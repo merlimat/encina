@@ -46,8 +46,8 @@ pub(crate) enum Turn {
 enum State {
     /// There is no current group.
     Idle,
-    /// The current group waits for a write to commit it: the one that was went
-    /// away before writing anything.
+    /// The current group waits for a write to take it over: the write that was
+    /// committing it went away before writing anything.
     Waiting,
     /// A write is building the group's new version. A write that leaves the group
     /// takes its batch with it.
