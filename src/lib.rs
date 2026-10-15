@@ -12,9 +12,75 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! encina: an embedded, ordered key-value store built on the compio runtime.
+//! An embedded, ordered key-value store built on the [compio] runtime, designed for
+//! many small key-value pairs.
 //!
-//! See `DESIGN.md` for the design.
+//! encina is a copy-on-write B+tree. It favors large batched writes, point and
+//! ordered lookups, range scans, and deleting whole key ranges at once.
+//!
+//! - **Durable, atomic batches.** [`Db::write`] applies a [`WriteBatch`] in one step
+//!   and returns once it is on disk.
+//! - **Lookups without copies.** [`Db::get`] finds a key, or its nearest neighbor
+//!   under a [`Comparison`], and lends the entry to a closure. [`Db::range`]
+//!   iterates over a point-in-time view, in key order.
+//! - **Bounded memory.** Internal nodes stay in memory, and leaves are cached within
+//!   [`Options::cache_size`]. The store bypasses the OS page cache.
+//! - **One owner per store.** A [`Db`] is neither `Send` nor `Sync`: each compio
+//!   runtime thread owns its stores, and a store file has one `Db` at a time. A
+//!   [`ReadOnlyDb`] can read it meanwhile, as of when the view opened.
+//!
+//! Keys sort bytewise, so encode integers big-endian. A key plus its value may not
+//! exceed [`Options::max_entry_size`], a bit under a quarter of the page size.
+//!
+//! # Example
+//!
+//! ```
+//! use encina::{Comparison, Db, Options, WriteBatch};
+//!
+//! # compio::runtime::Runtime::new().unwrap().block_on(async {
+//! # let dir = tempfile::tempdir().unwrap();
+//! # let path = dir.path().join("data.db");
+//! let db = Db::open(&path, Options::default()).await?;
+//!
+//! let mut batch = WriteBatch::new();
+//! batch.put(b"user/0001", b"alice");
+//! batch.put(b"user/0002", b"bob");
+//! batch.put(b"session/42", b"token");
+//! db.write(&mut batch).await?;
+//!
+//! // A cleared batch keeps its memory. This one removes every key starting with
+//! // "session/".
+//! batch.clear();
+//! batch.delete_range(b"session/", b"session0");
+//! db.write(&mut batch).await?;
+//!
+//! // The entry with the largest key at or below "user/9999". `get` lends the key
+//! // and value to a closure instead of allocating copies.
+//! let last = db
+//!     .get(b"user/9999", Comparison::Floor, |k, _v| String::from_utf8_lossy(k).into_owned())
+//!     .await?;
+//! assert_eq!(last.as_deref(), Some("user/0002"));
+//!
+//! // A point-in-time scan of every key starting with "user/".
+//! let mut names = Vec::new();
+//! let mut iter = db.range(&b"user/"[..]..&b"user0"[..]);
+//! while let Some((_k, v)) = iter.next().await? {
+//!     names.push(String::from_utf8_lossy(v).into_owned());
+//! }
+//! assert_eq!(names, ["alice", "bob"]);
+//! # Ok::<_, encina::Error>(())
+//! # }).unwrap();
+//! ```
+//!
+//! # Platforms
+//!
+//! Linux with io_uring is the target, and there the store file uses direct I/O.
+//! macOS works for development, but without a durability guarantee against power
+//! loss.
+//!
+//! [DESIGN.md](https://github.com/merlimat/encina/blob/main/DESIGN.md) describes the
+//! design.
+#![warn(missing_docs)]
 
 mod batch;
 mod cache;

@@ -141,6 +141,15 @@ impl Storage {
         }
     }
 
+    /// Cuts the file at `len` bytes.
+    pub(crate) async fn set_len(&self, len: u64) -> io::Result<()> {
+        match self {
+            Storage::File(file) => file.set_len(len).await,
+            #[cfg(test)]
+            Storage::Sim(disk) => disk.set_len(len),
+        }
+    }
+
     /// Makes every completed write durable.
     pub(crate) async fn sync(&self) -> io::Result<()> {
         match self {
@@ -301,6 +310,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore)] // Miri can't run compio's runtime.
     async fn reads_past_the_end_fail() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file");

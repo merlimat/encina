@@ -24,6 +24,11 @@
 //! freed too. Pages likely to be replaced soon and pages likely to stay take
 //! separate runs, so that the pages replaced together are freed together, as
 //! runs again.
+//!
+//! A few pages that stay can hold a whole stretch back. So a write moves the pages
+//! it keeps out of windows that are mostly free, when that only costs their writes
+//! (see [`Space::should_move`]), and once the end of the file is free, the file
+//! ends earlier.
 
 use std::collections::VecDeque;
 
@@ -34,6 +39,11 @@ const MIN_RUN: u64 = 16;
 /// How many pages a run at the end of the file spans. Bounding it lets both
 /// [`Life`]s grow the file, each in runs of its own.
 const CHUNK: u64 = 256;
+
+/// The most pages in use in a window of 64, the pages one word of the bitmap
+/// tracks, for a write to move them out: each page moved frees at least three,
+/// and the emptied window makes a run.
+pub(crate) const MOVE_AT: u32 = 16;
 
 /// How long a page a write allocates is likely to stay in use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,7 +117,8 @@ impl Space {
     }
 
     /// Makes the next allocation start over from the lowest free page: each write
-    /// starts with this, so that it reuses what earlier writes freed.
+    /// starts with this, so that it reuses what earlier writes freed. The
+    /// high-water mark comes down to the last page in use.
     pub(crate) fn restart(&mut self) {
         self.runs = [Run::default(); 2];
         self.holes.clear();
@@ -115,6 +126,11 @@ impl Space {
         {
             self.freed = 0;
         }
+        let last = self.used.iter().rposition(|&w| w != 0);
+        self.high_water = last.map_or(0, |i| {
+            (i as u64 + 1) * 64 - u64::from(self.used[i].leading_zeros())
+        });
+        self.used.truncate(self.high_water.div_ceil(64) as usize);
     }
 
     /// A free page, which becomes used: for a short-lived page, a hole the write
@@ -149,6 +165,15 @@ impl Space {
         }
         self.mark_used(page);
         page
+    }
+
+    /// Whether a node on `page` that the write in progress keeps should move to a
+    /// new page, freeing `page` once the write is published: whether `page` sits
+    /// in a window of 64 pages, below the high-water mark, with at most
+    /// [`MOVE_AT`] in use.
+    pub(crate) fn should_move(&self, page: u64) -> bool {
+        let word = page / 64;
+        (word + 1) * 64 <= self.high_water && self.used[word as usize].count_ones() <= MOVE_AT
     }
 
     /// The first stretch of free pages at or after `from`, outside the `other`
@@ -359,6 +384,36 @@ mod tests {
         space.restart();
         assert_eq!(space.alloc(Life::Long), 2);
         assert_eq!(space.alloc(Life::Short), 3 + CHUNK);
+    }
+
+    #[test]
+    fn restarting_ends_the_file_after_the_last_page_in_use() {
+        let mut space = space_with(200, 70..200);
+        space.restart();
+        assert_eq!(space.high_water(), 70);
+        assert_eq!(alloc_n(&mut space, Life::Short, 3), [70, 71, 72]);
+        assert_eq!(space.high_water(), 73);
+    }
+
+    #[test]
+    fn kept_pages_move_out_of_mostly_free_windows() {
+        // Of each window of 64 pages, the first has one page in use too many, the
+        // second just few enough, the third is full, and the file ends in the
+        // fourth.
+        let few = u64::from(MOVE_AT);
+        let mut space = Space::new(224);
+        let used = (0..4 * few)
+            .step_by(4)
+            .chain([63])
+            .chain((64..64 + 4 * few).step_by(4))
+            .chain(128..193);
+        for page in used {
+            space.mark_used(page);
+        }
+        assert!(!space.should_move(4));
+        assert!(space.should_move(68));
+        assert!(!space.should_move(130));
+        assert!(!space.should_move(192), "the window runs past the end");
     }
 
     #[test]

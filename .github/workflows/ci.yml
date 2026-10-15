@@ -32,6 +32,20 @@ jobs:
       - name: Clippy for the leaf-layout benchmark
         run: cargo clippy --manifest-path experiments/leaf-layouts/Cargo.toml -- -D warnings
 
+  msrv:
+    name: Check on the minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
   test:
     name: Test (${{ matrix.os }})
     strategy:

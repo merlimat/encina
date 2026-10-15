@@ -1,0 +1,49 @@
+name: Bench
+
+# bench/ is a workspace of its own, which the other workflows don't build. It
+# builds encina from src/ and compiles RocksDB's C++, so it runs only when bench/
+# or encina changes.
+on:
+  pull_request:
+    paths:
+      - bench/**
+      - src/**
+      - Cargo.toml
+      - .github/workflows/bench.yml
+  # A pull request can restore a cache saved on main, but not one saved by
+  # another pull request. Without this, each pull request would compile RocksDB.
+  push:
+    branches: [main]
+    paths:
+      - bench/**
+      - src/**
+      - Cargo.toml
+      - .github/workflows/bench.yml
+
+permissions:
+  contents: read
+
+# A new push to a pull request, or to main, cancels the run before it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug info would make RocksDB's objects, and so the cache, almost four times
+  # larger.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench
+      - run: cargo clippy --manifest-path bench/Cargo.toml --all-targets -- -D warnings

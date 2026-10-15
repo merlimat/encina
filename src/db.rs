@@ -15,6 +15,7 @@
 use std::array;
 use std::cell::{Cell, RefCell, RefMut};
 use std::future::{Future, poll_fn};
+use std::io;
 use std::iter;
 use std::mem;
 use std::ops::{Bound, RangeBounds};
@@ -65,7 +66,8 @@ pub enum Comparison {
 /// An embedded, ordered key-value store.
 ///
 /// `Db` is a cheap handle: clones share the same store. It is neither `Send` nor
-/// `Sync`; each compio runtime thread owns its own stores.
+/// `Sync`: each thread that runs a compio runtime owns its own stores, and awaits
+/// their futures on that runtime.
 #[derive(Clone)]
 pub struct Db {
     inner: Rc<Inner>,
@@ -79,6 +81,8 @@ struct Inner {
     writer: WriteLock,
     /// Set when an I/O error left it unknown whether a write reached the disk.
     failed: Cell<bool>,
+    /// Pages the file may hold: it has grown to this length at most.
+    file_end: Cell<u64>,
     /// Opened by a [`ReadOnlyDb`], whose version the store's owner may overwrite.
     read_only: bool,
     page_size: usize,
@@ -169,6 +173,7 @@ impl Db {
             storage,
             writer: WriteLock::default(),
             failed: Cell::new(false),
+            file_end: Cell::new(len.div_ceil(page_size as u64).max(meta::META_PAGES)),
             read_only,
             page_size,
             max_entry: opts.max_entry_size(),
@@ -233,16 +238,21 @@ impl Db {
         inner.tree.borrow_mut().seal_pending(generation);
 
         // Commit: write the new nodes, sync, then switch the meta page and sync.
+        let meta = inner.tree.borrow().pending_meta(generation);
+        inner
+            .file_end
+            .set(inner.file_end.get().max(meta.high_water));
         guard.stage = Stage::Writing;
         let written = write_dirty(inner).await;
         guard.stage = Stage::Building;
         written?;
         guard.stage = Stage::Committing;
         inner.storage.sync().await?;
-        let meta = inner.tree.borrow().pending_meta(generation);
         write_meta(inner, &meta).await?;
         inner.storage.sync().await?;
         inner.tree.borrow_mut().publish(generation);
+        guard.stage = Stage::Cutting;
+        shrink(inner, meta.high_water).await;
         guard.stage = Stage::Done;
         Ok(())
     }
@@ -251,17 +261,46 @@ impl Db {
     /// value, returning whatever `f` returns. The slices are only valid inside `f`,
     /// which is how `get` avoids allocating: decode or copy what you need there.
     ///
-    /// ```ignore
+    /// Here keys are a ledger id and an entry id, big-endian, and values are the
+    /// entries' locations:
+    ///
+    /// ```
+    /// # use encina::{Comparison, Db, Options, WriteBatch};
+    /// fn key(ledger: u64, entry: u64) -> [u8; 16] {
+    ///     let mut key = [0; 16];
+    ///     key[..8].copy_from_slice(&ledger.to_be_bytes());
+    ///     key[8..].copy_from_slice(&entry.to_be_bytes());
+    ///     key
+    /// }
+    ///
+    /// fn decode_key(key: &[u8]) -> (u64, u64) {
+    ///     let decode = |bytes: &[u8]| u64::from_be_bytes(bytes.try_into().unwrap());
+    ///     (decode(&key[..8]), decode(&key[8..]))
+    /// }
+    /// # compio::runtime::Runtime::new().unwrap().block_on(async {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = Db::open(dir.path().join("data.db"), Options::default()).await?;
+    /// # let mut batch = WriteBatch::new();
+    /// # for entry in 0..3u64 {
+    /// #     batch.put(&key(7, entry), &(entry * 1024).to_be_bytes());
+    /// # }
+    /// # db.write(&mut batch).await?;
+    /// # let (l, e) = (7, 1);
+    ///
     /// // Location of entry `e` in ledger `l`.
-    /// let loc: Option<Location> = db
-    ///     .get(&key(l, e), Comparison::Equal, |_k, v| Location::decode(v))
+    /// let loc: Option<u64> = db
+    ///     .get(&key(l, e), Comparison::Equal, |_k, v| u64::from_be_bytes(v.try_into().unwrap()))
     ///     .await?;
+    /// # assert_eq!(loc, Some(1024));
     ///
     /// // Last entry of ledger `l`: the largest key <= (l, u64::MAX), if it is in `l`.
     /// let last: Option<u64> = db
     ///     .get(&key(l, u64::MAX), Comparison::Floor, |k, _v| decode_key(k))
     ///     .await?
     ///     .and_then(|(ledger, entry)| (ledger == l).then_some(entry));
+    /// # assert_eq!(last, Some(2));
+    /// # Ok::<_, encina::Error>(())
+    /// # }).unwrap();
     /// ```
     pub async fn get<R>(
         &self,
@@ -317,14 +356,18 @@ impl Db {
     /// When it reaches a leaf that isn't cached, it also starts reading the next
     /// leaves in the range, up to 16 of them.
     ///
+    /// The bounds are byte slices, as in `db.range(&start[..]..&end[..])` or any
+    /// other range form. `db.range(..)` covers every key, and a pair of [`Bound`]s
+    /// can also leave out the start.
+    ///
     /// An iterator keeps its version's internal nodes in memory, and the pages
     /// later writes replace allocated, until it is dropped, so keep iterators
     /// short-lived.
-    pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter {
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter {
         let mut bounds = self.inner.take_buffer();
-        let start = copy_bound(range.start_bound(), &mut bounds);
+        let start = copy_bound(range.start_bound().cloned(), &mut bounds);
         let start_len = bounds.len();
-        let end = copy_bound(range.end_bound(), &mut bounds);
+        let end = copy_bound(range.end_bound().cloned(), &mut bounds);
         let version = self.inner.tree.borrow_mut().pin();
         Iter {
             inner: self.inner.clone(),
@@ -343,8 +386,10 @@ impl Db {
         }
     }
 
-    /// Closes the store, once this is its last handle. Every successful
-    /// [`write`](Self::write) is already durable.
+    /// Closes the store if this is its last handle, freeing its file for the next
+    /// [`open`](Self::open). Otherwise the store stays open until its last handle,
+    /// a clone or an iterator, is dropped. Every successful [`write`](Self::write)
+    /// is already durable.
     pub async fn close(self) -> Result<()> {
         if let Ok(inner) = Rc::try_unwrap(self.inner) {
             match inner.storage {
@@ -425,7 +470,7 @@ impl ReadOnlyDb {
     }
 
     /// As [`Db::range`], in the version this view reads.
-    pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter {
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter {
         self.db.range(range)
     }
 
@@ -504,10 +549,17 @@ async fn recover(storage: &Storage, len: u64) -> Result<Meta> {
 
 /// Reports error `e`, which a read-only store hit reading the version it opened as
 /// of `generation`. The store's owner reuses the pages its later versions replaced,
-/// so once it has committed another version, a page that fails its checks was most
-/// likely overwritten: then the store is [stale](Error::Stale) rather than corrupt.
+/// and cuts the file once its end is free, so once it has committed another
+/// version, a page that fails its checks, or lies past the end of the file, was
+/// most likely overwritten or cut: then the store is [stale](Error::Stale) rather
+/// than corrupt.
 async fn stale_or(storage: &Storage, page_size: usize, generation: u64, e: Error) -> Error {
-    if !matches!(e, Error::Corruption { .. }) {
+    let gone = match &e {
+        Error::Corruption { .. } => true,
+        Error::Io(e) => e.kind() == io::ErrorKind::UnexpectedEof,
+        _ => false,
+    };
+    if !gone {
         return e;
     }
     for slot in 0..meta::META_PAGES {
@@ -752,6 +804,23 @@ pub(crate) fn max_run(page_size: usize) -> usize {
     (MAX_WRITE / page_size).clamp(1, MAX_IOVECS)
 }
 
+/// Cuts the file at `high_water`, past the pages that the version just committed
+/// and the older ones still read can use, once that frees an eighth of it. Only
+/// the newest meta page, which is durable, still matters. If this fails, the file
+/// stays longer than it needs to be until a later commit cuts it.
+async fn shrink(inner: &Inner, high_water: u64) {
+    let end = inner.file_end.get();
+    if 8 * (end - high_water) >= end
+        && inner
+            .storage
+            .set_len(inner.offset(high_water))
+            .await
+            .is_ok()
+    {
+        inner.file_end.set(high_water);
+    }
+}
+
 /// Writes `meta` to its slot.
 async fn write_meta(inner: &Inner, meta: &Meta) -> Result<()> {
     let (frame, buf) = {
@@ -808,6 +877,9 @@ enum Stage {
     Writing,
     /// The nodes are written: whether the commit is durable is unknown.
     Committing,
+    /// The commit is published, and the file may be getting cut: a cut still in
+    /// flight could cut what a later write adds.
+    Cutting,
     Done,
 }
 
@@ -843,6 +915,7 @@ impl Drop for WriteGuard<'_> {
                 self.inner.failed.set(true);
                 tree.discard();
             }
+            Stage::Cutting => self.inner.failed.set(true),
         }
     }
 }
@@ -923,6 +996,9 @@ enum State {
 
 impl Iter {
     /// Lends the next entry's key and value, valid until the next call.
+    ///
+    /// If reading a leaf fails, this returns the error, and the next call reads it
+    /// again.
     pub async fn next(&mut self) -> Result<Option<(&[u8], &[u8])>> {
         let Some(root) = self.version.root else {
             return Ok(None);

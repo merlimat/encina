@@ -47,6 +47,9 @@ struct Disk {
     /// Pages written since the last sync: offset and length.
     unsynced: Vec<(usize, usize)>,
     ops: u64,
+    /// Write operations, and bytes written.
+    writes: u64,
+    written: u64,
     fault: Option<(u64, Fault)>,
     /// The disk as a crash left it.
     crashed: Option<Vec<u8>>,
@@ -75,6 +78,12 @@ impl SimDisk {
     /// Operations started so far.
     pub(crate) fn ops(&self) -> u64 {
         self.0.borrow().ops
+    }
+
+    /// Write operations that succeeded so far, and the bytes they wrote.
+    pub(crate) fn written(&self) -> (u64, u64) {
+        let disk = self.0.borrow();
+        (disk.writes, disk.written)
     }
 
     /// Flips a bit at `offset`, as bit rot would.
@@ -216,12 +225,21 @@ impl SimDisk {
         let mut at = offset as usize;
         self.begin(Some((at, bufs)))?;
         let mut disk = self.0.borrow_mut();
+        disk.writes += 1;
         for buf in bufs {
             let data = buf.as_init();
             land(&mut disk.current, at, data);
             disk.unsynced.push((at, data.len()));
+            disk.written += data.len() as u64;
             at += data.len();
         }
+        Ok(())
+    }
+
+    /// Cuts the disk at `len` bytes. Until a sync, a crash may undo it.
+    pub(crate) fn set_len(&self, len: u64) -> io::Result<()> {
+        self.begin(None)?;
+        self.0.borrow_mut().current.resize(len as usize, 0);
         Ok(())
     }
 

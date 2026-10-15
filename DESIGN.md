@@ -243,6 +243,11 @@ Every `write()` ends with a commit that makes its batch durable in one atomic st
    durable.
 4. Publish the new root. The written leaves become evictable, and the pages this
    write dropped become reusable, subject to §8.
+5. If an eighth of the file or more lies past the high-water mark that the meta
+   page recorded, cut the file there (`set_len`). Only that meta page, which is
+   durable, still matters, and no version a reader holds uses a page past the
+   mark. If the cut fails, the file stays longer than it needs to be until a later
+   commit cuts it.
 
 A write keeps the leaves it changes and the ones it builds in memory until it
 publishes, so a batch larger than the cache budget grows the pool past it. Writing
@@ -260,7 +265,8 @@ free set, and `write()` returns the error, leaving the store as it was. If a
 instance enters a failed state: reads keep serving the last published version,
 writes return `Error::Failed`, and the store must be reopened. Dropping a `write()`
 future is harmless until it starts writing pages; after that, it also puts the
-instance in the failed state.
+instance in the failed state, even while it only cuts the file: a cut still in
+flight could cut what a later write adds.
 
 ### File layout (format v1)
 
@@ -295,12 +301,51 @@ that a run of appends leaves behind, which are likely to stay. With appends, as 
 ledgers, each batch replaces the short-lived pages of the batch before as a whole,
 and the batch after reuses their space as one run.
 
-The cost is space. On the BookKeeper-shaped benchmark (10 million entries in 100
-batches) the file ends up 21% larger than when allocation took the lowest free
-page, and in a simulation of random updates over 22,000 leaves it settled at
-2.8–3.3× the live pages instead of 2×. In exchange, that benchmark's load sent
-4,540 write requests averaging 158 KiB instead of 169,500 of 4 KiB, and ran three
-times as fast.
+Updates spread over the keys don't free pages together: a few pages that stay
+hold a whole stretch back, as short holes that no run takes, until the last of
+them goes. So a write moves such pages when that costs only their writes. When it
+rebuilds an internal node, it gives the node's unchanged children new pages, next
+to the pages it builds, if they sit in a window of 64 pages (one word of the
+bitmap) with at most 16 in use, and, for leaves, if they are cached. Their parent
+is rebuilt anyway, so a move takes no read and no other write; each page moved
+frees at least three, and the window, once empty, makes a run for a later write. A
+write moves at most as many nodes as it builds for its changes.
+
+The file gives back its end once that is free: every write starts by lowering the
+high-water mark to the last page in use, which its meta page records, and the
+commit cuts the file once an eighth of it lies past the mark (step 5 above).
+
+Writing in runs costs space, in exchange for requests. The table shows the file
+against the pages in use, and the write requests and pages per commit, measured
+on the simulated disk with 4 KiB pages and a cache that holds everything (the
+ignored test `file_size_and_requests`): the benchmark's load (bench/README.md: 10
+million entries in 100 batches), and 1 million random keys, loaded in batches of
+20,000, then updated at random, 2 million updates in all, in commits of the size
+shown.
+
+| Workload | Allocation | File | Requests | Pages |
+|---|---|---:|---:|---:|
+| Benchmark load | lowest free page | 1.02× | 1,790 | 1,790 |
+| | runs | 1.21× | 25 | 1,790 |
+| | runs, moving pages | 1.22× | 26 | 1,807 |
+| Random, 20,000 per commit | lowest free page | 1.72× | 10,882 | 10,882 |
+| | runs | 2.73× | 433 | 10,882 |
+| | runs, moving pages | 2.63× | 316 | 11,319 |
+| Random, 1,000 per commit | lowest free page | 1.70× | 1,158 | 1,158 |
+| | runs | 3.00× | 57 | 1,158 |
+| | runs, moving pages | 2.08× | 26 | 1,420 |
+| Random, 10 per commit | lowest free page | 1.70× | 23 | 23 |
+| | runs | 4.16× | 1.8 | 23 |
+| | runs, moving pages | 2.87× | 1.9 | 29 |
+
+Taking the lowest free page sends a request per page, and the random keys' load
+sets its file size. Moving pages costs page writes where updates are small and
+spread out, but takes fewer requests there, since the emptied windows make longer
+runs; the benchmark's load barely changes. Big commits gain little: the windows a
+commit fills still hold over a quarter of their pages after the next one, too many
+to move, and the commit after replaces most of those anyway. On the benchmark VM,
+writing in runs cut the load's requests from 169,500 of 4 KiB to 4,540 averaging
+158 KiB, and made it three times as fast.
 
 ### Recovery
 
@@ -402,23 +447,24 @@ same 282 MiB.
   corrupting the store. A `flock` lock belongs to the open file rather than to the
   process, so it also stops a second open from another thread of the same process,
   the likely mistake with one instance per thread.
-- **Read-only views.** A `ReadOnlyDb` opens the file read-only and takes no lock,
-  so it can read a store that a `Db` owns, in this process or another. It reads
-  the version that was current when it opened, with a cache of its own. The owner
+- **Read-only views.** A `ReadOnlyDb` opens the file read-only and takes no lock, so
+  it can read a store that a `Db` owns, in this process or another. It reads the
+  version that was current when it opened, with a cache of its own. The owner
   doesn't know about it, so it reuses that version's pages from its second write
-  after the view opens. Every leaf read checks that the page holds a leaf no newer
-  than the current generation, so a reused page is never taken for the one the
-  tree points to. When a view's page fails its checks, the view rereads both meta
+  after the view opens, and may cut them off the end of the file (§7). Every leaf
+  read checks that the page holds a leaf no newer than the current generation, so a
+  reused page is never taken for the one the tree points to. When a view's page
+  fails its checks, or lies past the end of the file, the view rereads both meta
   slots: if the owner has committed since, the error is `Error::Stale`, and a new
-  view reads the current version; otherwise it is `Error::Corruption`. A corrupt
-  page reported as stale is reported as corrupt by the next view, if that view
-  still uses it. Opening a view checks the internal nodes it loads the same way.
-  Views suit inspection and tooling: one that should keep up with a busy owner has
-  to be reopened, since nothing holds back the owner's page reuse for it.
+  view reads the current version; otherwise it is the error the read met. A corrupt
+  page reported as stale is reported as corrupt by the next view, if that view still
+  uses it. Opening a view checks the internal nodes it loads the same way. Views
+  suit inspection and tooling: one that should keep up with a busy owner has to be
+  reopened, since nothing holds back the owner's page reuse for it.
 - All file I/O goes through compio 0.19: `read_at` / `write_at` on `&File`, with
-  frames as the owned buffers, and `sync_data`. A commit writes each run of pages
-  with `write_vectored_at`, whose buffers are the frames themselves, so nothing is
-  copied; a run is at most 1,024 frames (`IOV_MAX`).
+  frames as the owned buffers, `sync_data`, and `set_len` to cut the file. A commit
+  writes each run of pages with `write_vectored_at`, whose buffers are the frames
+  themselves, so nothing is copied; a run is at most 1,024 frames (`IOV_MAX`).
 - **No OS page cache, no `mmap`.** On Linux the data file is opened with `O_DIRECT`
   (`OpenOptions::custom_flags`), so pages move straight between frames and the
   device; on file systems that don't support it, like tmpfs, it falls back to
@@ -473,8 +519,9 @@ impl Db {
         cmp: Comparison,
         f: impl FnOnce(&[u8], &[u8]) -> R,
     ) -> Result<Option<R>>;
-    /// Point-in-time iterator. Creating and advancing it never allocates.
-    pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter;
+    /// Point-in-time iterator. Creating and advancing it never allocates. The bounds
+    /// are byte slices, in any range form: `&a[..]..&b[..]`, `..`, a pair of `Bound`s.
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter;
     /// Closes the store. Every successful `write()` is already durable.
     pub async fn close(self) -> Result<()>;
 }
@@ -494,7 +541,7 @@ impl ReadOnlyDb {
         cmp: Comparison,
         f: impl FnOnce(&[u8], &[u8]) -> R,
     ) -> Result<Option<R>>;
-    pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter;
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter;
     pub async fn close(self) -> Result<()>;
 }
 
@@ -538,9 +585,11 @@ complete without suspending.
   interface with two implementations: compio files, and a simulated disk that can
   fail or crash at any single operation. A crash keeps what was synced, a
   pseudo-random subset of the pages written since, and the first half of the write
-  in progress, which may span several pages. The failure scenario first runs once
-  to count its I/O operations, then reruns once per operation with an error
-  injected there, and once more with a crash. After each run, a store left usable
+  in progress, which may span several pages; a cut of the file lasts once synced.
+  Each failure scenario first runs once to count its I/O operations, then reruns
+  once per operation with an error injected there, and once more with a crash. One
+  scenario reads leaves back through a tiny cache; another moves pages out of
+  mostly free windows and cuts the file. After each run, a store left usable
   must pass the invariant checker, one left failed must reject writes, and
   reopening must yield the state after the last successful write (or after the
   failed one, when the failure hit a commit).
@@ -560,11 +609,11 @@ complete without suspending.
   internal node fails the open, both with `Error::Corruption`.
 - **Read-only views:** a view on the owner's simulated disk returns exactly its
   version while the owner rewrites every leaf, until its reads fail with
-  `Error::Stale`, and never with other entries. Damage in a store the owner hasn't
-  written since is still `Error::Corruption`. The simulated disk can also take
-  another disk's contents at a given operation, as if the owner wrote meanwhile:
-  a view whose internal nodes are overwritten that way while it opens fails with
-  `Error::Stale`.
+  `Error::Stale`, and never with other entries; so does a read of a page the owner
+  cut off the end of the file. Damage in a store the owner hasn't written since is
+  still `Error::Corruption`. The simulated disk can also take another disk's
+  contents at a given operation, as if the owner wrote meanwhile: a view whose
+  internal nodes are overwritten that way while it opens fails with `Error::Stale`.
 - **Real files** cover what the simulated disk doesn't model: reopening, the lock
   that keeps out a second open, syncing the directory of a new store, including
   a directory that can't be synced, and a read-only view, which opens beside the
@@ -573,9 +622,15 @@ complete without suspending.
   iteration over cached pages, `get` and iteration that miss the cache (reading
   ahead included), and `write` with a reused batch, all on the simulated disk,
   perform no allocations. On a real disk, compio adds one per I/O operation.
+- **Sanitizers:** CI runs every test under AddressSanitizer, std included, so a
+  use of freed memory or a leak fails the run even where the test's own checks
+  pass, real files' io_uring path included. One test drops a store while the
+  simulated disk still holds its reads, which checks that their buffers keep the
+  frame memory alive until the reads finish.
 - **Benchmarks** against RocksDB on the BookKeeper workload: sorted batches over
   *A* active ledgers, random point reads, floor lookups, and `delete_range` of old
-  ledgers.
+  ledgers. On the simulated disk, an ignored test measures the file's size and the
+  write requests per commit of that load and of random updates (§7).
 
 ## 12. Milestones
 

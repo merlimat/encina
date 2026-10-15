@@ -132,6 +132,9 @@ pub(crate) struct Tree {
     pub(crate) dirty: Vec<(FrameId, u64)>,
     /// That version, until it is published or discarded.
     pending: Option<Option<Root>>,
+    /// The nodes the write in progress added for its changes, and those it moved.
+    added: usize,
+    moved: usize,
 }
 
 enum Outcome {
@@ -164,6 +167,8 @@ impl Tree {
             dropped: Vec::new(),
             dirty: Vec::new(),
             pending: None,
+            added: 0,
+            moved: 0,
         }
     }
 
@@ -454,6 +459,7 @@ impl Tree {
         }
         self.dropped.clear();
         self.pages.space.restart();
+        (self.added, self.moved) = (0, 0);
         let (level, outcome) = match self.root {
             Some(root) => {
                 let level = usize::from(root.level);
@@ -674,6 +680,7 @@ impl Tree {
             self.discard_list(below, mark);
             return Outcome::Unchanged;
         }
+        self.move_kept(below, mark.items);
         self.fix_underfull(below, mark.items);
         self.build_parents(below, mark);
         Outcome::Replaced
@@ -756,8 +763,10 @@ impl Tree {
         let used = node::size(&out.entries, base, n);
         if used <= page {
             out.emit(base, n, used, Life::Short);
+            self.added += 1;
             return Outcome::Replaced;
         }
+        let items = out.len();
         // Split after each run of puts that fills at least a quarter page, as when
         // appending to ledgers: pack the run full, and leave the entries after it to
         // other leaves, so that the next appends don't rewrite them. Smaller runs,
@@ -777,6 +786,7 @@ impl Tree {
             }
         }
         out.emit_even(s, n, page);
+        self.added += out.len() - items;
         Outcome::Replaced
     }
 
@@ -822,11 +832,12 @@ impl Tree {
         }
         let (lower, upper) = self.lists.split_at_mut(level + 1);
         let (children, parents) = (&mut lower[level], &mut upper[0]);
-        let a = parents.entries.len();
+        let (a, items) = (parents.entries.len(), parents.len());
         for i in mark.items..children.len() {
             parents.entries.push(children.key(i), children.value(i));
         }
         parents.emit_even(a, parents.entries.len(), self.page_size);
+        self.added += parents.len() - items;
         children.truncate(mark);
     }
 
@@ -841,6 +852,44 @@ impl Tree {
             .build(level as u8, &list.entries, a, b, item.life);
         debug_assert_eq!(used, item.used as usize);
         list.built(i, frame, page);
+    }
+
+    /// Moves the nodes of `lists[level]` past `start` that the write keeps, but
+    /// whose pages the allocator wants freed: they become nodes the write adds,
+    /// with the same entries, built next to the others. Their parent is rebuilt
+    /// anyway, so a move costs a page write and nothing else: leaves move only if
+    /// they are cached. A write moves at most as many nodes as it adds.
+    fn move_kept(&mut self, level: usize, start: usize) {
+        for k in start..self.lists[level].len() {
+            let item = self.lists[level].items[k];
+            if item.fresh || self.moved >= self.added || !self.pages.space.should_move(item.page) {
+                continue;
+            }
+            let frame = if level > 0 {
+                item.frame
+            } else if let Some(frame) = self.pages.cached(item.page) {
+                frame
+            } else {
+                continue;
+            };
+            let list = &mut self.lists[level];
+            let a = list.entries.len();
+            let node = Node::new(self.pages.pool.page(frame));
+            for i in 0..node.count() {
+                list.entries.push_from(&node, i);
+                if level > 1 {
+                    // The new node becomes another parent of each internal child.
+                    self.pages.pool.retain(node.child(i));
+                }
+            }
+            let b = list.entries.len();
+            list.restage(k, a, b, node::size(&list.entries, a, b));
+            self.dropped.push(item.page);
+            if level > 0 {
+                self.release(frame);
+            }
+            self.moved += 1;
+        }
     }
 
     /// Merges each node this write added that is under a quarter full into a
@@ -1121,6 +1170,17 @@ impl NodeList {
         }
     }
 
+    /// Turns node `i`, kept from the previous version, into one this write adds,
+    /// holding `entries[a..b]`, which take `used` bytes.
+    fn restage(&mut self, i: usize, a: usize, b: usize, used: usize) {
+        let item = &mut self.items[i];
+        (item.frame, item.page, item.fresh) = (NO_FRAME, 0, true);
+        (item.start, item.end, item.used) = (a as u32, b as u32, used as u32);
+        item.life = Life::Short;
+        let at = (item.at + item.key_len) as usize;
+        self.bytes[at..at + CHILD_REF].copy_from_slice(&node::child_ref(NO_FRAME, 0));
+    }
+
     /// Records that node `i`, which this write added, was built in `frame` and
     /// `page`.
     fn built(&mut self, i: usize, frame: FrameId, page: u64) {
@@ -1353,6 +1413,11 @@ impl Tree {
 
     pub(crate) fn page_size(&self) -> usize {
         self.page_size
+    }
+
+    /// The nodes the last write added for its changes, and those it moved.
+    pub(crate) fn moves(&self) -> (usize, usize) {
+        (self.added, self.moved)
     }
 }
 
