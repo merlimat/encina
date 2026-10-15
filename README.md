@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo.svg" alt="encina logo" width="160">
+  </picture>
+</p>
+
 # encina
 
 An embedded, ordered key-value store for Rust, built on the
