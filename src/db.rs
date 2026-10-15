@@ -65,7 +65,8 @@ pub enum Comparison {
 /// An embedded, ordered key-value store.
 ///
 /// `Db` is a cheap handle: clones share the same store. It is neither `Send` nor
-/// `Sync`; each compio runtime thread owns its own stores.
+/// `Sync`: each thread that runs a compio runtime owns its own stores, and awaits
+/// their futures on that runtime.
 #[derive(Clone)]
 pub struct Db {
     inner: Rc<Inner>,
@@ -251,17 +252,46 @@ impl Db {
     /// value, returning whatever `f` returns. The slices are only valid inside `f`,
     /// which is how `get` avoids allocating: decode or copy what you need there.
     ///
-    /// ```ignore
+    /// Here keys are a ledger id and an entry id, big-endian, and values are the
+    /// entries' locations:
+    ///
+    /// ```
+    /// # use encina::{Comparison, Db, Options, WriteBatch};
+    /// fn key(ledger: u64, entry: u64) -> [u8; 16] {
+    ///     let mut key = [0; 16];
+    ///     key[..8].copy_from_slice(&ledger.to_be_bytes());
+    ///     key[8..].copy_from_slice(&entry.to_be_bytes());
+    ///     key
+    /// }
+    ///
+    /// fn decode_key(key: &[u8]) -> (u64, u64) {
+    ///     let decode = |bytes: &[u8]| u64::from_be_bytes(bytes.try_into().unwrap());
+    ///     (decode(&key[..8]), decode(&key[8..]))
+    /// }
+    /// # compio::runtime::Runtime::new().unwrap().block_on(async {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = Db::open(dir.path().join("data.db"), Options::default()).await?;
+    /// # let mut batch = WriteBatch::new();
+    /// # for entry in 0..3u64 {
+    /// #     batch.put(&key(7, entry), &(entry * 1024).to_be_bytes());
+    /// # }
+    /// # db.write(&mut batch).await?;
+    /// # let (l, e) = (7, 1);
+    ///
     /// // Location of entry `e` in ledger `l`.
-    /// let loc: Option<Location> = db
-    ///     .get(&key(l, e), Comparison::Equal, |_k, v| Location::decode(v))
+    /// let loc: Option<u64> = db
+    ///     .get(&key(l, e), Comparison::Equal, |_k, v| u64::from_be_bytes(v.try_into().unwrap()))
     ///     .await?;
+    /// # assert_eq!(loc, Some(1024));
     ///
     /// // Last entry of ledger `l`: the largest key <= (l, u64::MAX), if it is in `l`.
     /// let last: Option<u64> = db
     ///     .get(&key(l, u64::MAX), Comparison::Floor, |k, _v| decode_key(k))
     ///     .await?
     ///     .and_then(|(ledger, entry)| (ledger == l).then_some(entry));
+    /// # assert_eq!(last, Some(2));
+    /// # Ok::<_, encina::Error>(())
+    /// # }).unwrap();
     /// ```
     pub async fn get<R>(
         &self,
@@ -317,14 +347,18 @@ impl Db {
     /// When it reaches a leaf that isn't cached, it also starts reading the next
     /// leaves in the range, up to 16 of them.
     ///
+    /// The bounds are byte slices, as in `db.range(&start[..]..&end[..])` or any
+    /// other range form. `db.range(..)` covers every key, and a pair of [`Bound`]s
+    /// can also leave out the start.
+    ///
     /// An iterator keeps its version's internal nodes in memory, and the pages
     /// later writes replace allocated, until it is dropped, so keep iterators
     /// short-lived.
-    pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter {
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter {
         let mut bounds = self.inner.take_buffer();
-        let start = copy_bound(range.start_bound(), &mut bounds);
+        let start = copy_bound(range.start_bound().cloned(), &mut bounds);
         let start_len = bounds.len();
-        let end = copy_bound(range.end_bound(), &mut bounds);
+        let end = copy_bound(range.end_bound().cloned(), &mut bounds);
         let version = self.inner.tree.borrow_mut().pin();
         Iter {
             inner: self.inner.clone(),
@@ -343,8 +377,10 @@ impl Db {
         }
     }
 
-    /// Closes the store, once this is its last handle. Every successful
-    /// [`write`](Self::write) is already durable.
+    /// Closes the store if this is its last handle, freeing its file for the next
+    /// [`open`](Self::open). Otherwise the store stays open until its last handle,
+    /// a clone or an iterator, is dropped. Every successful [`write`](Self::write)
+    /// is already durable.
     pub async fn close(self) -> Result<()> {
         if let Ok(inner) = Rc::try_unwrap(self.inner) {
             match inner.storage {
@@ -425,7 +461,7 @@ impl ReadOnlyDb {
     }
 
     /// As [`Db::range`], in the version this view reads.
-    pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter {
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter {
         self.db.range(range)
     }
 
@@ -923,6 +959,9 @@ enum State {
 
 impl Iter {
     /// Lends the next entry's key and value, valid until the next call.
+    ///
+    /// If reading a leaf fails, this returns the error, and the next call reads it
+    /// again.
     pub async fn next(&mut self) -> Result<Option<(&[u8], &[u8])>> {
         let Some(root) = self.version.root else {
             return Ok(None);

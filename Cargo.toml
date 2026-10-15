@@ -2,8 +2,12 @@
 name = "encina"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 description = "Embedded ordered key-value store built on the compio runtime"
 license = "Apache-2.0"
+repository = "https://github.com/merlimat/encina"
+keywords = ["database", "key-value", "btree", "embedded", "io-uring"]
+categories = ["database-implementations", "asynchronous"]
 
 [dependencies]
 compio = { version = "0.19.2", features = ["fs"] }

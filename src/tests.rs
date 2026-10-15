@@ -449,6 +449,33 @@ fn comparisons_at_the_edges() {
 }
 
 #[test]
+fn ranges_accept_every_form_of_bounds() {
+    let store = Store::new(Options::default());
+    write(
+        &store.db,
+        &[1u8, 2, 3, 4].map(|k| Op::Put(vec![k], Vec::new())),
+    );
+    let keys = |mut iter: crate::Iter| {
+        let mut keys = Vec::new();
+        while let Some((k, _)) = now(iter.next()).unwrap() {
+            keys.push(k[0]);
+        }
+        keys
+    };
+    let (db, two, three): (_, &[u8], &[u8]) = (&store.db, &[2], &[3]);
+    assert_eq!(keys(db.range(two..three)), [2]);
+    assert_eq!(keys(db.range(two..=three)), [2, 3]);
+    assert_eq!(keys(db.range(two..)), [2, 3, 4]);
+    assert_eq!(keys(db.range(..three)), [1, 2]);
+    assert_eq!(keys(db.range(..=three)), [1, 2, 3]);
+    assert_eq!(keys(db.range(..)), [1, 2, 3, 4]);
+    assert_eq!(
+        keys(db.range((Bound::Excluded(two), Bound::Unbounded))),
+        [3, 4]
+    );
+}
+
+#[test]
 fn oversized_entries_leave_the_store_unchanged() {
     let store = Store::new(Options::default());
     let max = Options::default().max_entry_size();

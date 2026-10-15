@@ -38,6 +38,7 @@ impl Default for Options {
 }
 
 impl Options {
+    /// The default options: 4 KiB pages and a 64 MiB cache.
     pub fn new() -> Self {
         Self::default()
     }
