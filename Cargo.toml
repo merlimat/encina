@@ -1,0 +1,13 @@
+[package]
+name = "encina"
+version = "0.1.0"
+edition = "2024"
+description = "Embedded ordered key-value store built on the compio runtime"
+license = "Apache-2.0"
+
+[dependencies]
+compio = { version = "0.19.2", features = ["fs"] }
+
+[dev-dependencies]
+compio = { version = "0.19.2", features = ["macros"] }
+proptest = "1"
