@@ -288,8 +288,11 @@ extends the file.
    the file.
 3. Build the free bitmap from the pages the tree reaches.
 
-A file too short to hold a meta page, or with no intact slot, isn't a store
-(`Error::InvalidFile`): a crash while a store is being created can leave one.
+Opening an empty file creates a store. It first syncs the file's directory, since a
+new file's name is durable only once its directory is: without that, a crash could
+lose a store whose every write had been synced. Then it writes both meta slots and
+syncs them. A file too short to hold a meta page, or with no intact slot, isn't a
+store (`Error::InvalidFile`): a crash while a store is being created can leave one.
 
 There is no log to replay: the caller's journal covers anything newer than the last
 completed write.
@@ -325,6 +328,11 @@ completed write.
   handle shared by the tasks of one compio runtime thread. BookKeeper already keeps
   one index per ledger directory; here, one instance per core or shard plays the
   same role. A `Send` facade (compio dispatcher or channels) can come later.
+- **One owner per file.** Opening takes an exclusive `flock` on the file, which
+  closing it releases, so a second open fails with `Error::Locked` instead of
+  corrupting the store. A `flock` lock belongs to the open file rather than to the
+  process, so it also stops a second open from another thread of the same process,
+  the likely mistake with one instance per thread.
 - All file I/O goes through compio 0.19: `read_at` / `write_at` on `&File`, with
   frames as the owned buffers, and `sync_data`.
 - **No OS page cache, no `mmap`.** On Linux the data file is opened with `O_DIRECT`
@@ -434,6 +442,9 @@ complete without suspending.
   path needs a test or a written reason, is planned for M3.
 - **Damage:** a flipped bit in a leaf fails the reads that need it, and one in an
   internal node fails the open, both with `Error::Corruption`.
+- **Real files** cover what the simulated disk doesn't model: reopening, the lock
+  that keeps out a second open, and syncing the directory of a new store, including
+  a directory that can't be synced.
 - **Allocation tests:** a counting global allocator asserts that `get` and
   iteration over cached pages, and `write` with a reused batch on the simulated
   disk, perform no allocations. On a real disk, compio adds one per I/O operation.

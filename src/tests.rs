@@ -670,3 +670,57 @@ async fn a_file_store_survives_reopening() {
     drop(iter);
     db.close().await.unwrap();
 }
+
+#[compio::test]
+async fn a_file_store_has_one_owner_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let second = Db::open(&path, Options::default()).await.map(drop);
+    assert!(matches!(second, Err(Error::Locked)), "{second:?}");
+
+    // The failed open left the store alone.
+    let mut batch = WriteBatch::new();
+    batch.put(b"key", b"value");
+    db.write(&mut batch).await.unwrap();
+
+    // Closing the store lets go of it, and so does dropping it.
+    db.close().await.unwrap();
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let found = db.get(b"key", Comparison::Equal, |_, v| v.to_vec());
+    assert_eq!(found.await.unwrap(), Some(b"value".to_vec()));
+    drop(db);
+    Db::open(&path, Options::default()).await.unwrap();
+}
+
+#[cfg(unix)]
+#[compio::test]
+async fn a_new_store_needs_its_directory_synced() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::{fs, io};
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // Permissions don't stop root.
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+    let mode = |mode| fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+
+    // Without read permission, a file can be created in the directory, but the
+    // directory can't be opened to sync it.
+    mode(0o300);
+    let result = Db::open(&path, Options::default()).await.map(drop);
+    mode(0o700);
+    assert!(
+        matches!(&result, Err(Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied),
+        "{result:?}"
+    );
+
+    // The file left behind is empty, so opening it again creates the store.
+    assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let mut batch = WriteBatch::new();
+    batch.put(b"key", b"value");
+    db.write(&mut batch).await.unwrap();
+    db.close().await.unwrap();
+}

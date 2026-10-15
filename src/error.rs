@@ -25,6 +25,8 @@ pub enum Error {
     InvalidOptions(&'static str),
     /// The file is not a store this version of encina can open.
     InvalidFile(&'static str),
+    /// Another [`Db`](crate::Db), in this process or another, has the store open.
+    Locked,
     /// A page failed its checksum, or doesn't hold the node expected there.
     Corruption { page: u64 },
     /// An I/O error.
@@ -44,6 +46,7 @@ impl fmt::Display for Error {
             }
             Error::InvalidOptions(reason) => write!(f, "invalid options: {reason}"),
             Error::InvalidFile(reason) => write!(f, "invalid store file: {reason}"),
+            Error::Locked => write!(f, "the store is already open"),
             Error::Corruption { page } => write!(f, "page {page} is corrupt"),
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::Failed => write!(f, "an earlier I/O error left the store failed; reopen it"),

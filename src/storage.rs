@@ -23,6 +23,7 @@ use compio::BufResult;
 use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 
+use crate::error::Result;
 use crate::pool::FrameBuf;
 
 /// Direct I/O moves whole blocks: buffer, offset and length must all be multiples
@@ -36,10 +37,19 @@ pub(crate) enum Storage {
 }
 
 impl Storage {
-    /// Opens the file at `path`, creating it if needed. Returns it with its length.
-    pub(crate) async fn open(path: &Path) -> io::Result<(Storage, u64)> {
+    /// Opens the file at `path`, creating it if needed, and locks it until it
+    /// closes. Returns it with its length.
+    ///
+    /// Fails with [`Error::Locked`](crate::Error::Locked) if another open of the
+    /// file holds the lock, in this process or another.
+    pub(crate) async fn open(path: &Path) -> Result<(Storage, u64)> {
         let file = open_uncached(path).await?;
+        lock(&file)?;
         let len = file.metadata().await?.len();
+        if len == 0 {
+            // A new file's name is durable only once its directory is synced.
+            sync_dir(path).await?;
+        }
         Ok((Storage::File(file), len))
     }
 
@@ -128,4 +138,59 @@ async fn open_uncached(path: &Path) -> io::Result<File> {
         }
     }
     Ok(file)
+}
+
+/// Takes an exclusive lock on `file`, which closing it releases. A `flock` lock
+/// belongs to this open of the file rather than to the process, so it also keeps
+/// out a second open by another thread of this process.
+#[cfg(unix)]
+fn lock(file: &File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor is open, and flock takes an int.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+        let e = io::Error::last_os_error();
+        return Err(match e.kind() {
+            io::ErrorKind::WouldBlock => crate::Error::Locked,
+            _ => e.into(),
+        });
+    }
+    Ok(())
+}
+
+/// Syncs the directory holding `path`, which makes the names in it durable.
+#[cfg(unix)]
+async fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(dir_of(path)).await?.sync_all().await
+}
+
+/// Elsewhere, encina neither locks its file nor syncs its directory.
+#[cfg(not(unix))]
+fn lock(_: &File) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn sync_dir(_: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// The directory holding `path`: a bare file name is in the working directory.
+#[cfg(unix)]
+fn dir_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_name_alone_is_in_the_working_directory() {
+        assert_eq!(dir_of(Path::new("encina.db")), Path::new("."));
+        assert_eq!(dir_of(Path::new("data/encina.db")), Path::new("data"));
+        assert_eq!(dir_of(Path::new("/encina.db")), Path::new("/"));
+    }
 }
