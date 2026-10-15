@@ -15,10 +15,14 @@
 //! The copy-on-write B+tree.
 //!
 //! Nodes are immutable once published. A write builds replacement nodes along the
-//! paths it touches, shares everything else with the previous version, then swaps
-//! the root. Frames are reference counted: every node holds a reference to each of
-//! its children, the current root holds one, and so does each pinned reader. When a
-//! version's last reference goes, exactly the nodes it doesn't share are freed.
+//! paths it touches and shares everything else with the previous version; once
+//! they are committed, it swaps the root.
+//!
+//! Internal nodes stay in memory and refer to internal children by frame. Those
+//! frames are reference counted: every node holds a reference to each internal
+//! child, the current root holds one, and so does each pinned reader. Leaves are
+//! found by page id through the leaf cache, so they can be evicted. A page a write
+//! replaces stays allocated until no reader of an older version is left.
 //!
 //! Each internal key equals the smallest key in its child's subtree.
 
@@ -27,16 +31,94 @@ use std::mem;
 
 use crate::Comparison;
 use crate::batch::WriteBatch;
-use crate::node::{self, CHILD_REF, Entries, EntryBuf, Node};
-use crate::pool::{FrameId, Pool};
+use crate::cache::Cache;
+use crate::meta::Meta;
+use crate::node::{self, CHILD_REF, Entries, EntryBuf, NO_FRAME, Node};
+use crate::pool::{FrameId, Holds, Pool};
+use crate::space::Space;
 
 /// The deepest tree supported. Every split leaves internal nodes with at least two
 /// children, so real trees stay far shallower.
 pub(crate) const MAX_HEIGHT: usize = 32;
 
+/// A version's root node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Root {
+    pub(crate) page: u64,
+    /// The root's frame, or [`NO_FRAME`] when it is a leaf.
+    pub(crate) frame: FrameId,
+    pub(crate) level: u8,
+}
+
+/// A version a reader pinned: its root, and the generation that published it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Version {
+    pub(crate) root: Option<Root>,
+    pub(crate) generation: u64,
+}
+
+/// The frames, the leaf cache and the page allocator.
+pub(crate) struct Pages {
+    pub(crate) pool: Pool,
+    pub(crate) cache: Cache,
+    pub(crate) space: Space,
+}
+
+impl Pages {
+    /// Builds entries `a..b` of `src` into a new node at `level`, on a new page. The
+    /// node is dirty until its write publishes. A leaf goes into the cache, holding
+    /// a reference until then; an internal node's one reference goes to the caller.
+    /// Returns the node's frame ([`NO_FRAME`] for a leaf), page, and bytes used.
+    fn build(
+        &mut self,
+        level: u8,
+        src: &impl Entries,
+        a: usize,
+        b: usize,
+    ) -> (FrameId, u64, usize) {
+        let page = self.space.alloc();
+        let holds = if level == 0 {
+            Holds::Leaf
+        } else {
+            Holds::Internal
+        };
+        let frame = self.cache.alloc(&mut self.pool, holds, page);
+        let used = node::build(self.pool.page_mut(frame), level, src, a, b);
+        self.pool.frame_mut(frame).dirty = true;
+        if level > 0 {
+            return (frame, page, used);
+        }
+        self.cache.insert(page, frame);
+        (NO_FRAME, page, used)
+    }
+
+    /// The cached frame of a leaf page.
+    pub(crate) fn cached(&mut self, page: u64) -> Option<FrameId> {
+        self.cache.get(&mut self.pool, page)
+    }
+
+    /// Caches the leaf page just read into `frame`, which the caller holds a
+    /// reference to. If another read cached the page meanwhile, frees `frame` and
+    /// pins that one instead. Returns the pinned frame.
+    pub(crate) fn adopt_leaf(&mut self, frame: FrameId, page: u64) -> FrameId {
+        if let Some(cached) = self.cached(page) {
+            self.pool.unref(frame);
+            self.pool.free(frame);
+            self.pool.retain(cached);
+            return cached;
+        }
+        let info = self.pool.frame_mut(frame);
+        info.holds = Holds::Leaf;
+        info.page = page;
+        self.cache.insert(page, frame);
+        frame
+    }
+}
+
 pub(crate) struct Tree {
-    pool: Pool,
-    root: Option<FrameId>,
+    pub(crate) pages: Pages,
+    root: Option<Root>,
+    generation: u64,
     page_size: usize,
     // Scratch space, reused so that writes don't allocate:
     /// Replacement nodes, per level.
@@ -51,6 +133,16 @@ pub(crate) struct Tree {
     pair: EntryBuf,
     /// Frames waiting to be released.
     stack: Vec<FrameId>,
+    /// The leaf pages the write in progress changes, found before it loads them.
+    pub(crate) touched: Vec<u64>,
+    /// Leaves the write in progress keeps in the cache while it works.
+    pub(crate) pinned: Vec<FrameId>,
+    /// Pages the version the write in progress builds no longer uses.
+    dropped: Vec<u64>,
+    /// The nodes of that version that need writing: frame and page.
+    pub(crate) dirty: Vec<(FrameId, u64)>,
+    /// That version, until it is published or discarded.
+    pending: Option<Option<Root>>,
 }
 
 enum Outcome {
@@ -58,11 +150,21 @@ enum Outcome {
     Replaced,
 }
 
+/// The result of looking an entry up using cached leaves only.
+pub(crate) enum Find {
+    /// Found: the value's address and length. The key was copied out.
+    Found(*const u8, usize),
+    NotFound,
+    /// The lookup needs this leaf page, which isn't cached.
+    Missing(u64),
+}
+
 impl Tree {
-    pub(crate) fn new(page_size: usize) -> Tree {
+    pub(crate) fn new(pages: Pages, page_size: usize, root: Option<Root>, generation: u64) -> Tree {
         Tree {
-            pool: Pool::new(page_size),
-            root: None,
+            pages,
+            root,
+            generation,
             page_size,
             lists: Vec::new(),
             bounds: Vec::new(),
@@ -70,118 +172,133 @@ impl Tree {
             run_ends: Vec::new(),
             pair: EntryBuf::default(),
             stack: Vec::new(),
+            touched: Vec::new(),
+            pinned: Vec::new(),
+            dropped: Vec::new(),
+            dirty: Vec::new(),
+            pending: None,
         }
     }
 
     pub(crate) fn node(&self, frame: FrameId) -> Node<'_> {
-        Node::new(self.pool.page(frame))
+        Node::new(self.pages.pool.page(frame))
     }
 
     /// Address of byte `offset` of `frame`.
     pub(crate) fn addr(&self, frame: FrameId, offset: usize) -> *const u8 {
-        self.pool.addr(frame, offset)
+        self.pages.pool.addr(frame, offset)
     }
 
-    pub(crate) fn root(&self) -> Option<FrameId> {
-        self.root
+    pub(crate) fn current(&self) -> Version {
+        Version {
+            root: self.root,
+            generation: self.generation,
+        }
     }
 
-    /// Takes a reference to the current root, keeping the current version alive
-    /// until it is [released](Self::release).
-    pub(crate) fn pin(&mut self) -> Option<FrameId> {
-        let root = self.root?;
-        self.pool.retain(root);
-        Some(root)
+    /// Pins the current version: its internal nodes stay in memory, and its pages
+    /// stay allocated, until it is [unpinned](Self::unpin).
+    pub(crate) fn pin(&mut self) -> Version {
+        if let Some(root) = self.root.filter(|r| r.frame != NO_FRAME) {
+            self.pages.pool.retain(root.frame);
+        }
+        self.pages.space.add_reader(self.generation);
+        self.current()
     }
 
-    /// Drops a reference to `frame`. Frames that lose their last reference are
-    /// freed, and release their children in turn.
+    pub(crate) fn unpin(&mut self, version: Version) {
+        if let Some(root) = version.root.filter(|r| r.frame != NO_FRAME) {
+            self.release(root.frame);
+        }
+        self.pages.space.remove_reader(version.generation);
+        self.reclaim();
+    }
+
+    /// Drops a reference to an internal node's frame. A frame that loses its last
+    /// reference is freed, and releases its internal children in turn. A node built
+    /// by the write in progress frees its page too: it was never committed.
     pub(crate) fn release(&mut self, frame: FrameId) {
         let mut stack = mem::take(&mut self.stack);
         stack.push(frame);
         while let Some(frame) = stack.pop() {
-            if !self.pool.unref(frame) {
+            let pool = &mut self.pages.pool;
+            if !pool.unref(frame) {
                 continue;
             }
-            let node = Node::new(self.pool.page(frame));
-            if node.level() > 0 {
+            let node = Node::new(pool.page(frame));
+            if node.level() > 1 {
                 stack.extend((0..node.count()).map(|i| node.child(i)));
             }
-            self.pool.free(frame);
+            let info = *pool.frame(frame);
+            debug_assert_eq!(info.holds, Holds::Internal);
+            if info.dirty {
+                self.pages.space.free(info.page);
+            }
+            pool.free(frame);
         }
         self.stack = stack;
     }
 
-    /// Positions `cur` on the entry matching `key` under `cmp`, in the version rooted
-    /// at `root`. Returns false if there is no such entry.
-    pub(crate) fn seek(
-        &self,
-        root: FrameId,
-        key: &[u8],
-        cmp: Comparison,
-        cur: &mut Cursor,
-    ) -> bool {
+    /// Frees the pages replaced by versions no reader needs any more, evicting
+    /// any copies cached.
+    fn reclaim(&mut self) {
+        let Pages { pool, cache, space } = &mut self.pages;
+        space.reclaim(|page| {
+            if let Some(frame) = cache.remove(page) {
+                debug_assert_eq!(pool.refs(frame), 0, "reclaimed leaf {page} in use");
+                pool.free(frame);
+            }
+        });
+    }
+
+    // Reads.
+
+    /// Descends from `root` through the internal nodes towards `key`, recording the
+    /// path in `cur`, and returns the page of the leaf where `key` belongs.
+    pub(crate) fn descend(&self, root: Root, key: &[u8], cur: &mut Cursor) -> u64 {
         cur.depth = 0;
-        let mut frame = root;
+        if root.level == 0 {
+            return root.page;
+        }
+        let mut frame = root.frame;
         loop {
             let node = self.node(frame);
             let (i, eq) = node.search(key);
-            if node.level() > 0 {
-                // The child holding `key`: the last one whose smallest key is <= it.
-                let child = if eq { i } else { i.saturating_sub(1) };
-                cur.push(frame, child);
-                frame = node.child(child);
-                continue;
+            // The child holding `key`: the last one whose smallest key is <= it.
+            let child = if eq { i } else { i.saturating_sub(1) };
+            cur.push(frame, child);
+            if node.level() == 1 {
+                return node.child_page(child);
             }
-            let n = node.count();
-            let at = match cmp {
-                Comparison::Equal => eq.then_some(i),
-                Comparison::Floor if eq => Some(i),
-                Comparison::Floor | Comparison::Lower => i.checked_sub(1),
-                Comparison::Ceiling => Some(i).filter(|&i| i < n),
-                Comparison::Higher => Some(i + usize::from(eq)).filter(|&i| i < n),
-            };
-            if let Some(at) = at {
-                cur.push(frame, at);
-                return true;
-            }
-            // The match, if any, is in a neighboring leaf.
-            return match cmp {
-                Comparison::Equal => false,
-                Comparison::Floor | Comparison::Lower => {
-                    cur.push(frame, 0);
-                    self.step(cur, false)
-                }
-                Comparison::Ceiling | Comparison::Higher => {
-                    cur.push(frame, n - 1);
-                    self.step(cur, true)
-                }
-            };
+            frame = node.child(child);
         }
     }
 
-    /// Positions `cur` on the first entry of the version rooted at `root`.
-    pub(crate) fn seek_first(&self, root: FrameId, cur: &mut Cursor) {
+    /// Like [`descend`](Self::descend), to the first leaf.
+    pub(crate) fn descend_first(&self, root: Root, cur: &mut Cursor) -> u64 {
         cur.depth = 0;
-        let mut frame = root;
+        if root.level == 0 {
+            return root.page;
+        }
+        let mut frame = root.frame;
         loop {
             let node = self.node(frame);
             cur.push(frame, 0);
-            if node.level() == 0 {
-                return;
+            if node.level() == 1 {
+                return node.child_page(0);
             }
             frame = node.child(0);
         }
     }
 
-    /// Moves `cur` to the next entry, or the previous one. Returns false, leaving
-    /// `cur` where it was, if there is none.
-    pub(crate) fn step(&self, cur: &mut Cursor, forward: bool) -> bool {
+    /// Moves `cur` to the next leaf, or the previous one, and returns its page;
+    /// `None`, leaving `cur` as it was, if there is none.
+    pub(crate) fn next_leaf(&self, cur: &mut Cursor, forward: bool) -> Option<u64> {
         // Climb to the nearest level that can move that way, and move there.
         let mut depth = cur.depth;
         loop {
             if depth == 0 {
-                return false;
+                return None;
             }
             let (frame, i) = cur.path[depth - 1];
             let i = usize::from(i);
@@ -207,17 +324,149 @@ impl Tree {
             cur.path[depth] = (child, at as u16);
             depth += 1;
         }
-        true
+        let (frame, i) = cur.path[cur.depth - 1];
+        Some(self.node(frame).child_page(usize::from(i)))
     }
 
-    /// Applies a prepared batch and publishes the result as the current version.
-    pub(crate) fn apply(&mut self, batch: &WriteBatch) {
+    /// Looks up the entry matching `key` under `cmp` in the version rooted at
+    /// `root`, using cached leaves only. Copies the key it finds into `out`.
+    pub(crate) fn find(
+        &mut self,
+        root: Option<Root>,
+        key: &[u8],
+        cmp: Comparison,
+        out: &mut Vec<u8>,
+    ) -> Find {
+        let Some(root) = root else {
+            return Find::NotFound;
+        };
+        let mut cur = Cursor::new();
+        let page = self.descend(root, key, &mut cur);
+        let Some(frame) = self.pages.cached(page) else {
+            return Find::Missing(page);
+        };
+        let node = self.node(frame);
+        let (i, eq) = node.search(key);
+        let n = node.count();
+        let at = match cmp {
+            Comparison::Equal => eq.then_some(i),
+            Comparison::Floor if eq => Some(i),
+            Comparison::Floor | Comparison::Lower => i.checked_sub(1),
+            Comparison::Ceiling => Some(i).filter(|&i| i < n),
+            Comparison::Higher => Some(i + usize::from(eq)).filter(|&i| i < n),
+        };
+        let (frame, at) = match at {
+            Some(at) => (frame, at),
+            None if cmp == Comparison::Equal => return Find::NotFound,
+            // The match, if any, is in a neighboring leaf.
+            None => {
+                let forward = matches!(cmp, Comparison::Ceiling | Comparison::Higher);
+                let Some(page) = self.next_leaf(&mut cur, forward) else {
+                    return Find::NotFound;
+                };
+                let Some(frame) = self.pages.cached(page) else {
+                    return Find::Missing(page);
+                };
+                (
+                    frame,
+                    if forward {
+                        0
+                    } else {
+                        self.node(frame).count() - 1
+                    },
+                )
+            }
+        };
+        let node = self.node(frame);
+        node.key_into(at, out);
+        let (offset, len) = node.value_span(at);
+        Find::Found(self.addr(frame, offset), len)
+    }
+
+    // Writes.
+
+    /// Lists in `touched` the leaf pages applying `batch` changes, which the write
+    /// must load before [`apply`](Self::apply). Leaves that ranges remove whole
+    /// aren't listed: the write drops them without reading them.
+    pub(crate) fn plan(&mut self, batch: &WriteBatch) {
+        self.touched.clear();
         let (ops, ranges) = (batch.points(), batch.ranges());
+        if ops.is_empty() && ranges.is_empty() {
+            return;
+        }
+        match self.root {
+            None => {}
+            Some(root) if root.level == 0 => self.touched.push(root.page),
+            Some(root) => {
+                let level = usize::from(root.level);
+                self.ensure_level(level);
+                self.plan_internal(root.frame, level, ops, ranges, None, batch);
+            }
+        }
+    }
+
+    fn plan_internal(
+        &mut self,
+        frame: FrameId,
+        level: usize,
+        mut ops: &[u32],
+        mut ranges: &[(u32, u32)],
+        hi: Option<&[u8]>,
+        batch: &WriteBatch,
+    ) {
+        // SAFETY: internal nodes of the current version stay put until it changes.
+        let node = unsafe { Node::new(self.pages.pool.page_unbounded(frame)) };
+        let mut key = mem::take(&mut self.bounds[2 * level]);
+        let mut next = mem::take(&mut self.bounds[2 * level + 1]);
+        node.key_into(0, &mut key);
+        for i in 0..node.count() {
+            let child_hi = if i + 1 < node.count() {
+                node.key_into(i + 1, &mut next);
+                Some(&next[..])
+            } else {
+                hi
+            };
+            let (child_ops, child_ranges, covered) =
+                split(batch, &mut ops, &mut ranges, &key, child_hi);
+            if !covered && !(child_ops.is_empty() && child_ranges.is_empty()) {
+                if level == 1 {
+                    self.touched.push(node.child_page(i));
+                } else {
+                    self.plan_internal(
+                        node.child(i),
+                        level - 1,
+                        child_ops,
+                        child_ranges,
+                        child_hi,
+                        batch,
+                    );
+                }
+            }
+            mem::swap(&mut key, &mut next);
+        }
+        self.bounds[2 * level] = key;
+        self.bounds[2 * level + 1] = next;
+    }
+
+    /// Applies a prepared batch, whose touched leaves must be cached, building the
+    /// next version. Returns false if the batch changes nothing. Otherwise the new
+    /// version is pending until [`publish`](Self::publish) or
+    /// [`discard`](Self::discard).
+    pub(crate) fn apply(&mut self, batch: &WriteBatch) -> bool {
+        debug_assert!(self.pending.is_none());
+        let (ops, ranges) = (batch.points(), batch.ranges());
+        if ops.is_empty() && ranges.is_empty() {
+            return false;
+        }
+        self.dropped.clear();
         let (level, outcome) = match self.root {
             Some(root) => {
-                let level = usize::from(self.node(root).level());
+                let level = usize::from(root.level);
                 self.ensure_level(level);
-                (level, self.merge(root, level, ops, ranges, None, batch))
+                (
+                    level,
+                    self.merge((root.frame, root.page), level, ops, ranges, None, batch),
+                )
             }
             None => {
                 self.ensure_level(0);
@@ -225,11 +474,128 @@ impl Tree {
             }
         };
         if let Outcome::Unchanged = outcome {
-            return;
+            return false;
         }
-        let root = self.grow(level);
-        if let Some(old) = mem::replace(&mut self.root, root) {
-            self.release(old);
+        if let Some(root) = self.root {
+            self.dropped.push(root.page);
+        }
+        self.pending = Some(self.grow(level));
+        true
+    }
+
+    /// The meta page that makes the pending version current as `generation`.
+    pub(crate) fn pending_meta(&self, generation: u64) -> Meta {
+        let root = self.pending.expect("no pending version");
+        Meta {
+            generation,
+            root: root.map_or(0, |r| r.page),
+            root_level: root.map_or(0, |r| r.level),
+            high_water: self.pages.space.high_water(),
+            ..Meta::empty(self.page_size)
+        }
+    }
+
+    /// Lists in `dirty` the nodes of the pending version that need writing, and
+    /// seals them as written by `generation`.
+    pub(crate) fn seal_pending(&mut self, generation: u64) {
+        self.collect_pending();
+        for i in 0..self.dirty.len() {
+            let frame = self.dirty[i].0;
+            node::seal(self.pages.pool.page_mut(frame), generation);
+        }
+    }
+
+    /// Lists in `dirty` the nodes the pending version doesn't share with the
+    /// current one.
+    fn collect_pending(&mut self) {
+        self.dirty.clear();
+        let Some(Some(root)) = self.pending else {
+            return;
+        };
+        // Leaves this write built are cached until it ends, so an uncached leaf is
+        // one it kept.
+        if root.level == 0 {
+            if let Some(frame) = self.pages.cached(root.page)
+                && self.pages.pool.frame(frame).dirty
+            {
+                self.dirty.push((frame, root.page));
+            }
+        } else if self.pages.pool.frame(root.frame).dirty {
+            self.collect_dirty(root.frame, root.page);
+        }
+    }
+
+    fn collect_dirty(&mut self, frame: FrameId, page: u64) {
+        self.dirty.push((frame, page));
+        // SAFETY: the pending version's nodes stay put until it is published.
+        let node = unsafe { Node::new(self.pages.pool.page_unbounded(frame)) };
+        for i in 0..node.count() {
+            let page = node.child_page(i);
+            if node.level() == 1 {
+                if let Some(leaf) = self.pages.cached(page)
+                    && self.pages.pool.frame(leaf).dirty
+                {
+                    self.dirty.push((leaf, page));
+                }
+            } else if self.pages.pool.frame(node.child(i)).dirty {
+                self.collect_dirty(node.child(i), page);
+            }
+        }
+    }
+
+    /// Makes the pending version current, as `generation`, once committed.
+    pub(crate) fn publish(&mut self, generation: u64) {
+        self.unpin_touched();
+        let root = self.pending.take().expect("no pending version");
+        let pool = &mut self.pages.pool;
+        for &(frame, _) in &self.dirty {
+            let info = pool.frame_mut(frame);
+            info.dirty = false;
+            if info.holds == Holds::Leaf {
+                // Committed leaves are ordinary cached leaves, free to evict.
+                pool.unref(frame);
+            }
+        }
+        self.dirty.clear();
+        if let Some(old) = mem::replace(&mut self.root, root)
+            && old.frame != NO_FRAME
+        {
+            self.release(old.frame);
+        }
+        for page in self.dropped.drain(..) {
+            self.pages.space.drop_page(generation, page);
+        }
+        self.generation = generation;
+        self.reclaim();
+    }
+
+    /// Throws the pending version away: the write failed before committing it.
+    pub(crate) fn discard(&mut self) {
+        self.unpin_touched();
+        self.dropped.clear();
+        self.collect_pending();
+        let Some(root) = self.pending.take() else {
+            return;
+        };
+        let Pages { pool, cache, space } = &mut self.pages;
+        for &(frame, page) in &self.dirty {
+            if pool.frame(frame).holds == Holds::Leaf {
+                cache.remove(page);
+                pool.unref(frame);
+                pool.free(frame);
+                space.free(page);
+            }
+        }
+        self.dirty.clear();
+        if let Some(root) = root.filter(|r| r.frame != NO_FRAME) {
+            self.release(root.frame);
+        }
+    }
+
+    /// Releases the leaves the write in progress pinned.
+    pub(crate) fn unpin_touched(&mut self) {
+        for frame in self.pinned.drain(..) {
+            self.pages.pool.unref(frame);
         }
     }
 
@@ -245,10 +611,10 @@ impl Tree {
     }
 
     /// Applies `ops` and `ranges`, which all fall below `hi`, to the subtree at
-    /// `frame`. Its replacement nodes, if any, go to `lists[level]`.
+    /// `node` (frame and page). Its replacement nodes, if any, go to `lists[level]`.
     fn merge(
         &mut self,
-        frame: FrameId,
+        node: (FrameId, u64),
         level: usize,
         ops: &[u32],
         ranges: &[(u32, u32)],
@@ -256,9 +622,9 @@ impl Tree {
         batch: &WriteBatch,
     ) -> Outcome {
         if level == 0 {
-            self.merge_leaf(Some(frame), ops, ranges, batch)
+            self.merge_leaf(Some(node.1), ops, ranges, batch)
         } else {
-            self.merge_internal(frame, level, ops, ranges, hi, batch)
+            self.merge_internal(node.0, level, ops, ranges, hi, batch)
         }
     }
 
@@ -273,7 +639,7 @@ impl Tree {
     ) -> Outcome {
         // SAFETY: published frames are never modified, and this one stays referenced
         // by the current root until the write publishes its new root.
-        let node = unsafe { Node::new(self.pool.page_unbounded(frame)) };
+        let node = unsafe { Node::new(self.pages.pool.page_unbounded(frame)) };
         let below = level - 1;
         let mark = self.lists[below].mark();
         let mut key = mem::take(&mut self.bounds[2 * level]);
@@ -281,32 +647,28 @@ impl Tree {
         let mut changed = false;
         node.key_into(0, &mut key);
         for i in 0..node.count() {
-            let child = node.child(i);
+            let child = (node.child(i), node.child_page(i));
             let child_hi = if i + 1 < node.count() {
                 node.key_into(i + 1, &mut next);
                 Some(&next[..])
             } else {
                 hi
             };
-            let n = child_hi.map_or(ops.len(), |hi| ops.partition_point(|&o| batch.key(o) < hi));
-            let (child_ops, rest) = ops.split_at(n);
-            ops = rest;
-            // Ranges ending at or before this child's smallest key can't touch it, or
-            // any later child.
-            ranges = &ranges[ranges.partition_point(|&(_, e)| batch.range_end(e) <= &key[..])..];
-            let n = child_hi.map_or(ranges.len(), |hi| {
-                ranges.partition_point(|&(s, _)| batch.range_start(s) < hi)
-            });
-            let child_ranges = &ranges[..n];
+            let (child_ops, child_ranges, covered) =
+                split(batch, &mut ops, &mut ranges, &key, child_hi);
             if child_ops.is_empty() && child_ranges.is_empty() {
                 self.keep(below, &key, child);
-            } else if child_ops.is_empty() && covers(batch, child_ranges, &key, child_hi) {
-                // The whole subtree goes, without visiting it.
+            } else if covered {
+                // The whole subtree goes, without reading its leaves.
+                self.drop_subtree(child, below);
                 changed = true;
             } else {
                 match self.merge(child, below, child_ops, child_ranges, child_hi, batch) {
                     Outcome::Unchanged => self.keep(below, &key, child),
-                    Outcome::Replaced => changed = true,
+                    Outcome::Replaced => {
+                        self.dropped.push(child.1);
+                        changed = true;
+                    }
                 }
             }
             mem::swap(&mut key, &mut next);
@@ -314,7 +676,7 @@ impl Tree {
         self.bounds[2 * level] = key;
         self.bounds[2 * level + 1] = next;
         if !changed {
-            self.discard(below, mark);
+            self.discard_list(below, mark);
             return Outcome::Unchanged;
         }
         self.fix_underfull(below, mark.items);
@@ -324,13 +686,20 @@ impl Tree {
 
     fn merge_leaf(
         &mut self,
-        frame: Option<FrameId>,
+        page: Option<u64>,
         ops: &[u32],
         ranges: &[(u32, u32)],
         batch: &WriteBatch,
     ) -> Outcome {
-        // SAFETY: as in `merge_internal`.
-        let node = frame.map(|f| unsafe { Node::new(self.pool.page_unbounded(f)) });
+        let node = page.map(|page| {
+            let frame = self
+                .pages
+                .cached(page)
+                .expect("the write loads the leaves it changes");
+            // SAFETY: the write pinned this leaf, and published frames are never
+            // modified.
+            unsafe { Node::new(self.pages.pool.page_unbounded(frame)) }
+        });
         let old = node.map_or(0, |n| n.count());
         let (leaf, run_ends) = (&mut self.leaf, &mut self.run_ends);
         leaf.clear();
@@ -381,8 +750,8 @@ impl Tree {
         if !changed {
             return Outcome::Unchanged;
         }
-        let (pool, out, leaf, page) = (
-            &mut self.pool,
+        let (pages, out, leaf, page) = (
+            &mut self.pages,
             &mut self.lists[0],
             &self.leaf,
             self.page_size,
@@ -392,7 +761,7 @@ impl Tree {
             return Outcome::Replaced;
         }
         if node::size(leaf, 0, n) <= page {
-            emit(pool, out, 0, leaf, 0, n);
+            emit(pages, out, 0, leaf, 0, n);
             return Outcome::Replaced;
         }
         // Split after each run of puts that fills at least a quarter page, as when
@@ -407,26 +776,62 @@ impl Tree {
             }
             while s < end {
                 let e = node::fit(leaf, s, end, page);
-                emit(pool, out, 0, leaf, s, e);
+                emit(pages, out, 0, leaf, s, e);
                 s = e;
             }
         }
-        emit_even(pool, out, 0, leaf, s, n, page);
+        emit_even(pages, out, 0, leaf, s, n, page);
         Outcome::Replaced
     }
 
     /// Adds an unchanged node to `lists[level]`.
-    fn keep(&mut self, level: usize, key: &[u8], frame: FrameId) {
-        self.pool.retain(frame);
-        let used = self.node(frame).used();
-        self.lists[level].push(key, frame, used, false);
+    fn keep(&mut self, level: usize, key: &[u8], (frame, page): (FrameId, u64)) {
+        if frame != NO_FRAME {
+            self.pages.pool.retain(frame);
+        }
+        self.lists[level].push(key, frame, page, u32::MAX as usize, false);
     }
 
-    /// Drops the nodes added to `lists[level]` since `mark`.
-    fn discard(&mut self, level: usize, mark: Mark) {
+    /// Records every page of the subtree at `node` as dropped.
+    fn drop_subtree(&mut self, (frame, page): (FrameId, u64), level: usize) {
+        self.dropped.push(page);
+        if level == 0 {
+            return;
+        }
+        // SAFETY: as in `merge_internal`.
+        let node = unsafe { Node::new(self.pages.pool.page_unbounded(frame)) };
+        for i in 0..node.count() {
+            self.drop_subtree((node.child(i), node.child_page(i)), level - 1);
+        }
+    }
+
+    /// Lets go of a node from `lists[level]` that the new version won't use. A node
+    /// this write built is freed now. One from the published version keeps its
+    /// page until older readers are gone.
+    fn forget(&mut self, level: usize, item: Item) {
+        if !item.fresh {
+            self.dropped.push(item.page);
+            if item.frame != NO_FRAME {
+                self.release(item.frame);
+            }
+        } else if level > 0 {
+            self.release(item.frame);
+        } else {
+            let Pages { pool, cache, space } = &mut self.pages;
+            let frame = cache.remove(item.page).expect("fresh leaves are cached");
+            pool.unref(frame);
+            pool.free(frame);
+            space.free(item.page);
+        }
+    }
+
+    /// Drops the nodes added to `lists[level]` since `mark`, all unchanged ones.
+    fn discard_list(&mut self, level: usize, mark: Mark) {
         for i in mark.items..self.lists[level].len() {
             let frame = self.lists[level].items[i].frame;
-            self.release(frame);
+            if frame != NO_FRAME {
+                self.release(frame);
+            }
         }
         self.lists[level].truncate(mark);
     }
@@ -438,7 +843,7 @@ impl Tree {
         let children = &mut lower[level];
         let (a, b) = (mark.items, children.len());
         emit_even(
-            &mut self.pool,
+            &mut self.pages,
             &mut upper[0],
             level as u8 + 1,
             &*children,
@@ -451,7 +856,7 @@ impl Tree {
 
     /// Merges each node this write built that is under a quarter full into a
     /// neighbor, among the nodes of `lists[level]` past `start`, if the two fit in a
-    /// page.
+    /// page and the neighbor is in memory.
     fn fix_underfull(&mut self, level: usize, start: usize) {
         let mut k = start;
         'next: while k < self.lists[level].len() {
@@ -471,15 +876,23 @@ impl Tree {
         }
     }
 
-    /// Rebuilds nodes `a` and `a + 1` of `lists[level]` as one node, if they fit.
+    /// Rebuilds nodes `a` and `a + 1` of `lists[level]` as one node, if they fit
+    /// and are in memory.
     fn merge_pair(&mut self, level: usize, a: usize) -> bool {
         let (x, y) = {
             let items = &self.lists[level].items;
-            (items[a].frame, items[a + 1].frame)
+            (items[a], items[a + 1])
         };
         self.pair.clear();
-        for frame in [x, y] {
-            let node = Node::new(self.pool.page(frame));
+        for item in [x, y] {
+            let frame = if level > 0 {
+                item.frame
+            } else if let Some(frame) = self.pages.cached(item.page) {
+                frame
+            } else {
+                return false;
+            };
+            let node = Node::new(self.pages.pool.page(frame));
             for i in 0..node.count() {
                 self.pair.push_from(&node, i);
             }
@@ -488,23 +901,25 @@ impl Tree {
         if node::size(&self.pair, 0, n) > self.page_size {
             return false;
         }
-        let frame = self.pool.alloc();
-        let used = node::build(self.pool.page_mut(frame), level as u8, &self.pair, 0, n);
+        let (frame, page, used) = self.pages.build(level as u8, &self.pair, 0, n);
         if level > 0 {
-            // The new node becomes another parent of every child of the two.
+            // The new node becomes another parent of every internal child of the two.
             for i in 0..n {
-                self.pool.retain(node::child_frame(self.pair.value(i)));
+                let child = node::child_frame(self.pair.value(i));
+                if child != NO_FRAME {
+                    self.pages.pool.retain(child);
+                }
             }
         }
-        self.lists[level].replace_pair(a, self.pair.key(0), frame, used);
-        self.release(x);
-        self.release(y);
+        self.lists[level].replace_pair(a, self.pair.key(0), frame, page, used);
+        self.forget(level, x);
+        self.forget(level, y);
         true
     }
 
     /// Stacks levels on the replacement nodes for the root, in `lists[level]`,
     /// until one node remains, and returns it as the new root.
-    fn grow(&mut self, mut level: usize) -> Option<FrameId> {
+    fn grow(&mut self, mut level: usize) -> Option<Root> {
         loop {
             if self.lists[level].len() > 1 {
                 self.fix_underfull(level, 0);
@@ -520,41 +935,75 @@ impl Tree {
             }
         }
         // The list's reference becomes the root's.
-        let mut root = self.lists[level].items[0].frame;
+        let item = self.lists[level].items[0];
         self.lists[level].truncate(Mark::default());
+        let mut root = Root {
+            page: item.page,
+            frame: item.frame,
+            level: level as u8,
+        };
         // A root with a single child is redundant.
-        loop {
-            let node = self.node(root);
-            if node.level() == 0 || node.count() > 1 {
-                return Some(root);
+        while root.level > 0 {
+            let node = self.node(root.frame);
+            if node.count() > 1 {
+                break;
             }
-            let child = node.child(0);
-            self.pool.retain(child);
-            self.release(root);
+            let child = Root {
+                page: node.child_page(0),
+                frame: node.child(0),
+                level: root.level - 1,
+            };
+            if child.frame != NO_FRAME {
+                self.pages.pool.retain(child.frame);
+            }
+            if !self.pages.pool.frame(root.frame).dirty {
+                self.dropped.push(root.page);
+            }
+            self.release(root.frame);
             root = child;
         }
+        Some(root)
     }
 }
 
-/// Whether `ranges` remove every key in `lo..hi`, which holds when the first of
-/// them, the only one that can contain `lo`, spans it all.
-fn covers(batch: &WriteBatch, ranges: &[(u32, u32)], lo: &[u8], hi: Option<&[u8]>) -> bool {
-    match (ranges.first(), hi) {
-        (Some(&(s, e)), Some(hi)) => batch.range_start(s) <= lo && batch.range_end(e) >= hi,
-        _ => false,
-    }
+/// Takes the operations and ranges falling in one child, whose keys are
+/// `key..hi`, off the front of `ops` and `ranges`, which are sorted and fall at or
+/// after `key`. Also returns whether the ranges remove the child whole.
+fn split<'o, 'r>(
+    batch: &WriteBatch,
+    ops: &mut &'o [u32],
+    ranges: &mut &'r [(u32, u32)],
+    key: &[u8],
+    hi: Option<&[u8]>,
+) -> (&'o [u32], &'r [(u32, u32)], bool) {
+    let n = hi.map_or(ops.len(), |hi| ops.partition_point(|&o| batch.key(o) < hi));
+    let (child_ops, rest) = ops.split_at(n);
+    *ops = rest;
+    // Ranges ending at or before this child's smallest key can't touch it, or any
+    // later child.
+    *ranges = &ranges[ranges.partition_point(|&(_, e)| batch.range_end(e) <= key)..];
+    let n = hi.map_or(ranges.len(), |hi| {
+        ranges.partition_point(|&(s, _)| batch.range_start(s) < hi)
+    });
+    let child_ranges = &ranges[..n];
+    // Only the first range can contain `key`; the child goes if it spans it all.
+    let covered = child_ops.is_empty()
+        && match (child_ranges.first(), hi) {
+            (Some(&(s, e)), Some(hi)) => batch.range_start(s) <= key && batch.range_end(e) >= hi,
+            _ => false,
+        };
+    (child_ops, child_ranges, covered)
 }
 
 /// Builds entries `a..b` of `src` into a new node at `level`, appended to `out`.
-fn emit(pool: &mut Pool, out: &mut NodeList, level: u8, src: &impl Entries, a: usize, b: usize) {
-    let frame = pool.alloc();
-    let used = node::build(pool.page_mut(frame), level, src, a, b);
-    out.push(src.key(a), frame, used, true);
+fn emit(pages: &mut Pages, out: &mut NodeList, level: u8, src: &impl Entries, a: usize, b: usize) {
+    let (frame, page, used) = pages.build(level, src, a, b);
+    out.push(src.key(a), frame, page, used, true);
 }
 
 /// Builds entries `a..b` of `src` into as few nodes as fit, of similar sizes.
 fn emit_even(
-    pool: &mut Pool,
+    pages: &mut Pages,
     out: &mut NodeList,
     level: u8,
     src: &impl Entries,
@@ -566,16 +1015,17 @@ fn emit_even(
     while s < b {
         let total = node::size(src, s, b);
         if total <= page_size {
-            emit(pool, out, level, src, s, b);
+            emit(pages, out, level, src, s, b);
             return;
         }
         let e = node::fit(src, s, b, total / total.div_ceil(page_size));
-        emit(pool, out, level, src, s, e);
+        emit(pages, out, level, src, s, e);
         s = e;
     }
 }
 
-/// Nodes replacing one node's children, in key order, each holding a reference.
+/// Nodes replacing one node's children, in key order. Each internal node holds a
+/// reference; each leaf is found through the cache.
 #[derive(Default)]
 struct NodeList {
     /// Each node's smallest key, followed by a child reference to it.
@@ -588,6 +1038,8 @@ struct Item {
     at: u32,
     key_len: u32,
     frame: FrameId,
+    page: u64,
+    /// Bytes used, known for the nodes this write built.
     used: u32,
     /// Built by this write, rather than kept from the previous version.
     fresh: bool,
@@ -616,23 +1068,24 @@ impl NodeList {
         self.bytes.truncate(mark.bytes);
     }
 
-    fn push(&mut self, key: &[u8], frame: FrameId, used: usize, fresh: bool) {
+    fn push(&mut self, key: &[u8], frame: FrameId, page: u64, used: usize, fresh: bool) {
         let at = self.bytes.len() as u32;
         self.bytes.extend_from_slice(key);
-        self.bytes.extend_from_slice(&node::child_ref(frame));
-        let (key_len, used) = (key.len() as u32, used as u32);
+        self.bytes.extend_from_slice(&node::child_ref(frame, page));
+        let (key_len, used) = (key.len() as u32, used.min(u32::MAX as usize) as u32);
         self.items.push(Item {
             at,
             key_len,
             frame,
+            page,
             used,
             fresh,
         });
     }
 
     /// Replaces nodes `i` and `i + 1` with a fresh node starting at `key`.
-    fn replace_pair(&mut self, i: usize, key: &[u8], frame: FrameId, used: usize) {
-        self.push(key, frame, used, true);
+    fn replace_pair(&mut self, i: usize, key: &[u8], frame: FrameId, page: u64, used: usize) {
+        self.push(key, frame, page, used, true);
         self.items[i] = self.items.pop().unwrap();
         self.items.remove(i + 1);
     }
@@ -650,7 +1103,8 @@ impl Entries for NodeList {
     }
 }
 
-/// A reader's position: the node and entry index at each level, root first.
+/// A reader's path through the internal nodes: the node and child index at each
+/// level, root first.
 #[derive(Clone)]
 pub(crate) struct Cursor {
     path: [(FrameId, u16); MAX_HEIGHT],
@@ -669,45 +1123,74 @@ impl Cursor {
         self.path[self.depth] = (frame, i as u16);
         self.depth += 1;
     }
-
-    /// The leaf and entry index the cursor is on.
-    pub(crate) fn leaf(&self) -> (FrameId, usize) {
-        let (frame, i) = self.path[self.depth - 1];
-        (frame, usize::from(i))
-    }
 }
 
 #[cfg(test)]
 impl Tree {
-    /// Checks the tree's structure, and that it holds the only reference to every
-    /// allocated frame. Panics on a violation. Only valid while no reader is pinned.
-    pub(crate) fn check(&self) {
-        let mut nodes = 0;
+    /// Checks the tree's structure and accounting. Panics on a violation. Only
+    /// valid while no reader is pinned and no write is in progress.
+    ///
+    /// Leaves are checked when cached; contents are left to the callers' scans.
+    pub(crate) fn check(&mut self) {
+        let mut stats = Stats::default();
         if let Some(root) = self.root {
-            let level = self.node(root).level();
-            self.check_node(root, level, None, None, &mut nodes);
+            self.check_node((root.frame, root.page), root.level, None, None, &mut stats);
         }
-        assert_eq!(self.pool.in_use(), nodes, "frames leaked");
+        let Pages { pool, cache, space } = &self.pages;
+        assert_eq!(space.dropped().count(), 0, "replaced pages not reclaimed");
+        assert_eq!(
+            space.used_count() as u64,
+            crate::meta::META_PAGES + stats.pages,
+            "pages leaked"
+        );
+        assert_eq!(pool.in_use(), stats.internal + cache.len(), "frames leaked");
+        for (page, frame) in cache.entries() {
+            let info = pool.frame(frame);
+            assert_eq!(
+                (info.holds, info.page, info.dirty),
+                (Holds::Leaf, page, false)
+            );
+            assert_eq!(pool.refs(frame), 0, "leaf {page} still pinned");
+            assert!(space.is_used(page), "cached leaf {page} on a free page");
+        }
+        assert!(self.pinned.is_empty() && self.dirty.is_empty() && self.pending.is_none());
     }
 
-    /// Checks the subtree at `frame`, whose keys must fall in `lo..hi`, and returns
-    /// its smallest key.
+    /// Checks the subtree at `node`, whose keys fall in `lo..hi`, and returns its
+    /// smallest key if known.
     fn check_node(
-        &self,
-        frame: FrameId,
+        &mut self,
+        (frame, page): (FrameId, u64),
         level: u8,
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
-        nodes: &mut usize,
-    ) -> Vec<u8> {
-        *nodes += 1;
-        assert_eq!(
-            self.pool.refs(frame),
-            1,
-            "frame {frame} has extra references"
+        stats: &mut Stats,
+    ) -> Option<Vec<u8>> {
+        stats.pages += 1;
+        assert!(
+            self.pages.space.is_used(page),
+            "page {page} in the tree but free"
         );
+        let frame = if level == 0 {
+            assert_eq!(frame, NO_FRAME);
+            self.pages.cached(page)?
+        } else {
+            stats.internal += 1;
+            let info = *self.pages.pool.frame(frame);
+            assert_eq!(
+                (info.holds, info.page, info.dirty),
+                (Holds::Internal, page, false)
+            );
+            assert_eq!(
+                self.pages.pool.refs(frame),
+                1,
+                "frame {frame} has extra references"
+            );
+            frame
+        };
         let node = self.node(frame);
         assert_eq!(node.level(), level, "uneven depth");
+        assert!(node.generation() <= self.generation, "node from the future");
         let n = node.count();
         assert!(n > 0, "empty node");
         let mut entries = EntryBuf::default();
@@ -734,35 +1217,39 @@ impl Tree {
                 } else {
                     hi
                 };
-                let child = node.child(i);
-                let min = self.check_node(child, level - 1, Some(entries.key(i)), child_hi, nodes);
-                assert_eq!(
-                    min,
-                    entries.key(i),
-                    "internal key isn't its child's smallest"
+                let child = (
+                    node::child_frame(entries.value(i)),
+                    node::child_page(entries.value(i)),
                 );
+                let min = self.check_node(child, level - 1, Some(entries.key(i)), child_hi, stats);
+                if let Some(min) = min {
+                    assert_eq!(
+                        min,
+                        entries.key(i),
+                        "internal key isn't its child's smallest"
+                    );
+                }
             }
         }
-        entries.key(0).to_vec()
+        Some(entries.key(0).to_vec())
     }
 
-    /// Number of leaves, and the bytes they use.
+    /// Number of cached leaves, and the bytes they use.
     pub(crate) fn leaf_usage(&self) -> (usize, usize) {
-        let mut usage = (0, 0);
-        let mut stack: Vec<FrameId> = self.root.into_iter().collect();
-        while let Some(frame) = stack.pop() {
-            let node = self.node(frame);
-            if node.level() == 0 {
-                usage.0 += 1;
-                usage.1 += node.used();
-            } else {
-                stack.extend((0..node.count()).map(|i| node.child(i)));
-            }
-        }
-        usage
+        let (pool, cache) = (&self.pages.pool, &self.pages.cache);
+        cache.entries().fold((0, 0), |(n, used), (_, frame)| {
+            (n + 1, used + Node::new(pool.page(frame)).used())
+        })
     }
 
     pub(crate) fn page_size(&self) -> usize {
         self.page_size
     }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Stats {
+    pages: u64,
+    internal: usize,
 }

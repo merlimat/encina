@@ -7,7 +7,12 @@ license = "Apache-2.0"
 
 [dependencies]
 compio = { version = "0.19.2", features = ["fs"] }
+crc32c = "0.6"
 
 [dev-dependencies]
 compio = { version = "0.19.2", features = ["macros"] }
 proptest = "1"
+tempfile = "3"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"

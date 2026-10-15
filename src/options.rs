@@ -15,15 +15,25 @@
 use crate::error::{Error, Result};
 use crate::node;
 
+/// The smallest cache: a write needs a few leaves in memory at once.
+const MIN_CACHE_FRAMES: usize = 8;
+
+/// The smallest page size. Tests use tiny pages to grow deep trees from few entries.
+pub(crate) const MIN_PAGE_SIZE: usize = if cfg!(test) { 256 } else { 4096 };
+
 /// Configuration for a store.
 #[derive(Clone, Debug)]
 pub struct Options {
     pub(crate) page_size: usize,
+    pub(crate) cache_size: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { page_size: 4096 }
+        Options {
+            page_size: 4096,
+            cache_size: 64 << 20,
+        }
     }
 }
 
@@ -41,6 +51,17 @@ impl Options {
         self
     }
 
+    /// Sets the memory budget for pages, 64 MiB by default.
+    ///
+    /// Internal nodes always stay in memory; leaves are cached within what's left,
+    /// and evicted roughly least recently used first. A write needs the leaves it changes
+    /// and the ones it builds in memory at once, so a large batch can exceed the
+    /// budget until it commits.
+    pub fn cache_size(mut self, bytes: usize) -> Self {
+        self.cache_size = bytes;
+        self
+    }
+
     /// The largest key plus value a store with these options accepts. Larger
     /// entries make [`Db::write`](crate::Db::write) reject the whole batch with
     /// [`Error::EntryTooLarge`].
@@ -49,13 +70,16 @@ impl Options {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        // Tests use tiny pages to grow deep trees from few entries.
-        let min = if cfg!(test) { 256 } else { 4096 };
-        if !self.page_size.is_power_of_two() || !(min..=65536).contains(&self.page_size) {
+        if !self.page_size.is_power_of_two() || !(MIN_PAGE_SIZE..=65536).contains(&self.page_size) {
             return Err(Error::InvalidOptions(
                 "page size must be a power of two from 4 KiB to 64 KiB",
             ));
         }
         Ok(())
+    }
+
+    /// The number of page frames the cache budget allows.
+    pub(crate) fn cache_frames(&self) -> usize {
+        (self.cache_size / self.page_size).max(MIN_CACHE_FRAMES)
     }
 }

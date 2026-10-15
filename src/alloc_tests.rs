@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Checks that reads, iteration, and writes from a reused batch don't allocate.
+//! Checks that reads and iteration over cached pages, and writes from a reused
+//! batch, don't allocate. The simulated disk doesn't either, once warm; compio
+//! allocates per operation on a real one.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+use crate::sim::SimDisk;
 use crate::tests::now;
 use crate::{Comparison, Db, Options, WriteBatch};
 
@@ -85,7 +88,7 @@ fn fill(batch: &mut WriteBatch, value: u8) {
 
 #[test]
 fn the_data_path_does_not_allocate() {
-    let db = Db::in_memory(Options::default()).unwrap();
+    let db = now(Db::open_sim(SimDisk::new(), Options::default())).unwrap();
     let mut batch = WriteBatch::new();
     // The first writes grow the frame pool and the scratch space.
     for value in 0..3 {
