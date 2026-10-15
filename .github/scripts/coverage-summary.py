@@ -19,8 +19,9 @@ as the error branch of a `?`.
 
 Usage: coverage-summary.py REPORT
 
-In GitHub Actions, it also sets the step output `totals` to the totals on one
-line, as in `lines 97.8% (65 missed), regions 97.9% (117 missed), ...`.
+In GitHub Actions, it also writes the summary to the job summary, and sets the
+step output `totals` to the totals on one line, as in
+`lines 97.8% (65 missed), regions 97.9% (117 missed), functions 97.8% (8 missed)`.
 """
 
 import json
@@ -34,23 +35,33 @@ KINDS = ("lines", "regions", "functions")
 def main():
     with open(sys.argv[1]) as f:
         report = json.load(f)["data"][0]
-    totals = report["totals"]
+    text = "\n".join(summary(report)) + "\n"
+    print(text, end="")
+    if "GITHUB_STEP_SUMMARY" in os.environ:
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+            out.write(text)
     if "GITHUB_OUTPUT" in os.environ:
+        totals = report["totals"]
         with open(os.environ["GITHUB_OUTPUT"], "a") as out:
             line = ", ".join(f"{kind} {coverage(totals[kind])}" for kind in KINDS)
             print(f"totals={line}", file=out)
 
-    files = sorted(report["files"], key=lambda f: f["filename"])
-    print("## Coverage\n")
-    print("| File | Lines | Regions | Functions |")
-    print("|---|---|---|---|")
-    for name, summary in [(f"`{path(f)}`", f["summary"]) for f in files] + [
-        ("Total", totals)
-    ]:
-        print(f"| {name} | {' | '.join(coverage(summary[kind]) for kind in KINDS)} |")
 
-    print("\n### Not covered\n")
-    print(
+def summary(report):
+    """The summary's lines."""
+    files = sorted(report["files"], key=lambda f: f["filename"])
+    yield "## Coverage"
+    yield ""
+    yield "| File | Lines | Regions | Functions |"
+    yield "|---|---|---|---|"
+    rows = [(f"`{path(f)}`", f["summary"]) for f in files]
+    for name, s in rows + [("**Total**", report["totals"])]:
+        yield f"| {name} | {' | '.join(coverage(s[kind]) for kind in KINDS)} |"
+
+    yield ""
+    yield "### Not covered"
+    yield ""
+    yield (
         "Each line no test runs, and on lines that do run, a `^` under each region "
         "that doesn't."
     )
@@ -60,17 +71,20 @@ def main():
             continue
         with open(file["filename"], encoding="utf-8") as f:
             source = f.read().split("\n")
-        print(f"\n`{path(file)}`\n\n```text")
+        yield ""
+        yield f"`{path(file)}`"
+        yield ""
+        yield "```text"
         previous = None
         for line in sorted(unrun | gaps.keys()):
             if previous is not None and line > previous + 1:
-                print("  ...")
+                yield "  ..."
             text = source[line - 1]
-            print(f"{line:5} | {text}")
+            yield f"{line:5} | {text}"
             if line in gaps:
-                print(f"{'':5} | {markers(text, gaps[line])}")
+                yield f"{'':5} | {markers(text, gaps[line])}"
             previous = line
-        print("```")
+        yield "```"
 
 
 def path(file):

@@ -38,7 +38,7 @@ jobs:
           PROPTEST_RNG_SEED: 1
       - name: Summarize
         id: summary
-        run: python3 .github/scripts/coverage-summary.py target/coverage.json >> "$GITHUB_STEP_SUMMARY"
+        run: python3 .github/scripts/coverage-summary.py target/coverage.json
       - name: Post the totals as a commit status
         if: github.event.pull_request.head.repo.full_name == github.repository
         env:
