@@ -513,9 +513,10 @@ complete without suspending.
   reopening must yield the state after the last successful write (or after the
   failed one, when the failure hit a commit).
   This enumerates every failure point instead of sampling them; the scenario's
-  reads include scans, so failures hit reads ahead too. Measuring coverage of
-  error-handling branches in CI (`cargo llvm-cov`), where an uncovered failure path
-  needs a test or a written reason, is planned for M3.
+  reads include scans, so failures hit reads ahead too. CI measures coverage on
+  every pull request (`cargo llvm-cov`), posts the totals as a status, and lists
+  the lines and regions no test runs, such as the error branch of a `?`. An
+  uncovered failure path needs a test or a written reason.
 - **Reads in flight:** the simulated disk can also hold leaf reads until a test
   releases them, and keeps the buffer of a held read that is cancelled, as a kernel
   would. Tests use it to check that concurrent misses share one read, that an
@@ -548,7 +549,7 @@ complete without suspending.
    the next one), the dense node format if benchmarks justify it, yielding inside
    large merges, writing large batches' new leaves early, one shared read for
    concurrent misses and reading ahead in iterators (done, §8), coverage measured
-   in CI, and benchmarks against RocksDB.
+   in CI (done, §11), and benchmarks against RocksDB.
 
 ## Non-goals (for now)
 
