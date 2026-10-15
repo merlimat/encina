@@ -187,11 +187,13 @@ doesn't allocate. The operations are applied in order and atomically.
 Large batches yield to the executor every N leaves. This is safe because readers
 keep using the old root until the swap, and the lock keeps other writers out.
 
-**Split policy.** If all keys inserted into a leaf fall into one gap between existing
-entries (the per-ledger append case), split right after the inserted run: the
-existing entries after the gap become their own leaf. Leaves holding a ledger's
-settled entries then stop being rewritten by later appends. Otherwise, split evenly
-by bytes. There is no strict 50% minimum fill: a rebuilt leaf below ~25% merges with
+**Split policy.** A rebuilt leaf that overflows splits right after each run of
+inserted keys that fills at least a quarter page (the per-ledger append case): the
+run's leaves are packed full, and the existing entries after it start a new leaf. A
+ledger's settled entries then stop being rewritten by later appends, even when one
+leaf holds the tails of several ledgers. Smaller runs, like scattered inserts, don't
+get leaves of their own, and whatever follows the last split point is split evenly
+by bytes. There is no strict 50% minimum fill: a rebuilt node below ~25% merges with
 a neighbor.
 
 ### `delete_range(start..end)`

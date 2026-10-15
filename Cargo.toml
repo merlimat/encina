@@ -9,3 +9,4 @@ compio = { version = "0.19.2", features = ["fs"] }
 
 [dev-dependencies]
 compio = { version = "0.19.2", features = ["macros"] }
+proptest = "1"
