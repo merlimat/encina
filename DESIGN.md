@@ -232,7 +232,10 @@ Every `write()` ends with a commit that makes its batch durable in one atomic st
 
 1. Seal the new version's dirty nodes: stamp the generation and the checksum. Each
    already has its page, so they can be written in any order.
-2. Write them, 16 at a time, await every write, `sync_data`.
+2. Sort them by page, and write each run of adjacent pages with one vectored write
+   of up to 1 MiB, 16 writes at a time. Await every write, then `sync_data`.
+   Allocation hands a write its pages in runs (see below), so a commit takes a few
+   large requests rather than one per page.
 3. Write the meta page into slot `(gen + 1) % 2`, then `sync_data`. The commit is
    durable.
 4. Publish the new root. The written leaves become evictable, and the pages this
@@ -274,8 +277,27 @@ below the high-water mark is free, tracked in an in-memory bitmap (1 bit per pag
 128 KiB covers 4 GiB). Nothing on disk can drift out of sync with the tree, and a
 crash cannot leak space.
 
-At runtime, allocation takes the lowest free page (keeping the file compact) or
-extends the file.
+At runtime, a write takes its pages in order from runs of free pages: the first
+free stretch of at least 16 pages (64 KiB with 4 KiB pages), then the next one,
+and at the end of the file, 256 pages at a time. Shorter holes are skipped: each
+would cost a request for a page or two, and they become usable once the pages
+around them are freed too. Every write starts over from the lowest free page. The
+pages it frees again before it ends, as when two nodes merge, are holes in its own
+runs, which its next short-lived pages fill (see below).
+
+Pages replaced together should be freed together, as runs again, so a write
+allocates from two runs at once: one for pages likely to be replaced soon
+(internal nodes, and leaves that may take more keys), and one for the full leaves
+that a run of appends leaves behind, which are likely to stay. With appends, as to
+ledgers, each batch replaces the short-lived pages of the batch before as a whole,
+and the batch after reuses their space as one run.
+
+The cost is space. On the BookKeeper-shaped benchmark (10 million entries in 100
+batches) the file ends up 21% larger than when allocation took the lowest free
+page, and in a simulation of random updates over 22,000 leaves it settled at
+2.8–3.3× the live pages instead of 2×. In exchange, that benchmark's load sent
+4,540 write requests averaging 158 KiB instead of 169,500 of 4 KiB, and ran three
+times as fast.
 
 ### Recovery
 
@@ -334,18 +356,21 @@ completed write.
   process, so it also stops a second open from another thread of the same process,
   the likely mistake with one instance per thread.
 - All file I/O goes through compio 0.19: `read_at` / `write_at` on `&File`, with
-  frames as the owned buffers, and `sync_data`.
+  frames as the owned buffers, and `sync_data`. A commit writes each run of pages
+  with `write_vectored_at`, whose buffers are the frames themselves, so nothing is
+  copied; a run is at most 1,024 frames (`IOV_MAX`).
 - **No OS page cache, no `mmap`.** On Linux the data file is opened with `O_DIRECT`
   (`OpenOptions::custom_flags`), so pages move straight between frames and the
   device; on file systems that don't support it, like tmpfs, it falls back to
   buffered I/O. On macOS, for development only, `F_NOCACHE` is set instead.
   encina's cache is then the only cache, memory use matches the budget, and no page
   fault can block the event loop. `sync_data` is still required for durability.
-- compio 0.19 heap-allocates a small control block for every submitted operation.
-  The cache-hit path does no I/O and stays allocation-free; a miss or a commit pays
-  one allocation per page I/O. encina adds none: a write keeps its in-flight
-  operations in a fixed-size array. If compio's show up in profiles, the fix belongs
-  upstream (pooled operation slots).
+- compio 0.19 heap-allocates a small control block for every submitted operation,
+  and a vectored write also allocates its `iovec` array. The cache-hit path does no
+  I/O and stays allocation-free; a miss pays one allocation per page read, and a
+  commit two per write request. encina adds none: a write keeps its in-flight
+  operations in a fixed-size array, and reuses their lists of frames. If compio's
+  show up in profiles, the fix belongs upstream (pooled operation slots).
 - CPU-heavy steps, large merges in particular, don't yield to the executor yet;
   that is planned for M3.
 - **Linux with io_uring is the target.** macOS works for development, but there
@@ -431,12 +456,13 @@ complete without suspending.
 - **Failure paths, aiming for ~100% coverage.** All I/O goes through one internal
   interface with two implementations: compio files, and a simulated disk that can
   fail or crash at any single operation. A crash keeps what was synced, a
-  pseudo-random subset of the unsynced writes, and the first half of the write in
-  progress. The failure scenario first runs once to count its I/O operations, then
-  reruns once per operation with an error injected there, and once more with a
-  crash. After each run, a store left usable must pass the invariant checker, one
-  left failed must reject writes, and reopening must yield the state after the
-  last successful write (or after the failed one, when the failure hit a commit).
+  pseudo-random subset of the pages written since, and the first half of the write
+  in progress, which may span several pages. The failure scenario first runs once
+  to count its I/O operations, then reruns once per operation with an error
+  injected there, and once more with a crash. After each run, a store left usable
+  must pass the invariant checker, one left failed must reject writes, and
+  reopening must yield the state after the last successful write (or after the
+  failed one, when the failure hit a commit).
   This enumerates every failure point instead of sampling them. Measuring coverage
   of error-handling branches in CI (`cargo llvm-cov`), where an uncovered failure
   path needs a test or a written reason, is planned for M3.
