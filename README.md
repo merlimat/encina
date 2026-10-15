@@ -41,6 +41,33 @@ Early development. [DESIGN.md](DESIGN.md) covers the design and the milestones:
 - [ ] **M3, performance:** group commit, a dense node format, and benchmarks against
   RocksDB.
 
+## Example
+
+```rust
+use encina::{Comparison, Db, Options, WriteBatch};
+
+let db = Db::open("data.db", Options::default()).await?;
+
+// Batches apply atomically. Keys sort bytewise, so encode integers big-endian.
+let mut batch = WriteBatch::new();
+batch.put(b"user/0001", b"alice");
+batch.put(b"user/0002", b"bob");
+batch.delete_range(b"session/", b"session0"); // every key starting with "session/"
+db.write(&mut batch).await?;
+
+// The entry with the largest key at or below "user/9999". `get` lends the key and
+// value to a closure instead of allocating copies.
+let last_user = db
+    .get(b"user/9999", Comparison::Floor, |k, _v| String::from_utf8_lossy(k).into_owned())
+    .await?;
+
+// A point-in-time scan of every key starting with "user/".
+let mut iter = db.range(&b"user/"[..]..&b"user0"[..]);
+while let Some((k, v)) = iter.next().await? {
+    // ...
+}
+```
+
 ## Performance
 
 Measured with [bench/](bench/README.md) on a workload shaped like BookKeeper's entry
@@ -79,33 +106,6 @@ Floor finds a ledger's last entry: the largest key at or below a given one. Rock
 compresses its blocks with LZ4, which takes its files from 291 MiB to 110 MiB. encina
 doesn't compress: its pages in use take 285 MiB, and the file's other 62 MiB is free
 pages that later writes reuse.
-
-## Example
-
-```rust
-use encina::{Comparison, Db, Options, WriteBatch};
-
-let db = Db::open("data.db", Options::default()).await?;
-
-// Batches apply atomically. Keys sort bytewise, so encode integers big-endian.
-let mut batch = WriteBatch::new();
-batch.put(b"user/0001", b"alice");
-batch.put(b"user/0002", b"bob");
-batch.delete_range(b"session/", b"session0"); // every key starting with "session/"
-db.write(&mut batch).await?;
-
-// The entry with the largest key at or below "user/9999". `get` lends the key and
-// value to a closure instead of allocating copies.
-let last_user = db
-    .get(b"user/9999", Comparison::Floor, |k, _v| String::from_utf8_lossy(k).into_owned())
-    .await?;
-
-// A point-in-time scan of every key starting with "user/".
-let mut iter = db.range(&b"user/"[..]..&b"user0"[..]);
-while let Some((k, v)) = iter.next().await? {
-    // ...
-}
-```
 
 ## Building
 
