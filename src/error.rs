@@ -68,3 +68,38 @@ impl From<std::io::Error> for Error {
         Error::Io(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use super::*;
+
+    #[test]
+    fn errors_describe_themselves() {
+        let io = Error::from(std::io::Error::other("disk on fire"));
+        assert_eq!(io.to_string(), "I/O error: disk on fire");
+        assert_eq!(io.source().unwrap().to_string(), "disk on fire");
+        let others = [
+            (
+                Error::EntryTooLarge {
+                    size: 2000,
+                    max: 1000,
+                },
+                "entry of 2000 bytes exceeds the maximum of 1000",
+            ),
+            (Error::InvalidOptions("why"), "invalid options: why"),
+            (Error::InvalidFile("why"), "invalid store file: why"),
+            (Error::Locked, "the store is already open"),
+            (Error::Corruption { page: 7 }, "page 7 is corrupt"),
+            (
+                Error::Failed,
+                "an earlier I/O error left the store failed; reopen it",
+            ),
+        ];
+        for (e, message) in others {
+            assert_eq!(e.to_string(), message);
+            assert!(e.source().is_none(), "{e}");
+        }
+    }
+}

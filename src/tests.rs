@@ -24,6 +24,8 @@ use std::task::{Context, Poll, Waker};
 
 use proptest::prelude::*;
 
+use crate::meta::Meta;
+use crate::node::{self, NO_FRAME, Node};
 use crate::pool::Holds;
 use crate::sim::{Fault, SimDisk};
 use crate::{Comparison, Db, Error, Options, WriteBatch};
@@ -565,8 +567,127 @@ fn damaged_pages_are_reported() {
     assert!(matches!(opened, Err(Error::Corruption { page }) if page == root));
 }
 
-/// Batches that build a few levels on 256-byte pages, then rewrite and delete
-/// parts of them.
+#[test]
+fn a_bad_child_reference_fails_the_open() {
+    let store = Store::new(Options::new().page_size(256));
+    let puts: Vec<_> = (0..300u32)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![7; 8]))
+        .collect();
+    write(&store.db, &puts);
+    let (root, bytes) = {
+        let tree = store.db.tree();
+        let root = tree.current().root.unwrap();
+        assert!(root.level > 0);
+        (root.page, tree.pages.pool.page(root.frame).to_vec())
+    };
+    let first = Node::new(&bytes).child_page(0);
+    // Point the first child past the end of the file, then the second at the
+    // first's page. The root is sealed again, so that it passes its checksum.
+    for (i, bad) in [(0, store.disk.len() / 256), (1, first)] {
+        let mut page = bytes.clone();
+        let (at, _) = Node::new(&page).value_span(i);
+        page[at..at + node::CHILD_REF].copy_from_slice(&node::child_ref(NO_FRAME, bad));
+        let generation = Node::new(&page).generation();
+        node::seal(&mut page, generation);
+        let disk = store.disk.restart();
+        disk.set_bytes(root * 256, &page);
+        let opened = now(Db::open_sim(disk, store.opts.clone()));
+        assert!(
+            matches!(opened, Err(Error::Corruption { page }) if page == bad),
+            "child {i}"
+        );
+    }
+}
+
+#[test]
+fn bad_meta_pages_are_rejected() {
+    let meta = Meta::empty(256);
+    // The meta page in each slot of a two-page file, and why it isn't a store.
+    let cases: [(&[Meta], &str); 5] = [
+        // Zeros.
+        (&[], "no intact meta page"),
+        (
+            &[Meta {
+                page_size: 1000,
+                ..meta
+            }],
+            "unsupported page size",
+        ),
+        (&[Meta { version: 2, ..meta }], "unsupported format version"),
+        // The root is at the high-water mark, beyond the pages in use.
+        (&[Meta { root: 2, ..meta }], "inconsistent meta page"),
+        // The newer slot has another page size.
+        (
+            &[
+                meta,
+                Meta {
+                    page_size: 512,
+                    generation: 1,
+                    ..meta
+                },
+            ],
+            "inconsistent meta page",
+        ),
+    ];
+    for (metas, reason) in cases {
+        let mut file = vec![0; 512];
+        for (slot, meta) in file.chunks_mut(256).zip(metas) {
+            meta.encode(slot);
+        }
+        let disk = SimDisk::new();
+        disk.set_bytes(0, &file);
+        let opened = now(Db::open_sim(disk, Options::new().page_size(256)));
+        assert!(
+            matches!(opened, Err(Error::InvalidFile(r)) if r == reason),
+            "{reason}"
+        );
+    }
+}
+
+/// Opens the store on `disk` with each read of the open failing in turn: that
+/// open fails, and the next one works. Then opens it once more.
+fn open_after_failed_reads(disk: &SimDisk, opts: &Options) -> Db {
+    let clean = disk.restart();
+    now(Db::open_sim(clean.clone(), opts.clone())).unwrap();
+    for op in 0..clean.ops() {
+        let disk = disk.restart();
+        disk.inject(op, Fault::Error);
+        let opened = now(Db::open_sim(disk.clone(), opts.clone()));
+        assert!(
+            matches!(opened, Err(Error::Io(_))),
+            "read {op} failed, yet the open worked"
+        );
+        now(Db::open_sim(disk, opts.clone())).unwrap().check();
+    }
+    now(Db::open_sim(disk.restart(), opts.clone())).unwrap()
+}
+
+#[test]
+fn a_failed_read_fails_only_that_open() {
+    // The open reads both meta slots, then the internal nodes.
+    let (store, model) = cold_store(2000, 64);
+    assert!(store.db.tree().current().root.unwrap().level > 1);
+    let db = open_after_failed_reads(&store.disk, &store.opts);
+    assert_eq!(scan(&db, ALL), expected_scan(&model, ALL));
+}
+
+#[test]
+fn a_damaged_meta_slot_leaves_the_other() {
+    // Pages larger than the open's first read, which finds the page size in slot 0.
+    let opts = Options::new().page_size(1024);
+    let store = Store::new(opts.clone());
+    write(&store.db, &[Op::Put(b"a".to_vec(), b"1".to_vec())]);
+    let first = scan(&store.db, ALL);
+    write(&store.db, &[Op::Put(b"b".to_vec(), b"2".to_vec())]);
+    // The second write's meta, in slot 0, rots. The open looks for slot 1 where each
+    // page size would put it, and finds the first write's.
+    store.disk.flip(24);
+    let db = open_after_failed_reads(&store.disk, &opts);
+    assert_eq!(scan(&db, ALL), first);
+}
+
+/// Batches that build a few levels on 256-byte pages, rewrite and delete parts of
+/// them, then delete everything.
 fn failure_scenario() -> Vec<Vec<Op>> {
     let key = |i: u32| i.to_be_bytes().to_vec();
     vec![
@@ -580,6 +701,7 @@ fn failure_scenario() -> Vec<Vec<Op>> {
             .step_by(7)
             .map(|i| Op::Put(key(i), vec![4; 4]))
             .collect(),
+        vec![Op::DeleteRange(key(0), key(300))],
     ]
 }
 
@@ -900,6 +1022,28 @@ fn a_failed_shared_read_is_read_again_by_the_others() {
     assert_eq!(now(b).unwrap(), Some(model[&key[..]].clone()));
     assert_eq!(store.disk.ops() - ops, 2);
     store.db.check();
+}
+
+#[test]
+fn a_write_waiting_for_a_failed_commit_fails() {
+    // A store of one leaf, which isn't cached.
+    let (store, _) = cold_store(1, 64);
+    store.disk.hold();
+    let ops = store.disk.ops();
+    // The first write takes the write lock, then waits for its leaf.
+    let mut first = batch_of(&[Op::Put(vec![1], vec![1])]);
+    let mut a = pin!(store.db.write(&mut first));
+    assert!(poll(a.as_mut()).is_pending());
+    // The second waits for the lock.
+    let mut second = batch_of(&[Op::Put(vec![2], vec![2])]);
+    let mut b = pin!(store.db.write(&mut second));
+    assert!(poll(b.as_mut()).is_pending());
+    // The first reads its leaf, writes the new one, and fails to sync it, which
+    // leaves the store failed. The second then gets the lock, and fails too.
+    store.disk.inject(ops + 2, Fault::Error);
+    store.disk.release();
+    assert!(matches!(now(a), Err(Error::Io(_))));
+    assert!(matches!(now(b), Err(Error::Failed)));
 }
 
 #[test]
@@ -1243,6 +1387,59 @@ async fn a_file_store_has_one_owner_at_a_time() {
     assert_eq!(found.await.unwrap(), Some(b"value".to_vec()));
     drop(db);
     Db::open(&path, Options::default()).await.unwrap();
+}
+
+#[compio::test]
+async fn a_store_closes_with_its_last_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    // Closing a clone, or the store while an iterator is alive, leaves it open.
+    db.clone().close().await.unwrap();
+    let iter = db.range(..);
+    db.close().await.unwrap();
+    let second = Db::open(&path, Options::default()).await.map(drop);
+    assert!(matches!(second, Err(Error::Locked)), "{second:?}");
+    // The iterator was the last handle.
+    drop(iter);
+    Db::open(&path, Options::default()).await.unwrap();
+}
+
+#[compio::test]
+async fn a_write_dropped_mid_commit_fails_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let mut batch = WriteBatch::new();
+    batch.put(b"key", b"value");
+    // The first poll sends out the new leaf's write, and the write is dropped
+    // before it finishes.
+    assert!(poll(pin!(db.write(&mut batch))).is_pending());
+    assert!(matches!(db.write(&mut batch).await, Err(Error::Failed)));
+    // Closing waits for the leaf's write. The store reopens as it was, and takes
+    // writes again.
+    db.close().await.unwrap();
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let found = db.get(b"key", Comparison::Equal, |_, v| v.to_vec());
+    assert_eq!(found.await.unwrap(), None);
+    db.write(&mut batch).await.unwrap();
+}
+
+#[compio::test]
+async fn bad_options_or_a_missing_directory_fail_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options::new().page_size(1000);
+    let opened = Db::open(dir.path().join("encina.db"), opts).await.map(drop);
+    assert!(
+        matches!(opened, Err(Error::InvalidOptions(_))),
+        "{opened:?}"
+    );
+    let path = dir.path().join("missing").join("encina.db");
+    let opened = Db::open(path, Options::default()).await.map(drop);
+    assert!(
+        matches!(&opened, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound),
+        "{opened:?}"
+    );
 }
 
 #[cfg(unix)]
