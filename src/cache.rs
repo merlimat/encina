@@ -52,15 +52,31 @@ impl Cache {
         self.map.remove(&page)
     }
 
+    /// Frames the pool may hold before leaves get evicted.
+    pub(crate) fn budget(&self) -> usize {
+        self.budget
+    }
+
     /// A frame holding one reference, evicting a cold leaf first when the pool is
     /// at its budget. If every leaf is in use, the pool grows past the budget.
     pub(crate) fn alloc(&mut self, pool: &mut Pool, holds: Holds, page: u64) -> FrameId {
-        if pool.in_use() >= self.budget
-            && let Some(victim) = self.evict(pool)
-        {
+        self.try_alloc(pool, holds, page)
+            .unwrap_or_else(|| pool.alloc(holds, page))
+    }
+
+    /// Like [`alloc`](Self::alloc), but returns `None` rather than growing the
+    /// pool past its budget.
+    pub(crate) fn try_alloc(
+        &mut self,
+        pool: &mut Pool,
+        holds: Holds,
+        page: u64,
+    ) -> Option<FrameId> {
+        if pool.in_use() >= self.budget {
+            let victim = self.evict(pool)?;
             pool.free(victim);
         }
-        pool.alloc(holds, page)
+        Some(pool.alloc(holds, page))
     }
 
     /// Finds a frame to reuse: a clean, unreferenced leaf the clock hand finds
