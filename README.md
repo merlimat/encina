@@ -68,6 +68,45 @@ while let Some((k, v)) = iter.next().await? {
 }
 ```
 
+## Performance
+
+Measured with [bench/](bench/README.md) on a workload shaped like BookKeeper's entry
+location index: 10 million 16-byte keys mapped to 16-byte values, appended in 100
+durable batches, then scanned, looked up at random, and half deleted by range. Both
+engines bypass the OS page cache and get the same cache size. The machine is an Ubuntu
+26.04 VM with 6 aarch64 vCPUs and ext4 on virtio, under UTM on an Apple M5 Pro. Each
+figure is from a single run at commit 7a0e12b, and repeat runs on this VM vary by up to
+40%.
+
+| 512 MiB cache: the store fits in memory | encina | RocksDB |
+|---|---:|---:|
+| Load, entries/s | 6.41M | 6.26M |
+| Load, p99 batch commit | 22.2 ms | 18.8 ms |
+| Load, CPU seconds | 1.0 | 2.6, then 1.1 compacting |
+| Load, MiB written | 706 | 493, then 102 compacting |
+| Scan, entries/s | 37.4M | 12.4M |
+| Get, lookups/s | 1.36M | 375K |
+| Floor, lookups/s | 2.68M | 316K |
+| Delete half the ledgers, one commit | 1.7 ms | 3.9 ms |
+| Size on disk, MiB | 347 | 110 |
+| Peak memory, MiB | 335 | 355 |
+
+With `--cache-mb 64 --reads 200000`, reads go to disk:
+
+| 64 MiB cache | encina | RocksDB |
+|---|---:|---:|
+| Load, entries/s | 6.34M | 6.37M |
+| Scan, entries/s | 14.5M | 17.3M |
+| Get, lookups/s | 21.1K | 9.75K |
+| Get, KiB read per lookup | 3 | 19 |
+| Floor, lookups/s | 312K | 14.9K |
+| Peak memory, MiB | 89 | 184 |
+
+Floor finds a ledger's last entry: the largest key at or below a given one. RocksDB
+compresses its blocks with LZ4, which takes its files from 291 MiB to 110 MiB. encina
+doesn't compress: its pages in use take 285 MiB, and the file's other 62 MiB is free
+pages that later writes reuse.
+
 ## Command-line tool
 
 The `encina` command, in [cli/](cli), puts, gets and scans entries, for inspecting a
