@@ -543,7 +543,8 @@ complete without suspending.
   injected there, and once more with a crash. After each run, a store left usable
   must pass the invariant checker, one left failed must reject writes, and
   reopening must yield the state after the last successful write (or after the
-  failed one, when the failure hit a commit).
+  failed one, when the failure hit a commit). Tests also fail each read of an open
+  in turn: that open fails with `Error::Io`, and the next one works.
   This enumerates every failure point instead of sampling them; the scenario's
   reads include scans, so failures hit reads ahead too. CI measures coverage on
   every pull request (`cargo llvm-cov`), posts the totals as a status, and lists
@@ -555,9 +556,15 @@ complete without suspending.
   iterator reads ahead and waits for the leaf it read ahead rather than reading it
   again, that a read survives as long as some reader holds it, that a failed read
   reaches the reader that claims it, and that a cancelled read's frame is only
-  reused once the read finishes.
+  reused once the read finishes. They also hold a write's leaf read while a second
+  write waits for the write lock: when the first then fails its commit, the second
+  gets `Error::Failed`.
 - **Damage:** a flipped bit in a leaf fails the reads that need it, and one in an
-  internal node fails the open, both with `Error::Corruption`.
+  internal node fails the open, both with `Error::Corruption`, as does a child
+  reference past the end of the file or to a page already used. A flipped bit in
+  meta slot 0 leaves slot 1, which the open finds where each page size would put
+  it. A file of zeros, or with meta pages built from bad fields, isn't a store
+  (`Error::InvalidFile`).
 - **Read-only views:** a view on the owner's simulated disk returns exactly its
   version while the owner rewrites every leaf, until its reads fail with
   `Error::Stale`, and never with other entries. Damage in a store the owner hasn't
@@ -568,7 +575,8 @@ complete without suspending.
 - **Real files** cover what the simulated disk doesn't model: reopening, the lock
   that keeps out a second open, syncing the directory of a new store, including
   a directory that can't be synced, and a read-only view, which opens beside the
-  owner, creates nothing, and opens a file it may only read.
+  owner, creates nothing, and opens a file it may only read. A write dropped while
+  its page write is in flight leaves the store failed until it reopens.
 - **Allocation tests:** a counting global allocator asserts that `get` and
   iteration over cached pages, `get` and iteration that miss the cache (reading
   ahead included), and `write` with a reused batch, all on the simulated disk,
