@@ -573,6 +573,11 @@ complete without suspending.
   iteration over cached pages, `get` and iteration that miss the cache (reading
   ahead included), and `write` with a reused batch, all on the simulated disk,
   perform no allocations. On a real disk, compio adds one per I/O operation.
+- **Sanitizers:** CI runs every test under AddressSanitizer, std included, so a
+  use of freed memory or a leak fails the run even where the test's own checks
+  pass, real files' io_uring path included. One test drops a store while the
+  simulated disk still holds its reads, which checks that their buffers keep the
+  frame memory alive until the reads finish.
 - **Benchmarks** against RocksDB on the BookKeeper workload: sorted batches over
   *A* active ledgers, random point reads, floor lookups, and `delete_range` of old
   ledgers.

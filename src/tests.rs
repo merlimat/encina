@@ -1192,6 +1192,21 @@ fn cancelled_reads_keep_their_frames_until_they_finish() {
     store.db.check();
 }
 
+#[test]
+fn a_dropped_store_keeps_its_frames_until_its_reads_finish() {
+    let (store, _) = cold_store(2000, 64);
+    store.disk.hold();
+    let mut iter = store.db.range(..);
+    assert!(poll(pin!(iter.next())).is_pending());
+    assert_eq!(loading_frames(&store.db), (1 + WINDOW as usize, 0));
+    // The disk finishes the reads after the store is gone: their buffers must keep
+    // the frame memory alive until then. Only a sanitizer or Miri sees if they don't.
+    let Store { disk, db, .. } = store;
+    drop(iter);
+    drop(db);
+    disk.release();
+}
+
 /// A step of readers sharing held reads.
 #[derive(Clone, Debug)]
 enum Action {
@@ -1333,7 +1348,9 @@ proptest! {
     }
 }
 
+// The tests on real files need compio's runtime, which Miri can't run.
 #[compio::test]
+#[cfg_attr(miri, ignore)]
 async fn a_file_store_survives_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
@@ -1371,6 +1388,7 @@ async fn a_file_store_survives_reopening() {
 }
 
 #[compio::test]
+#[cfg_attr(miri, ignore)]
 async fn a_file_store_has_one_owner_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
@@ -1393,6 +1411,7 @@ async fn a_file_store_has_one_owner_at_a_time() {
 }
 
 #[compio::test]
+#[cfg_attr(miri, ignore)]
 async fn a_read_only_view_opens_beside_the_owner() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
@@ -1422,6 +1441,7 @@ async fn a_read_only_view_opens_beside_the_owner() {
 
 #[cfg(unix)]
 #[compio::test]
+#[cfg_attr(miri, ignore)]
 async fn a_read_only_view_never_writes() {
     use std::os::unix::fs::PermissionsExt;
     use std::{fs, io};
@@ -1456,6 +1476,7 @@ async fn a_read_only_view_never_writes() {
 
 #[cfg(unix)]
 #[compio::test]
+#[cfg_attr(miri, ignore)]
 async fn a_new_store_needs_its_directory_synced() {
     use std::os::unix::fs::PermissionsExt;
     use std::{fs, io};

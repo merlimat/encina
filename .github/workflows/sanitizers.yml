@@ -1,0 +1,34 @@
+name: Sanitizers
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      # Every test, io_uring included, with std rebuilt under the sanitizer too.
+      - run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+          # Leaks fail the run too. The runner has no llvm-symbolizer on its PATH,
+          # so reports are symbolized with addr2line.
+          ASAN_OPTIONS: detect_leaks=1:allow_addr2line=1
