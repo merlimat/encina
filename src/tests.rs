@@ -1384,6 +1384,7 @@ async fn a_file_store_has_one_owner_at_a_time() {
 }
 
 #[compio::test]
+#[cfg_attr(miri, ignore)]
 async fn a_read_only_view_opens_beside_the_owner() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
@@ -1413,6 +1414,7 @@ async fn a_read_only_view_opens_beside_the_owner() {
 
 #[cfg(unix)]
 #[compio::test]
+#[cfg_attr(miri, ignore)]
 async fn a_read_only_view_never_writes() {
     use std::os::unix::fs::PermissionsExt;
     use std::{fs, io};
