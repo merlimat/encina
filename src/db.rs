@@ -15,6 +15,7 @@
 use std::array;
 use std::cell::{Cell, RefCell, RefMut};
 use std::future::{Future, poll_fn};
+use std::io;
 use std::iter;
 use std::mem;
 use std::ops::{Bound, RangeBounds};
@@ -512,10 +513,17 @@ async fn recover(storage: &Storage, len: u64) -> Result<Meta> {
 
 /// Reports error `e`, which a read-only store hit reading the version it opened as
 /// of `generation`. The store's owner reuses the pages its later versions replaced,
-/// so once it has committed another version, a page that fails its checks was most
-/// likely overwritten: then the store is [stale](Error::Stale) rather than corrupt.
+/// and cuts the file once its end is free, so once it has committed another
+/// version, a page that fails its checks, or lies past the end of the file, was
+/// most likely overwritten or cut: then the store is [stale](Error::Stale) rather
+/// than corrupt.
 async fn stale_or(storage: &Storage, page_size: usize, generation: u64, e: Error) -> Error {
-    if !matches!(e, Error::Corruption { .. }) {
+    let gone = match &e {
+        Error::Corruption { .. } => true,
+        Error::Io(e) => e.kind() == io::ErrorKind::UnexpectedEof,
+        _ => false,
+    };
+    if !gone {
         return e;
     }
     for slot in 0..meta::META_PAGES {

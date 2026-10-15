@@ -447,19 +447,20 @@ same 282 MiB.
   corrupting the store. A `flock` lock belongs to the open file rather than to the
   process, so it also stops a second open from another thread of the same process,
   the likely mistake with one instance per thread.
-- **Read-only views.** A `ReadOnlyDb` opens the file read-only and takes no lock,
-  so it can read a store that a `Db` owns, in this process or another. It reads
-  the version that was current when it opened, with a cache of its own. The owner
+- **Read-only views.** A `ReadOnlyDb` opens the file read-only and takes no lock, so
+  it can read a store that a `Db` owns, in this process or another. It reads the
+  version that was current when it opened, with a cache of its own. The owner
   doesn't know about it, so it reuses that version's pages from its second write
-  after the view opens. Every leaf read checks that the page holds a leaf no newer
-  than the current generation, so a reused page is never taken for the one the
-  tree points to. When a view's page fails its checks, the view rereads both meta
+  after the view opens, and may cut them off the end of the file (§7). Every leaf
+  read checks that the page holds a leaf no newer than the current generation, so a
+  reused page is never taken for the one the tree points to. When a view's page
+  fails its checks, or lies past the end of the file, the view rereads both meta
   slots: if the owner has committed since, the error is `Error::Stale`, and a new
-  view reads the current version; otherwise it is `Error::Corruption`. A corrupt
-  page reported as stale is reported as corrupt by the next view, if that view
-  still uses it. Opening a view checks the internal nodes it loads the same way.
-  Views suit inspection and tooling: one that should keep up with a busy owner has
-  to be reopened, since nothing holds back the owner's page reuse for it.
+  view reads the current version; otherwise it is the error the read met. A corrupt
+  page reported as stale is reported as corrupt by the next view, if that view still
+  uses it. Opening a view checks the internal nodes it loads the same way. Views
+  suit inspection and tooling: one that should keep up with a busy owner has to be
+  reopened, since nothing holds back the owner's page reuse for it.
 - All file I/O goes through compio 0.19: `read_at` / `write_at` on `&File`, with
   frames as the owned buffers, `sync_data`, and `set_len` to cut the file. A commit
   writes each run of pages with `write_vectored_at`, whose buffers are the frames
@@ -607,11 +608,11 @@ complete without suspending.
   internal node fails the open, both with `Error::Corruption`.
 - **Read-only views:** a view on the owner's simulated disk returns exactly its
   version while the owner rewrites every leaf, until its reads fail with
-  `Error::Stale`, and never with other entries. Damage in a store the owner hasn't
-  written since is still `Error::Corruption`. The simulated disk can also take
-  another disk's contents at a given operation, as if the owner wrote meanwhile:
-  a view whose internal nodes are overwritten that way while it opens fails with
-  `Error::Stale`.
+  `Error::Stale`, and never with other entries; so does a read of a page the owner
+  cut off the end of the file. Damage in a store the owner hasn't written since is
+  still `Error::Corruption`. The simulated disk can also take another disk's
+  contents at a given operation, as if the owner wrote meanwhile: a view whose
+  internal nodes are overwritten that way while it opens fails with `Error::Stale`.
 - **Real files** cover what the simulated disk doesn't model: reopening, the lock
   that keeps out a second open, syncing the directory of a new store, including
   a directory that can't be synced, and a read-only view, which opens beside the

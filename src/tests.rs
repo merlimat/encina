@@ -661,6 +661,30 @@ fn a_read_only_view_of_a_quiet_store_reports_damage() {
     assert!(matches!(opened, Err(Error::Corruption { page }) if page == root));
 }
 
+#[test]
+fn a_read_only_view_is_stale_once_the_owner_cuts_its_pages() {
+    // A small cache, so that the view reads its leaves from the disk.
+    let opts = Options::new().page_size(256).cache_size(16 * 256);
+    let store = Store::new(opts.clone());
+    let batches = moving_scenario();
+    for ops in &batches[..3] {
+        write(&store.db, ops);
+    }
+    let view = now(ReadOnlyDb::open_sim(store.disk.clone(), opts)).unwrap();
+    let leaves = store.db.tree().leaves();
+    // The owner frees the end of the file, and cuts it.
+    for ops in &batches[3..] {
+        write(&store.db, ops);
+    }
+    let end = store.disk.len() / 256;
+    let (_, key) = leaves
+        .iter()
+        .find(|&&(page, _)| page >= end)
+        .expect("a leaf of the view past the end of the file");
+    let found = view_get(&view, key, Comparison::Equal);
+    assert!(matches!(found, Err(Error::Stale)), "{found:?}");
+}
+
 /// Opening a store reads three meta pages before its tree: the start of slot 0,
 /// then both slots.
 const RECOVER_OPS: u64 = 3;
