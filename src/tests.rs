@@ -1230,6 +1230,134 @@ fn check_every_single_failure(opts: &Options, batches: &[Vec<Op>]) {
     }
 }
 
+/// Rounds of batches to write as groups: in each, the first write waits for its
+/// sync while the others queue up behind it, and they commit together. Batches
+/// override parts of those before them in their group.
+fn group_scenario() -> Vec<Vec<Vec<Op>>> {
+    vec![
+        vec![
+            puts(0..300, 1),
+            puts(100..200, 2),
+            vec![range_op(50, 250), put_op(120, 3)],
+            (0..300).step_by(7).map(|i| put_op(i, 4)).collect(),
+        ],
+        vec![
+            vec![range_op(0, 100)],
+            (0..300).step_by(3).map(|i| put_op(i, 5)).collect(),
+            vec![range_op(200, 300), put_op(250, 6)],
+        ],
+    ]
+}
+
+/// What a write came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Outcome {
+    Applied,
+    /// It failed, and left the store as it was.
+    Unchanged,
+    /// It failed during its commit, which left the store failed: it may have
+    /// applied.
+    InDoubt,
+    /// The store had failed already.
+    Rejected,
+}
+
+/// Runs the rounds until a write fails. Returns the store, if it opened, and the
+/// outcome of each write that ran, in the order they queued.
+fn try_group_scenario(
+    disk: &Rc<SimDisk>,
+    opts: &Options,
+    rounds: &[Vec<Vec<Op>>],
+) -> (Option<Db>, Vec<Outcome>) {
+    let Ok(db) = now(Db::open_sim(disk.clone(), opts.clone())) else {
+        return (None, Vec::new());
+    };
+    let outcome = |result: crate::Result<()>| match result {
+        Ok(()) => Outcome::Applied,
+        Err(Error::Failed) => Outcome::Rejected,
+        Err(_) if db.has_failed() => Outcome::InDoubt,
+        Err(_) => Outcome::Unchanged,
+    };
+    let mut outcomes = Vec::new();
+    for round in rounds {
+        let mut batches: Vec<_> = round.iter().map(|ops| batch_of(ops)).collect();
+        let mut writes = Vec::new();
+        disk.hold_syncs();
+        for batch in &mut batches {
+            let mut write: Write = Box::pin(db.write(batch));
+            match poll(write.as_mut()) {
+                Poll::Ready(result) => writes.push(Err(outcome(result))),
+                Poll::Pending => writes.push(Ok(write)),
+            }
+        }
+        disk.release_syncs();
+        let start = outcomes.len();
+        for write in writes {
+            outcomes.push(write.map_or_else(|done| done, |write| outcome(now(write))));
+        }
+        if outcomes[start..].iter().any(|&o| o != Outcome::Applied) {
+            break;
+        }
+    }
+    (Some(db), outcomes)
+}
+
+#[test]
+fn every_single_failure_in_a_group_leaves_a_recoverable_store() {
+    // A small cache, so that groups read leaves back from the disk.
+    let opts = Options::new().page_size(256).cache_size(16 * 256);
+    let rounds = group_scenario();
+    let batches: Vec<_> = rounds.iter().flatten().collect();
+    let clean = SimDisk::new();
+    let (db, outcomes) = try_group_scenario(&clean, &opts, &rounds);
+    assert_eq!(outcomes, vec![Outcome::Applied; batches.len()]);
+    drop(db);
+    let total = clean.ops();
+    for fault in [Fault::Error, Fault::Crash] {
+        for op in 0..total {
+            let disk = SimDisk::new();
+            disk.inject(op, fault);
+            let (db, outcomes) = try_group_scenario(&disk, &opts, &rounds);
+            let failed = db.as_ref().is_some_and(Db::has_failed);
+            if let Some(db) = &db {
+                if failed {
+                    assert!(matches!(
+                        now(db.write(&mut WriteBatch::new())),
+                        Err(Error::Failed)
+                    ));
+                } else {
+                    db.check();
+                }
+            }
+            drop(db);
+            let reopened = match now(Db::open_sim(disk.restart(), opts.clone())) {
+                Ok(db) => db,
+                Err(Error::InvalidFile(_)) if op < CREATE_OPS => continue,
+                Err(e) => panic!("{fault:?} at operation {op}: reopening failed: {e}"),
+            };
+            reopened.check();
+            // The writes that succeeded applied, in order, and those that failed
+            // with the store left usable didn't. Those whose commit failed the
+            // store applied together, or not at all.
+            let (mut applied, mut in_doubt) = (Model::new(), Model::new());
+            for (ops, &outcome) in batches.iter().zip(&outcomes) {
+                if outcome == Outcome::Applied {
+                    apply(&mut applied, ops);
+                }
+                if matches!(outcome, Outcome::Applied | Outcome::InDoubt) {
+                    apply(&mut in_doubt, ops);
+                }
+            }
+            let state = scan(&reopened, ALL);
+            assert!(
+                state == expected_scan(&applied, ALL)
+                    || (failed && state == expected_scan(&in_doubt, ALL)),
+                "{fault:?} at operation {op}: {outcomes:?}"
+            );
+        }
+    }
+}
+
 /// Batches on 256-byte pages: the first fills windows of 64 pages with leaves, the
 /// second replaces all but one leaf in ten or so, leaving those windows mostly
 /// free, and the third replaces a leaf under each parent, so that the leaves left
@@ -2530,6 +2658,53 @@ async fn a_write_dropped_mid_commit_fails_the_store() {
     let found = db.get(b"key", Comparison::Equal, |_, v| v.to_vec());
     assert_eq!(found.await.unwrap(), None);
     db.write(&mut batch).await.unwrap();
+}
+
+#[compio::test]
+#[cfg_attr(miri, ignore)]
+async fn concurrent_writes_to_a_file_share_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let key = |i: u32| i.to_be_bytes();
+    let mut batches: Vec<_> = (0..8u32)
+        .map(|w| {
+            let mut batch = WriteBatch::new();
+            for i in 0..1000 {
+                batch.put(&key(w * 1000 + i), &key(w));
+            }
+            batch
+        })
+        .collect();
+    let start = generation(&db);
+    let mut writes: Vec<_> = batches
+        .iter_mut()
+        .map(|batch| Some(Box::pin(db.write(batch))))
+        .collect();
+    std::future::poll_fn(|cx| {
+        for slot in &mut writes {
+            if let Some(write) = slot
+                && let Poll::Ready(result) = write.as_mut().poll(cx)
+            {
+                result.unwrap();
+                *slot = None;
+            }
+        }
+        match writes.iter().all(Option::is_none) {
+            true => Poll::Ready(()),
+            false => Poll::Pending,
+        }
+    })
+    .await;
+    // The first commits alone, and the seven that queued up behind it together.
+    assert_eq!(generation(&db), start + 2);
+    drop(writes);
+    db.close().await.unwrap();
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    for i in (0..8000).step_by(97) {
+        let found = db.get(&key(i), Comparison::Equal, |_, v| v.to_vec()).await;
+        assert_eq!(found.unwrap(), Some(key(i / 1000).to_vec()));
+    }
 }
 
 #[compio::test]

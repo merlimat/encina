@@ -198,9 +198,8 @@ impl WriteBatch {
             .sort_unstable_by(|&x, &y| a(x).cmp(a(y)).then(x.cmp(&y)));
 
         self.points.clear();
-        self.points.extend(
-            (0..n).filter(|&i| matches!(ops[i as usize].kind, Kind::Put | Kind::Delete)),
-        );
+        self.points
+            .extend((0..n).filter(|&i| matches!(ops[i as usize].kind, Kind::Put | Kind::Delete)));
         self.points
             .sort_unstable_by(|&x, &y| a(x).cmp(a(y)).then(x.cmp(&y)));
         // The last operation on a key wins, unless a range added after it covers the
