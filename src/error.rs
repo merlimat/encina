@@ -42,6 +42,10 @@ pub enum Error {
     /// An earlier I/O error left it unknown whether a write reached the disk. The
     /// store rejects further writes; reopen it to recover.
     Failed,
+    /// A [`ReadOnlyDb`](crate::ReadOnlyDb) can no longer read its version: the
+    /// store's owner has since overwritten pages of it. Open a new view to read the
+    /// current version.
+    Stale,
 }
 
 /// The result of encina's operations, which fail with an [`Error`].
@@ -59,6 +63,7 @@ impl fmt::Display for Error {
             Error::Corruption { page } => write!(f, "page {page} is corrupt"),
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::Failed => write!(f, "an earlier I/O error left the store failed; reopen it"),
+            Error::Stale => write!(f, "the version this read-only view reads was overwritten"),
         }
     }
 }
