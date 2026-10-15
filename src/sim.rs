@@ -94,6 +94,14 @@ impl SimDisk {
         disk.durable[at] ^= 1;
     }
 
+    /// Sets the bytes at `offset` to `data`, growing the disk if needed, as if
+    /// they had been written and synced: for files a store wouldn't write.
+    pub(crate) fn set_bytes(&self, offset: u64, data: &[u8]) {
+        let mut disk = self.0.borrow_mut();
+        land(&mut disk.current, offset as usize, data);
+        land(&mut disk.durable, offset as usize, data);
+    }
+
     /// Makes operation number `op`, counting from 0, suffer `fault`.
     pub(crate) fn inject(&self, op: u64, fault: Fault) {
         self.0.borrow_mut().fault = Some((op, fault));
