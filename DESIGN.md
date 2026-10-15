@@ -240,6 +240,11 @@ Every `write()` ends with a commit that makes its batch durable in one atomic st
    durable.
 4. Publish the new root. The written leaves become evictable, and the pages this
    write dropped become reusable, subject to §8.
+5. If an eighth of the file or more lies past the high-water mark that the meta
+   page recorded, cut the file there (`set_len`). Only that meta page, which is
+   durable, still matters, and no version a reader holds uses a page past the
+   mark. If the cut fails, the file stays longer than it needs to be until a later
+   commit cuts it.
 
 A write keeps the leaves it changes and the ones it builds in memory until it
 publishes, so a batch larger than the cache budget grows the pool past it. Writing
@@ -257,7 +262,8 @@ free set, and `write()` returns the error, leaving the store as it was. If a
 instance enters a failed state: reads keep serving the last published version,
 writes return `Error::Failed`, and the store must be reopened. Dropping a `write()`
 future is harmless until it starts writing pages; after that, it also puts the
-instance in the failed state.
+instance in the failed state, even while it only cuts the file: a cut still in
+flight could cut what a later write adds.
 
 ### File layout (format v1)
 
@@ -292,12 +298,50 @@ that a run of appends leaves behind, which are likely to stay. With appends, as 
 ledgers, each batch replaces the short-lived pages of the batch before as a whole,
 and the batch after reuses their space as one run.
 
-The cost is space. On the BookKeeper-shaped benchmark (10 million entries in 100
-batches) the file ends up 21% larger than when allocation took the lowest free
-page, and in a simulation of random updates over 22,000 leaves it settled at
-2.8–3.3× the live pages instead of 2×. In exchange, that benchmark's load sent
-4,540 write requests averaging 158 KiB instead of 169,500 of 4 KiB, and ran three
-times as fast.
+Updates spread over the keys don't free pages together: a few pages that stay
+hold a whole stretch back, as short holes that no run takes, until the last of
+them goes. So a write moves such pages when that costs only their writes. When it
+rebuilds an internal node, it gives the node's unchanged children new pages, next
+to the pages it builds, if they sit in a window of 64 pages (one word of the
+bitmap) with at most 16 in use, and, for leaves, if they are cached. Their parent
+is rebuilt anyway, so a move takes no read and no other write; each page moved
+frees at least three, and the window, once empty, makes a run for a later write. A
+write moves at most as many pages as it builds.
+
+The file gives back its end once that is free: every write starts by lowering the
+high-water mark to the last page in use, which its meta page records, and the
+commit cuts the file once an eighth of it lies past the mark (step 5 above).
+
+Writing in runs costs space, in exchange for requests. The table shows the file
+against the pages in use, and the write requests and pages per commit, measured
+on the simulated disk with 4 KiB pages and a cache that holds everything (the
+ignored test `file_size_and_requests`): the benchmark's load (bench/README.md: 10
+million entries in 100 batches), and 1 million random keys, loaded in batches of
+20,000, then updated at random, 2 million updates in all, in commits of the size
+shown.
+
+| Workload | Allocation | File | Requests | Pages |
+|---|---|---:|---:|---:|
+| Benchmark load | lowest free page | 1.02× | 1,790 | 1,790 |
+| | runs | 1.23× | 39 | 1,790 |
+| | runs, moving pages | 1.23× | 34 | 1,809 |
+| Random, 20,000 per commit | lowest free page | 1.72× | 10,882 | 10,882 |
+| | runs | 2.74× | 436 | 10,882 |
+| | runs, moving pages | 2.64× | 315 | 11,308 |
+| Random, 1,000 per commit | lowest free page | 1.70× | 1,158 | 1,158 |
+| | runs | 3.30× | 58 | 1,158 |
+| | runs, moving pages | 2.21× | 25 | 1,471 |
+| Random, 10 per commit | lowest free page | 1.70× | 23 | 23 |
+| | runs | 4.67× | 1.8 | 23 |
+| | runs, moving pages | 3.01× | 1.9 | 30 |
+
+Taking the lowest free page sends a request per page, and the random keys' load
+sets its file size. Moving pages costs page writes where updates are small and
+spread out, but takes fewer requests, since the emptied windows make longer runs.
+Big commits gain little: the windows a commit fills still hold over a quarter of
+their pages after the next one, too many to move, and the commit after replaces
+most of those anyway. On the benchmark VM, writing in runs cut the load's requests from 169,500
+of 4 KiB to 4,540 averaging 158 KiB, and made it three times as fast.
 
 ### Recovery
 
@@ -348,9 +392,9 @@ completed write.
   one index per ledger directory; here, one instance per core or shard plays the
   same role. A `Send` facade (compio dispatcher or channels) can come later.
 - All file I/O goes through compio 0.19: `read_at` / `write_at` on `&File`, with
-  frames as the owned buffers, and `sync_data`. A commit writes each run of pages
-  with `write_vectored_at`, whose buffers are the frames themselves, so nothing is
-  copied; a run is at most 1,024 frames (`IOV_MAX`).
+  frames as the owned buffers, `sync_data`, and `set_len` to cut the file. A commit
+  writes each run of pages with `write_vectored_at`, whose buffers are the frames
+  themselves, so nothing is copied; a run is at most 1,024 frames (`IOV_MAX`).
 - **No OS page cache, no `mmap`.** On Linux the data file is opened with `O_DIRECT`
   (`OpenOptions::custom_flags`), so pages move straight between frames and the
   device; on file systems that don't support it, like tmpfs, it falls back to
@@ -449,9 +493,11 @@ complete without suspending.
   interface with two implementations: compio files, and a simulated disk that can
   fail or crash at any single operation. A crash keeps what was synced, a
   pseudo-random subset of the pages written since, and the first half of the write
-  in progress, which may span several pages. The failure scenario first runs once
-  to count its I/O operations, then reruns once per operation with an error
-  injected there, and once more with a crash. After each run, a store left usable
+  in progress, which may span several pages; a cut of the file lasts once synced.
+  Each failure scenario first runs once to count its I/O operations, then reruns
+  once per operation with an error injected there, and once more with a crash. One
+  scenario reads leaves back through a tiny cache; another moves pages out of
+  mostly free windows and cuts the file. After each run, a store left usable
   must pass the invariant checker, one left failed must reject writes, and
   reopening must yield the state after the last successful write (or after the
   failed one, when the failure hit a commit).
@@ -465,7 +511,8 @@ complete without suspending.
   disk, perform no allocations. On a real disk, compio adds one per I/O operation.
 - **Benchmarks** against RocksDB on the BookKeeper workload: sorted batches over
   *A* active ledgers, random point reads, floor lookups, and `delete_range` of old
-  ledgers.
+  ledgers. On the simulated disk, an ignored test measures the file's size and the
+  write requests per commit of that load and of random updates (§7).
 
 ## 12. Milestones
 

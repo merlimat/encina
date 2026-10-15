@@ -93,6 +93,39 @@ impl Pages {
         (NO_FRAME, page, used)
     }
 
+    /// Copies the node in `from`, at `level`, to a new page, as [`build`](Self::build)
+    /// would build it. Returns the copy's frame ([`NO_FRAME`] for a leaf), page,
+    /// and bytes used.
+    fn copy(&mut self, level: u8, from: FrameId) -> (FrameId, u64, usize) {
+        let page = self.space.alloc_moved();
+        let holds = if level == 0 {
+            Holds::Leaf
+        } else {
+            Holds::Internal
+        };
+        // Making room for the copy mustn't evict the original.
+        self.pool.retain(from);
+        let frame = self.cache.alloc(&mut self.pool, holds, page);
+        // SAFETY: `from` is another frame, which nothing modifies meanwhile.
+        let src = unsafe { self.pool.page_unbounded(from) };
+        self.pool.page_mut(frame).copy_from_slice(src);
+        self.pool.unref(from);
+        self.pool.frame_mut(frame).dirty = true;
+        let node = Node::new(self.pool.page(frame));
+        let used = node.used();
+        if level == 0 {
+            self.cache.insert(page, frame);
+            return (NO_FRAME, page, used);
+        }
+        if level > 1 {
+            // The copy becomes another parent of every internal child.
+            for i in 0..node.count() {
+                self.pool.retain(node.child(i));
+            }
+        }
+        (frame, page, used)
+    }
+
     /// The cached frame of a leaf page.
     pub(crate) fn cached(&mut self, page: u64) -> Option<FrameId> {
         self.cache.get(&mut self.pool, page)
@@ -681,6 +714,7 @@ impl Tree {
             self.discard_list(below, mark);
             return Outcome::Unchanged;
         }
+        self.move_kept(below, mark.items);
         self.fix_underfull(below, mark.items);
         self.build_parents(below, mark);
         Outcome::Replaced
@@ -856,6 +890,33 @@ impl Tree {
             self.page_size,
         );
         children.truncate(mark);
+    }
+
+    /// Moves the nodes of `lists[level]` past `start` that the write keeps, but
+    /// whose pages the allocator wants freed, to new pages. Their parent is rebuilt
+    /// anyway, so a move costs a page write and nothing else: leaves move only if
+    /// they are cached.
+    fn move_kept(&mut self, level: usize, start: usize) {
+        for k in start..self.lists[level].len() {
+            let item = self.lists[level].items[k];
+            if item.fresh || !self.pages.space.should_move(item.page) {
+                continue;
+            }
+            let frame = if level > 0 {
+                item.frame
+            } else if let Some(frame) = self.pages.cached(item.page) {
+                frame
+            } else {
+                continue;
+            };
+            let (copy, page, used) = self.pages.copy(level as u8, frame);
+            self.lists[level].replace(k, copy, page, used);
+            self.dropped.push(item.page);
+            if level > 0 {
+                // The list held the original; it holds the copy now.
+                self.release(frame);
+            }
+        }
     }
 
     /// Merges each node this write built that is under a quarter full into a
@@ -1093,6 +1154,14 @@ impl NodeList {
             used,
             fresh,
         });
+    }
+
+    /// Replaces node `i` with a fresh copy of it.
+    fn replace(&mut self, i: usize, frame: FrameId, page: u64, used: usize) {
+        let item = &mut self.items[i];
+        let at = (item.at + item.key_len) as usize;
+        self.bytes[at..at + CHILD_REF].copy_from_slice(&node::child_ref(frame, page));
+        (item.frame, item.page, item.used, item.fresh) = (frame, page, used as u32, true);
     }
 
     /// Replaces nodes `i` and `i + 1` with a fresh node starting at `key`.

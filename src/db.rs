@@ -74,6 +74,8 @@ struct Inner {
     writer: WriteLock,
     /// Set when an I/O error left it unknown whether a write reached the disk.
     failed: Cell<bool>,
+    /// Pages the file may hold: it has grown to this length at most.
+    file_end: Cell<u64>,
     page_size: usize,
     max_entry: usize,
     /// Key buffers for reads and iterators, reused so that reads don't allocate.
@@ -141,6 +143,7 @@ impl Db {
             storage,
             writer: WriteLock::default(),
             failed: Cell::new(false),
+            file_end: Cell::new(len.div_ceil(page_size as u64).max(meta::META_PAGES)),
             page_size,
             max_entry: opts.max_entry_size(),
             buffers: RefCell::new(Vec::new()),
@@ -204,16 +207,21 @@ impl Db {
         inner.tree.borrow_mut().seal_pending(generation);
 
         // Commit: write the new nodes, sync, then switch the meta page and sync.
+        let meta = inner.tree.borrow().pending_meta(generation);
+        inner
+            .file_end
+            .set(inner.file_end.get().max(meta.high_water));
         guard.stage = Stage::Writing;
         let written = write_dirty(inner).await;
         guard.stage = Stage::Building;
         written?;
         guard.stage = Stage::Committing;
         inner.storage.sync().await?;
-        let meta = inner.tree.borrow().pending_meta(generation);
         write_meta(inner, &meta).await?;
         inner.storage.sync().await?;
         inner.tree.borrow_mut().publish(generation);
+        guard.stage = Stage::Cutting;
+        shrink(inner, meta.high_water).await;
         guard.stage = Stage::Done;
         Ok(())
     }
@@ -551,6 +559,23 @@ pub(crate) fn max_run(page_size: usize) -> usize {
     (MAX_WRITE / page_size).clamp(1, MAX_IOVECS)
 }
 
+/// Cuts the file at `high_water`, past the pages that the version just committed
+/// and the older ones still read can use, once that frees an eighth of it. Only
+/// the newest meta page, which is durable, still matters. If this fails, the file
+/// stays longer than it needs to be until a later commit cuts it.
+async fn shrink(inner: &Inner, high_water: u64) {
+    let end = inner.file_end.get();
+    if 8 * (end - high_water) >= end
+        && inner
+            .storage
+            .set_len(inner.offset(high_water))
+            .await
+            .is_ok()
+    {
+        inner.file_end.set(high_water);
+    }
+}
+
 /// Writes `meta` to its slot.
 async fn write_meta(inner: &Inner, meta: &Meta) -> Result<()> {
     let (frame, buf) = {
@@ -607,6 +632,9 @@ enum Stage {
     Writing,
     /// The nodes are written: whether the commit is durable is unknown.
     Committing,
+    /// The commit is published, and the file may be getting cut: a cut still in
+    /// flight could cut what a later write adds.
+    Cutting,
     Done,
 }
 
@@ -642,6 +670,7 @@ impl Drop for WriteGuard<'_> {
                 self.inner.failed.set(true);
                 tree.discard();
             }
+            Stage::Cutting => self.inner.failed.set(true),
         }
     }
 }
