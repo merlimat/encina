@@ -120,6 +120,10 @@ encina scan data.db user/ user0      # one key<TAB>value line per entry
 encina scan -x data.db               # keys and values as hexdump -C shows them
 ```
 
+`cargo install --path cli` builds the command and copies it to `~/.cargo/bin`. To
+build it in place instead, run `cargo build --release` at the root, which leaves it at
+`target/release/encina`.
+
 `get` and `scan` open the store read-only, so they work while another process has
 it open. If that process overwrites the version they read, they open the store
 again, and `scan` resumes after the last key it printed. Arguments take `\xNN` for
