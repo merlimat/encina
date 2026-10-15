@@ -79,6 +79,8 @@ struct Inner {
     writer: WriteLock,
     /// Set when an I/O error left it unknown whether a write reached the disk.
     failed: Cell<bool>,
+    /// Opened by a [`ReadOnlyDb`], whose version the store's owner may overwrite.
+    read_only: bool,
     page_size: usize,
     max_entry: usize,
     /// Key buffers for reads and iterators, reused so that reads don't allocate.
@@ -103,6 +105,16 @@ impl Inner {
     fn offset(&self, page: u64) -> u64 {
         page * self.page_size as u64
     }
+
+    /// The error to report for `e`, which a read hit. In a read-only store it may
+    /// mean the store is stale, as [`stale_or`] decides.
+    async fn explain(&self, e: Error) -> Error {
+        if !self.read_only {
+            return e;
+        }
+        let generation = self.tree.borrow().current().generation;
+        stale_or(&self.storage, self.page_size, generation, e).await
+    }
 }
 
 impl Db {
@@ -114,11 +126,11 @@ impl Db {
     /// A store has one owner at a time: this fails with [`Error::Locked`] while
     /// another `Db`, in this process or another, has it open. That `Db` lets go
     /// once it, its clones and its iterators are closed or dropped, and any I/O it
-    /// started has finished.
+    /// started has finished. A [`ReadOnlyDb`] can read the store meanwhile.
     pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
         opts.validate()?;
         let (storage, len) = Storage::open(path.as_ref()).await?;
-        Db::open_on(storage, len, opts).await
+        Db::open_on(storage, len, opts, false).await
     }
 
     /// Opens a store on a simulated disk.
@@ -126,11 +138,11 @@ impl Db {
     pub(crate) async fn open_sim(disk: Rc<crate::sim::SimDisk>, opts: Options) -> Result<Db> {
         opts.validate()?;
         let len = disk.len();
-        Db::open_on(Storage::Sim(disk), len, opts).await
+        Db::open_on(Storage::Sim(disk), len, opts, false).await
     }
 
-    async fn open_on(storage: Storage, len: u64, opts: Options) -> Result<Db> {
-        let meta = if len == 0 {
+    async fn open_on(storage: Storage, len: u64, opts: Options, read_only: bool) -> Result<Db> {
+        let meta = if len == 0 && !read_only {
             create(&storage, &opts).await?
         } else {
             recover(&storage, len).await?
@@ -145,13 +157,19 @@ impl Db {
         for page in 0..meta::META_PAGES {
             pages.space.mark_used(page);
         }
-        let root = load_internal(&storage, &mut pages, &meta).await?;
+        let root = match load_internal(&storage, &mut pages, &meta).await {
+            Err(e) if read_only => {
+                return Err(stale_or(&storage, page_size, meta.generation, e).await);
+            }
+            root => root?,
+        };
         let inner = Inner {
             tree: RefCell::new(Tree::new(pages, page_size, root, meta.generation)),
             reads: RefCell::new(Reads::default()),
             storage,
             writer: WriteLock::default(),
             failed: Cell::new(false),
+            read_only,
             page_size,
             max_entry: opts.max_entry_size(),
             buffers: RefCell::new(Vec::new()),
@@ -284,7 +302,10 @@ impl Db {
                         read.loaded < read.leaves.len(),
                         "lookup needs too many leaves"
                     );
-                    read.leaves[read.loaded] = load_leaf(inner, page).await?;
+                    read.leaves[read.loaded] = match load_leaf(inner, page).await {
+                        Ok(frame) => frame,
+                        Err(e) => return Err(inner.explain(e).await),
+                    };
                     read.loaded += 1;
                 }
             }
@@ -354,6 +375,66 @@ impl Db {
     }
 }
 
+/// A read-only view of a store. It takes no lock, so it opens even while a [`Db`],
+/// in this process or another, owns the store, and it never writes to the file.
+///
+/// It reads the version that was current when it opened, and doesn't see later
+/// writes. The owner reuses the pages its writes replace, so once it writes again,
+/// reads that miss the view's cache can fail with [`Error::Stale`]: open a new view
+/// to read the current version. A view never returns entries of another version.
+///
+/// Like a `Db`, it is a cheap handle: clones share the same view.
+#[derive(Clone)]
+pub struct ReadOnlyDb {
+    db: Db,
+}
+
+impl ReadOnlyDb {
+    /// Opens a view of the existing store at `path`, as of its last write. `opts`
+    /// sets the cache size; the page size comes from the file.
+    ///
+    /// Fails with [`Error::Stale`] if the store's owner overwrote that version
+    /// while it was being opened: opening again finds a newer one.
+    pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<ReadOnlyDb> {
+        opts.validate()?;
+        let (storage, len) = Storage::open_read_only(path.as_ref()).await?;
+        let db = Db::open_on(storage, len, opts, true).await?;
+        Ok(ReadOnlyDb { db })
+    }
+
+    /// Opens a view of a store on a simulated disk.
+    #[cfg(test)]
+    pub(crate) async fn open_sim(
+        disk: Rc<crate::sim::SimDisk>,
+        opts: Options,
+    ) -> Result<ReadOnlyDb> {
+        opts.validate()?;
+        let len = disk.len();
+        let db = Db::open_on(Storage::Sim(disk), len, opts, true).await?;
+        Ok(ReadOnlyDb { db })
+    }
+
+    /// As [`Db::get`], in the version this view reads.
+    pub async fn get<R>(
+        &self,
+        key: &[u8],
+        cmp: Comparison,
+        f: impl FnOnce(&[u8], &[u8]) -> R,
+    ) -> Result<Option<R>> {
+        self.db.get(key, cmp, f).await
+    }
+
+    /// As [`Db::range`], in the version this view reads.
+    pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter {
+        self.db.range(range)
+    }
+
+    /// Closes the view, once this is its last handle.
+    pub async fn close(self) -> Result<()> {
+        self.db.close().await
+    }
+}
+
 /// Writes the meta page and the empty second slot of a new store.
 async fn create(storage: &Storage, opts: &Options) -> Result<Meta> {
     let meta = Meta::empty(opts.page_size);
@@ -419,6 +500,25 @@ async fn recover(storage: &Storage, len: u64) -> Result<Meta> {
         return Err(Error::InvalidFile("inconsistent meta page"));
     }
     Ok(meta)
+}
+
+/// Reports error `e`, which a read-only store hit reading the version it opened as
+/// of `generation`. The store's owner reuses the pages its later versions replaced,
+/// so once it has committed another version, a page that fails its checks was most
+/// likely overwritten: then the store is [stale](Error::Stale) rather than corrupt.
+async fn stale_or(storage: &Storage, page_size: usize, generation: u64, e: Error) -> Error {
+    if !matches!(e, Error::Corruption { .. }) {
+        return e;
+    }
+    for slot in 0..meta::META_PAGES {
+        let meta = read_meta(storage, page_size, slot * page_size as u64).await;
+        if let Ok(Some(meta)) = meta
+            && meta.generation > generation
+        {
+            return Error::Stale;
+        }
+    }
+    e
 }
 
 /// Reads `len` bytes at `offset`, and decodes them as a meta slot.
@@ -583,16 +683,22 @@ fn poll_read(
     let claimed = ready!(reads.poll(held, cx));
     *slot = None;
     reads.leave(held, &mut tree.pages.pool);
-    Poll::Ready(claimed.map(|claim| finish(&mut tree.pages, page, claim)))
+    let generation = tree.current().generation;
+    Poll::Ready(claimed.map(|claim| finish(&mut tree.pages, page, claim, generation)))
 }
 
-/// Checks and caches the leaf page a claimed read brought in, pinning its frame.
-fn finish(pages: &mut Pages, page: u64, claim: Claim) -> Result<FrameId> {
+/// Checks and caches the leaf page a claimed read brought in, pinning its frame. No
+/// leaf a reader can reach was written after `generation`, the current one.
+fn finish(pages: &mut Pages, page: u64, claim: Claim, generation: u64) -> Result<FrameId> {
     let Claim { frame, res, buf } = claim;
     pages.pool.retain(frame);
     drop(buf);
     let bytes = pages.pool.page(frame);
-    if res.is_err() || !node::verify(bytes) || Node::new(bytes).level() != 0 {
+    if res.is_err()
+        || !node::verify(bytes)
+        || Node::new(bytes).level() != 0
+        || Node::new(bytes).generation() > generation
+    {
         pages.pool.unref(frame);
         pages.pool.free(frame);
         return Err(res.err().map_or(Error::Corruption { page }, Error::from));
@@ -779,7 +885,8 @@ fn copy_bound(bound: Bound<&[u8]>, out: &mut Vec<u8>) -> Bound<()> {
     }
 }
 
-/// A point-in-time iterator over a range of entries, from [`Db::range`].
+/// A point-in-time iterator over a range of entries, from [`Db::range`] or
+/// [`ReadOnlyDb::range`].
 pub struct Iter {
     inner: Rc<Inner>,
     version: Version,
@@ -836,7 +943,10 @@ impl Iter {
                     self.state = State::Enter { page, first };
                 }
                 State::Enter { page, first } => {
-                    let frame = poll_fn(|cx| self.poll_enter(cx, page)).await?;
+                    let frame = match poll_fn(|cx| self.poll_enter(cx, page)).await {
+                        Ok(frame) => frame,
+                        Err(e) => return Err(self.inner.explain(e).await),
+                    };
                     let tree = self.inner.tree.borrow();
                     if let Some(old) = self.leaf.replace(frame) {
                         tree.pages.pool.unref(old);
