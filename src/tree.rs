@@ -93,59 +93,18 @@ impl Pages {
         (NO_FRAME, page, used)
     }
 
-    /// Copies the node in `from`, at `level`, to a new page, as [`build`](Self::build)
-    /// would build it. Returns the copy's frame ([`NO_FRAME`] for a leaf), page,
-    /// and bytes used.
-    fn copy(&mut self, level: u8, from: FrameId) -> (FrameId, u64, usize) {
-        let page = self.space.alloc_moved();
-        let holds = if level == 0 {
-            Holds::Leaf
-        } else {
-            Holds::Internal
-        };
-        // Making room for the copy mustn't evict the original.
-        self.pool.retain(from);
-        let frame = self.cache.alloc(&mut self.pool, holds, page);
-        // SAFETY: `from` is another frame, which nothing modifies meanwhile.
-        let src = unsafe { self.pool.page_unbounded(from) };
-        self.pool.page_mut(frame).copy_from_slice(src);
-        self.pool.unref(from);
-        self.pool.frame_mut(frame).dirty = true;
-        let node = Node::new(self.pool.page(frame));
-        let used = node.used();
-        if level == 0 {
-            self.cache.insert(page, frame);
-            return (NO_FRAME, page, used);
-        }
-        if level > 1 {
-            // The copy becomes another parent of every internal child.
-            for i in 0..node.count() {
-                self.pool.retain(node.child(i));
-            }
-        }
-        (frame, page, used)
-    }
-
     /// The cached frame of a leaf page.
     pub(crate) fn cached(&mut self, page: u64) -> Option<FrameId> {
         self.cache.get(&mut self.pool, page)
     }
 
-    /// Caches the leaf page just read into `frame`, which the caller holds a
-    /// reference to. If another read cached the page meanwhile, frees `frame` and
-    /// pins that one instead. Returns the pinned frame.
-    pub(crate) fn adopt_leaf(&mut self, frame: FrameId, page: u64) -> FrameId {
-        if let Some(cached) = self.cached(page) {
-            self.pool.unref(frame);
-            self.pool.free(frame);
-            self.pool.retain(cached);
-            return cached;
-        }
+    /// Caches the leaf page just read into `frame`. Reads of a page are shared, so
+    /// it can't be cached already.
+    pub(crate) fn adopt_leaf(&mut self, frame: FrameId, page: u64) {
         let info = self.pool.frame_mut(frame);
         info.holds = Holds::Leaf;
         info.page = page;
         self.cache.insert(page, frame);
-        frame
     }
 }
 
@@ -159,12 +118,8 @@ pub(crate) struct Tree {
     lists: Vec<NodeList>,
     /// Separator keys, two per level.
     bounds: Vec<Vec<u8>>,
-    /// Entries of the leaf being rebuilt.
-    leaf: EntryBuf,
-    /// Where each run of puts ends in `leaf`.
+    /// Where each run of puts ends among the entries of the leaf being rebuilt.
     run_ends: Vec<u32>,
-    /// Entries of two nodes being merged.
-    pair: EntryBuf,
     /// Frames waiting to be released.
     stack: Vec<FrameId>,
     /// The leaf pages the write in progress changes, found before it loads them.
@@ -177,6 +132,9 @@ pub(crate) struct Tree {
     pub(crate) dirty: Vec<(FrameId, u64)>,
     /// That version, until it is published or discarded.
     pending: Option<Option<Root>>,
+    /// The nodes the write in progress added for its changes, and those it moved.
+    added: usize,
+    moved: usize,
 }
 
 enum Outcome {
@@ -202,15 +160,15 @@ impl Tree {
             page_size,
             lists: Vec::new(),
             bounds: Vec::new(),
-            leaf: EntryBuf::default(),
             run_ends: Vec::new(),
-            pair: EntryBuf::default(),
             stack: Vec::new(),
             touched: Vec::new(),
             pinned: Vec::new(),
             dropped: Vec::new(),
             dirty: Vec::new(),
             pending: None,
+            added: 0,
+            moved: 0,
         }
     }
 
@@ -362,6 +320,13 @@ impl Tree {
         Some(self.node(frame).child_page(usize::from(i)))
     }
 
+    /// Compares the smallest key of the leaf `cur` is at, below the root, with
+    /// `key`.
+    pub(crate) fn cmp_leaf_key(&self, cur: &Cursor, key: &[u8]) -> Ordering {
+        let (frame, i) = cur.path[cur.depth - 1];
+        self.node(frame).cmp_key(usize::from(i), key)
+    }
+
     /// Looks up the entry matching `key` under `cmp` in the version rooted at
     /// `root`, using cached leaves only. Copies the key it finds into `out`.
     pub(crate) fn find(
@@ -494,6 +459,7 @@ impl Tree {
         }
         self.dropped.clear();
         self.pages.space.restart();
+        (self.added, self.moved) = (0, 0);
         let (level, outcome) = match self.root {
             Some(root) => {
                 let level = usize::from(root.level);
@@ -737,8 +703,10 @@ impl Tree {
             unsafe { Node::new(self.pages.pool.page_unbounded(frame)) }
         });
         let old = node.map_or(0, |n| n.count());
-        let (leaf, run_ends) = (&mut self.leaf, &mut self.run_ends);
-        leaf.clear();
+        // The rebuilt leaf's entries go after those of its rebuilt siblings, until
+        // the parent builds them all.
+        let (leaf, run_ends) = (&mut self.lists[0].entries, &mut self.run_ends);
+        let base = leaf.len();
         run_ends.clear();
         let (mut i, mut j, mut r) = (0, 0, 0);
         let mut changed = false;
@@ -784,41 +752,41 @@ impl Tree {
             run_ends.push(leaf.len() as u32);
         }
         if !changed {
+            leaf.truncate(base);
             return Outcome::Unchanged;
         }
-        let (pages, out, leaf, page) = (
-            &mut self.pages,
-            &mut self.lists[0],
-            &self.leaf,
-            self.page_size,
-        );
-        let n = leaf.len();
-        if n == 0 {
+        let (out, page) = (&mut self.lists[0], self.page_size);
+        let n = out.entries.len();
+        if n == base {
             return Outcome::Replaced;
         }
-        if node::size(leaf, 0, n) <= page {
-            emit(pages, out, 0, leaf, 0, n, Life::Short);
+        let used = node::size(&out.entries, base, n);
+        if used <= page {
+            out.emit(base, n, used, Life::Short);
+            self.added += 1;
             return Outcome::Replaced;
         }
+        let items = out.len();
         // Split after each run of puts that fills at least a quarter page, as when
         // appending to ledgers: pack the run full, and leave the entries after it to
         // other leaves, so that the next appends don't rewrite them. Smaller runs,
         // like scattered inserts, aren't worth leaves of their own.
-        let mut s = 0;
+        let mut s = base;
         for &end in &self.run_ends {
             let end = end as usize;
-            if node::size(leaf, s, end) < page / 4 {
+            if node::size(&out.entries, s, end) < page / 4 {
                 continue;
             }
             while s < end {
-                let e = node::fit(leaf, s, end, page);
+                let (e, used) = node::fit(&out.entries, s, end, page);
                 // The run's full leaves are likely to stay; appends go on in its last.
                 let life = if e < end { Life::Long } else { Life::Short };
-                emit(pages, out, 0, leaf, s, e, life);
+                out.emit(s, e, used, life);
                 s = e;
             }
         }
-        emit_even(pages, out, 0, leaf, s, n, page);
+        out.emit_even(s, n, page);
+        self.added += out.len() - items;
         Outcome::Replaced
     }
 
@@ -827,7 +795,7 @@ impl Tree {
         if frame != NO_FRAME {
             self.pages.pool.retain(frame);
         }
-        self.lists[level].push(key, frame, page, u32::MAX as usize, false);
+        self.lists[level].push(key, frame, page);
     }
 
     /// Records every page of the subtree at `node` as dropped.
@@ -843,26 +811,6 @@ impl Tree {
         }
     }
 
-    /// Lets go of a node from `lists[level]` that the new version won't use. A node
-    /// this write built is freed now. One from the published version keeps its
-    /// page until older readers are gone.
-    fn forget(&mut self, level: usize, item: Item) {
-        if !item.fresh {
-            self.dropped.push(item.page);
-            if item.frame != NO_FRAME {
-                self.release(item.frame);
-            }
-        } else if level > 0 {
-            self.release(item.frame);
-        } else {
-            let Pages { pool, cache, space } = &mut self.pages;
-            let frame = cache.remove(item.page).expect("fresh leaves are cached");
-            pool.unref(frame);
-            pool.free(frame);
-            space.free(item.page);
-        }
-    }
-
     /// Drops the nodes added to `lists[level]` since `mark`, all unchanged ones.
     fn discard_list(&mut self, level: usize, mark: Mark) {
         for i in mark.items..self.lists[level].len() {
@@ -874,32 +822,47 @@ impl Tree {
         self.lists[level].truncate(mark);
     }
 
-    /// Builds nodes one level up from the nodes in `lists[level]` past `mark`, which
-    /// they take over, and appends them to `lists[level + 1]`.
+    /// Builds the nodes this write added to `lists[level]` past `mark`, then adds
+    /// nodes one level up that take them all over to `lists[level + 1]`.
     fn build_parents(&mut self, level: usize, mark: Mark) {
+        for i in mark.items..self.lists[level].len() {
+            if self.lists[level].items[i].fresh {
+                self.build_node(level, i);
+            }
+        }
         let (lower, upper) = self.lists.split_at_mut(level + 1);
-        let children = &mut lower[level];
-        let (a, b) = (mark.items, children.len());
-        emit_even(
-            &mut self.pages,
-            &mut upper[0],
-            level as u8 + 1,
-            &*children,
-            a,
-            b,
-            self.page_size,
-        );
+        let (children, parents) = (&mut lower[level], &mut upper[0]);
+        let (a, items) = (parents.entries.len(), parents.len());
+        for i in mark.items..children.len() {
+            parents.entries.push(children.key(i), children.value(i));
+        }
+        parents.emit_even(a, parents.entries.len(), self.page_size);
+        self.added += parents.len() - items;
         children.truncate(mark);
     }
 
+    /// Builds node `i` of `lists[level]`, which this write added, into a page of its
+    /// own. An internal node takes over the references its entries hold.
+    fn build_node(&mut self, level: usize, i: usize) {
+        let list = &mut self.lists[level];
+        let item = list.items[i];
+        let (a, b) = (item.start as usize, item.end as usize);
+        let (frame, page, used) = self
+            .pages
+            .build(level as u8, &list.entries, a, b, item.life);
+        debug_assert_eq!(used, item.used as usize);
+        list.built(i, frame, page);
+    }
+
     /// Moves the nodes of `lists[level]` past `start` that the write keeps, but
-    /// whose pages the allocator wants freed, to new pages. Their parent is rebuilt
+    /// whose pages the allocator wants freed: they become nodes the write adds,
+    /// with the same entries, built next to the others. Their parent is rebuilt
     /// anyway, so a move costs a page write and nothing else: leaves move only if
-    /// they are cached.
+    /// they are cached. A write moves at most as many nodes as it adds.
     fn move_kept(&mut self, level: usize, start: usize) {
         for k in start..self.lists[level].len() {
             let item = self.lists[level].items[k];
-            if item.fresh || !self.pages.space.should_move(item.page) {
+            if item.fresh || self.moved >= self.added || !self.pages.space.should_move(item.page) {
                 continue;
             }
             let frame = if level > 0 {
@@ -909,19 +872,30 @@ impl Tree {
             } else {
                 continue;
             };
-            let (copy, page, used) = self.pages.copy(level as u8, frame);
-            self.lists[level].replace(k, copy, page, used);
+            let list = &mut self.lists[level];
+            let a = list.entries.len();
+            let node = Node::new(self.pages.pool.page(frame));
+            for i in 0..node.count() {
+                list.entries.push_from(&node, i);
+                if level > 1 {
+                    // The new node becomes another parent of each internal child.
+                    self.pages.pool.retain(node.child(i));
+                }
+            }
+            let b = list.entries.len();
+            list.restage(k, a, b, node::size(&list.entries, a, b));
             self.dropped.push(item.page);
             if level > 0 {
-                // The list held the original; it holds the copy now.
                 self.release(frame);
             }
+            self.moved += 1;
         }
     }
 
-    /// Merges each node this write built that is under a quarter full into a
+    /// Merges each node this write added that is under a quarter full into a
     /// neighbor, among the nodes of `lists[level]` past `start`, if the two fit in a
-    /// page and the neighbor is in memory.
+    /// page and the neighbor is in memory. The nodes this write added aren't built
+    /// yet, so no build goes to waste.
     fn fix_underfull(&mut self, level: usize, start: usize) {
         let mut k = start;
         'next: while k < self.lists[level].len() {
@@ -941,44 +915,58 @@ impl Tree {
         }
     }
 
-    /// Rebuilds nodes `a` and `a + 1` of `lists[level]` as one node, if they fit
-    /// and are in memory.
+    /// Replaces nodes `a` and `a + 1` of `lists[level]` with a node holding the
+    /// entries of both, if they fit and are in memory.
     fn merge_pair(&mut self, level: usize, a: usize) -> bool {
-        let (x, y) = {
-            let items = &self.lists[level].items;
-            (items[a], items[a + 1])
-        };
-        self.pair.clear();
-        for item in [x, y] {
-            let frame = if level > 0 {
-                item.frame
-            } else if let Some(frame) = self.pages.cached(item.page) {
-                frame
-            } else {
-                return false;
-            };
-            let node = Node::new(self.pages.pool.page(frame));
-            for i in 0..node.count() {
-                self.pair.push_from(&node, i);
-            }
-        }
-        let n = self.pair.len();
-        if node::size(&self.pair, 0, n) > self.page_size {
-            return false;
-        }
-        let (frame, page, used) = self.pages.build(level as u8, &self.pair, 0, n, Life::Short);
-        if level > 0 {
-            // The new node becomes another parent of every internal child of the two.
-            for i in 0..n {
-                let child = node::child_frame(self.pair.value(i));
-                if child != NO_FRAME {
-                    self.pages.pool.retain(child);
+        let list = &mut self.lists[level];
+        let (x, y) = (list.items[a], list.items[a + 1]);
+        let len = list.entries.len();
+        let (start, end) = if x.fresh && y.fresh && x.end == y.start {
+            // Both are entries next to each other already.
+            (x.start as usize, y.end as usize)
+        } else {
+            for item in [x, y] {
+                if item.fresh {
+                    list.entries
+                        .extend_from_within(item.start as usize, item.end as usize);
+                    continue;
+                }
+                let frame = if level > 0 {
+                    item.frame
+                } else if let Some(frame) = self.pages.cached(item.page) {
+                    frame
+                } else {
+                    list.entries.truncate(len);
+                    return false;
+                };
+                let node = Node::new(self.pages.pool.page(frame));
+                for i in 0..node.count() {
+                    list.entries.push_from(&node, i);
                 }
             }
+            (len, list.entries.len())
+        };
+        let used = node::size(&list.entries, start, end);
+        if used > self.page_size {
+            list.entries.truncate(len);
+            return false;
         }
-        self.lists[level].replace_pair(a, self.pair.key(0), frame, page, used);
-        self.forget(level, x);
-        self.forget(level, y);
+        list.replace_pair(a, start, end, used);
+        // The new version won't use the unchanged ones, which keep their pages until
+        // older readers are gone. The new node becomes another parent of each of
+        // their internal children.
+        for item in [x, y].into_iter().filter(|item| !item.fresh) {
+            if level > 1 {
+                let node = Node::new(self.pages.pool.page(item.frame));
+                for i in 0..node.count() {
+                    self.pages.pool.retain(node.child(i));
+                }
+            }
+            self.dropped.push(item.page);
+            if item.frame != NO_FRAME {
+                self.release(item.frame);
+            }
+        }
         true
     }
 
@@ -999,14 +987,29 @@ impl Tree {
                 }
             }
         }
-        // The list's reference becomes the root's.
         let item = self.lists[level].items[0];
-        self.lists[level].truncate(Mark::default());
-        let mut root = Root {
-            page: item.page,
-            frame: item.frame,
-            level: level as u8,
+        let mut root = if item.fresh && level > 0 && item.end - item.start == 1 {
+            // A root with a single child is redundant: the child becomes the root
+            // instead, with the entry's reference to it.
+            let child = self.lists[level].entries.value(item.start as usize);
+            Root {
+                page: node::child_page(child),
+                frame: node::child_frame(child),
+                level: level as u8 - 1,
+            }
+        } else {
+            if item.fresh {
+                self.build_node(level, 0);
+            }
+            // The list's reference becomes the root's.
+            let item = self.lists[level].items[0];
+            Root {
+                page: item.page,
+                frame: item.frame,
+                level: level as u8,
+            }
         };
+        self.lists[level].truncate(Mark::default());
         // A root with a single child is redundant.
         while root.level > 0 {
             let node = self.node(root.frame);
@@ -1060,68 +1063,42 @@ fn split<'o, 'r>(
     (child_ops, child_ranges, covered)
 }
 
-/// Builds entries `a..b` of `src` into a new node at `level`, appended to `out`.
-fn emit(
-    pages: &mut Pages,
-    out: &mut NodeList,
-    level: u8,
-    src: &impl Entries,
-    a: usize,
-    b: usize,
-    life: Life,
-) {
-    let (frame, page, used) = pages.build(level, src, a, b, life);
-    out.push(src.key(a), frame, page, used, true);
-}
-
-/// Builds entries `a..b` of `src` into as few nodes as fit, of similar sizes.
-fn emit_even(
-    pages: &mut Pages,
-    out: &mut NodeList,
-    level: u8,
-    src: &impl Entries,
-    a: usize,
-    b: usize,
-    page_size: usize,
-) {
-    let mut s = a;
-    while s < b {
-        let total = node::size(src, s, b);
-        if total <= page_size {
-            emit(pages, out, level, src, s, b, Life::Short);
-            return;
-        }
-        let e = node::fit(src, s, b, total / total.div_ceil(page_size));
-        emit(pages, out, level, src, s, e, Life::Short);
-        s = e;
-    }
-}
-
 /// Nodes replacing one node's children, in key order. Each internal node holds a
 /// reference; each leaf is found through the cache.
+///
+/// The nodes this write adds aren't built at first: they are entries, kept here,
+/// until no merge can change them any more.
 #[derive(Default)]
 struct NodeList {
     /// Each node's smallest key, followed by a child reference to it.
     bytes: Vec<u8>,
     items: Vec<Item>,
+    /// The entries of the nodes this write adds.
+    entries: EntryBuf,
 }
 
 #[derive(Clone, Copy)]
 struct Item {
     at: u32,
     key_len: u32,
+    /// The node's frame and page, which a node this write adds only has once built.
     frame: FrameId,
     page: u64,
-    /// Bytes used, known for the nodes this write built.
-    used: u32,
-    /// Built by this write, rather than kept from the previous version.
+    /// Added by this write, rather than kept from the previous version. Until it
+    /// is built, such a node is entries `start..end` of the list's `entries`, which
+    /// take `used` bytes; `life` is how long its page is likely to stay in use.
     fresh: bool,
+    start: u32,
+    end: u32,
+    used: u32,
+    life: Life,
 }
 
 #[derive(Clone, Copy, Default)]
 struct Mark {
     items: usize,
     bytes: usize,
+    entries: usize,
 }
 
 impl NodeList {
@@ -1133,43 +1110,102 @@ impl NodeList {
         Mark {
             items: self.items.len(),
             bytes: self.bytes.len(),
+            entries: self.entries.len(),
         }
     }
 
     fn truncate(&mut self, mark: Mark) {
         self.items.truncate(mark.items);
         self.bytes.truncate(mark.bytes);
+        self.entries.truncate(mark.entries);
     }
 
-    fn push(&mut self, key: &[u8], frame: FrameId, page: u64, used: usize, fresh: bool) {
-        let at = self.bytes.len() as u32;
-        self.bytes.extend_from_slice(key);
-        self.bytes.extend_from_slice(&node::child_ref(frame, page));
-        let (key_len, used) = (key.len() as u32, used.min(u32::MAX as usize) as u32);
+    /// Adds a node kept from the previous version.
+    fn push(&mut self, key: &[u8], frame: FrameId, page: u64) {
+        let (at, key_len) = append_ref(&mut self.bytes, key, frame, page);
         self.items.push(Item {
             at,
             key_len,
             frame,
             page,
-            used,
-            fresh,
+            fresh: false,
+            start: 0,
+            end: 0,
+            used: 0,
+            life: Life::Short,
         });
     }
 
-    /// Replaces node `i` with a fresh copy of it.
-    fn replace(&mut self, i: usize, frame: FrameId, page: u64, used: usize) {
-        let item = &mut self.items[i];
-        let at = (item.at + item.key_len) as usize;
-        self.bytes[at..at + CHILD_REF].copy_from_slice(&node::child_ref(frame, page));
-        (item.frame, item.page, item.used, item.fresh) = (frame, page, used as u32, true);
+    /// Adds a node holding `entries[a..b]`, which take `used` bytes, to be built
+    /// on a page with `life`.
+    fn emit(&mut self, a: usize, b: usize, used: usize, life: Life) {
+        // The child reference is filled in once the node is built.
+        let (at, key_len) = append_ref(&mut self.bytes, self.entries.key(a), NO_FRAME, 0);
+        self.items.push(Item {
+            at,
+            key_len,
+            frame: NO_FRAME,
+            page: 0,
+            fresh: true,
+            start: a as u32,
+            end: b as u32,
+            used: used as u32,
+            life,
+        });
     }
 
-    /// Replaces nodes `i` and `i + 1` with a fresh node starting at `key`.
-    fn replace_pair(&mut self, i: usize, key: &[u8], frame: FrameId, page: u64, used: usize) {
-        self.push(key, frame, page, used, true);
+    /// Adds nodes holding `entries[a..b]`: as few as fit in pages of `page_size`
+    /// bytes, of similar sizes.
+    fn emit_even(&mut self, a: usize, b: usize, page_size: usize) {
+        let mut s = a;
+        while s < b {
+            let total = node::size(&self.entries, s, b);
+            if total <= page_size {
+                self.emit(s, b, total, Life::Short);
+                return;
+            }
+            let (e, used) = node::fit(&self.entries, s, b, total / total.div_ceil(page_size));
+            self.emit(s, e, used, Life::Short);
+            s = e;
+        }
+    }
+
+    /// Turns node `i`, kept from the previous version, into one this write adds,
+    /// holding `entries[a..b]`, which take `used` bytes.
+    fn restage(&mut self, i: usize, a: usize, b: usize, used: usize) {
+        let item = &mut self.items[i];
+        (item.frame, item.page, item.fresh) = (NO_FRAME, 0, true);
+        (item.start, item.end, item.used) = (a as u32, b as u32, used as u32);
+        item.life = Life::Short;
+        let at = (item.at + item.key_len) as usize;
+        self.bytes[at..at + CHILD_REF].copy_from_slice(&node::child_ref(NO_FRAME, 0));
+    }
+
+    /// Records that node `i`, which this write added, was built in `frame` and
+    /// `page`.
+    fn built(&mut self, i: usize, frame: FrameId, page: u64) {
+        let item = &mut self.items[i];
+        (item.frame, item.page) = (frame, page);
+        let at = (item.at + item.key_len) as usize;
+        self.bytes[at..at + CHILD_REF].copy_from_slice(&node::child_ref(frame, page));
+    }
+
+    /// Replaces nodes `i` and `i + 1` with a node holding `entries[a..b]`, which
+    /// take `used` bytes.
+    fn replace_pair(&mut self, i: usize, a: usize, b: usize, used: usize) {
+        self.emit(a, b, used, Life::Short);
         self.items[i] = self.items.pop().unwrap();
         self.items.remove(i + 1);
     }
+}
+
+/// Appends `key` and a child reference to `bytes`, and returns where the key
+/// starts and its length.
+fn append_ref(bytes: &mut Vec<u8>, key: &[u8], frame: FrameId, page: u64) -> (u32, u32) {
+    let at = bytes.len() as u32;
+    bytes.extend_from_slice(key);
+    bytes.extend_from_slice(&node::child_ref(frame, page));
+    (at, key.len() as u32)
 }
 
 impl Entries for NodeList {
@@ -1224,7 +1260,15 @@ impl Tree {
             crate::meta::META_PAGES + stats.pages,
             "pages leaked"
         );
-        assert_eq!(pool.in_use(), stats.internal + cache.len(), "frames leaked");
+        // Frames that cancelled reads left behind wait for the clock hand.
+        let cancelled = (0..pool.len() as FrameId)
+            .filter(|&f| pool.frame(f).holds == Holds::Loading && pool.refs(f) == 0)
+            .count();
+        assert_eq!(
+            pool.in_use(),
+            stats.internal + cache.len() + cancelled,
+            "frames leaked"
+        );
         for (page, frame) in cache.entries() {
             let info = pool.frame(frame);
             assert_eq!(
@@ -1338,6 +1382,27 @@ impl Tree {
         pages
     }
 
+    /// Each leaf's page and smallest key, in key order, found from the internal
+    /// nodes. The key is empty for a root leaf.
+    pub(crate) fn leaves(&self) -> Vec<(u64, Vec<u8>)> {
+        let Some(root) = self.root else {
+            return Vec::new();
+        };
+        let mut cur = Cursor::new();
+        let mut page = Some(self.descend_first(root, &mut cur));
+        let mut leaves = Vec::new();
+        while let Some(leaf) = page {
+            let mut key = Vec::new();
+            if cur.depth > 0 {
+                let (frame, i) = cur.path[cur.depth - 1];
+                self.node(frame).key_into(usize::from(i), &mut key);
+            }
+            leaves.push((leaf, key));
+            page = self.next_leaf(&mut cur, true);
+        }
+        leaves
+    }
+
     /// Number of cached leaves, and the bytes they use.
     pub(crate) fn leaf_usage(&self) -> (usize, usize) {
         let (pool, cache) = (&self.pages.pool, &self.pages.cache);
@@ -1348,6 +1413,11 @@ impl Tree {
 
     pub(crate) fn page_size(&self) -> usize {
         self.page_size
+    }
+
+    /// The nodes the last write added for its changes, and those it moved.
+    pub(crate) fn moves(&self) -> (usize, usize) {
+        (self.added, self.moved)
     }
 }
 

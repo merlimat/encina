@@ -14,12 +14,14 @@
 
 //! A simulated disk for tests. It can fail any single operation, or crash during
 //! one: then only what was synced survives, plus whichever pages written since
-//! happen to have landed, with the write in progress torn.
+//! happen to have landed, with the write in progress torn. It can also hold leaf
+//! reads in flight until a test releases them.
 
 use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 use std::slice;
+use std::task::{Context, Poll, Waker};
 
 use compio::buf::IoBuf;
 
@@ -51,6 +53,14 @@ struct Disk {
     fault: Option<(u64, Fault)>,
     /// The disk as a crash left it.
     crashed: Option<Vec<u8>>,
+    /// While holding, reads numbered `released` or later wait for a release.
+    holding: bool,
+    released: u64,
+    /// Reads waiting for a release.
+    waiting: Vec<Waker>,
+    /// The buffers of held reads that were cancelled, with their operation
+    /// numbers. Like a kernel, the disk keeps them until the read finishes.
+    cancelled: Vec<(u64, FrameBuf)>,
 }
 
 impl SimDisk {
@@ -122,20 +132,63 @@ impl SimDisk {
     }
 
     pub(crate) fn read(&self, mut buf: FrameBuf, offset: u64) -> (io::Result<()>, FrameBuf) {
-        if let Err(e) = self.begin(None) {
-            return (Err(e), buf);
-        }
+        let res = self.begin(None).and_then(|()| self.fill(&mut buf, offset));
+        (res, buf)
+    }
+
+    /// Copies what the disk holds at `offset` into `buf`.
+    fn fill(&self, buf: &mut FrameBuf, offset: u64) -> io::Result<()> {
         let disk = self.0.borrow();
         let (at, out) = (offset as usize, buf.bytes_mut());
-        let res = match disk.current.get(at..at + out.len()) {
-            Some(data) => {
-                out.copy_from_slice(data);
-                Ok(())
-            }
-            None => Err(io::ErrorKind::UnexpectedEof.into()),
-        };
-        drop(disk);
-        (res, buf)
+        let data = disk.current.get(at..at + out.len());
+        out.copy_from_slice(data.ok_or(io::ErrorKind::UnexpectedEof)?);
+        Ok(())
+    }
+
+    /// Makes the leaf reads started from now on wait until released.
+    pub(crate) fn hold(&self) {
+        let mut disk = self.0.borrow_mut();
+        disk.holding = true;
+        disk.released = disk.ops;
+    }
+
+    /// Finishes the held reads numbered up to `op`.
+    pub(crate) fn release_through(&self, op: u64) {
+        let mut disk = self.0.borrow_mut();
+        disk.released = disk.released.max(op + 1);
+        disk.finish_held();
+    }
+
+    /// Finishes every held read, and stops holding.
+    pub(crate) fn release(&self) {
+        let mut disk = self.0.borrow_mut();
+        disk.holding = false;
+        disk.finish_held();
+    }
+
+    /// Starts a leaf read: returns its operation number and outcome.
+    fn start_read(&self) -> (u64, io::Result<()>) {
+        let op = self.ops();
+        (op, self.begin(None))
+    }
+
+    /// Whether read `op` is held. If so, `waker` is woken on its release.
+    fn holds(&self, op: u64, waker: &Waker) -> bool {
+        let mut disk = self.0.borrow_mut();
+        let held = disk.is_held(op);
+        if held {
+            disk.waiting.push(waker.clone());
+        }
+        held
+    }
+
+    /// Takes the buffer of read `op`, cancelled: it is dropped once the read
+    /// would have finished.
+    fn cancel(&self, op: u64, buf: FrameBuf) {
+        let mut disk = self.0.borrow_mut();
+        if disk.is_held(op) {
+            disk.cancelled.push((op, buf));
+        }
     }
 
     pub(crate) fn write(&self, buf: FrameBuf, offset: u64) -> (io::Result<()>, FrameBuf) {
@@ -193,7 +246,62 @@ impl SimDisk {
     }
 }
 
+/// A leaf read on the simulated disk. It finishes when first polled, unless the
+/// disk holds it.
+pub(crate) struct SimRead {
+    disk: Rc<SimDisk>,
+    offset: u64,
+    buf: Option<FrameBuf>,
+    /// The read's operation number and outcome, once started.
+    started: Option<(u64, io::Result<()>)>,
+}
+
+impl SimRead {
+    pub(crate) fn new(disk: Rc<SimDisk>, buf: FrameBuf, offset: u64) -> SimRead {
+        SimRead {
+            disk,
+            offset,
+            buf: Some(buf),
+            started: None,
+        }
+    }
+
+    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<(io::Result<()>, FrameBuf)> {
+        let disk = &self.disk;
+        let (op, _) = self.started.get_or_insert_with(|| disk.start_read());
+        if disk.holds(*op, cx.waker()) {
+            return Poll::Pending;
+        }
+        let (_, res) = self.started.take().unwrap();
+        let mut buf = self.buf.take().unwrap();
+        let res = res.and_then(|()| self.disk.fill(&mut buf, self.offset));
+        Poll::Ready((res, buf))
+    }
+}
+
+impl Drop for SimRead {
+    fn drop(&mut self) {
+        if let (Some((op, _)), Some(buf)) = (&self.started, self.buf.take()) {
+            self.disk.cancel(*op, buf);
+        }
+    }
+}
+
 impl Disk {
+    fn is_held(&self, op: u64) -> bool {
+        self.holding && op >= self.released
+    }
+
+    /// Lets the reads no longer held finish: wakes those waiting, and drops the
+    /// buffers of the cancelled ones.
+    fn finish_held(&mut self) {
+        let (holding, released) = (self.holding, self.released);
+        self.cancelled.retain(|&(op, _)| holding && op >= released);
+        for waker in self.waiting.drain(..) {
+            waker.wake();
+        }
+    }
+
     /// Records what a crash during operation `op` leaves on disk: what was synced,
     /// plus a pseudo-random subset of the pages written since, plus the first half
     /// of the write in progress, if any.

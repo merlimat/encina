@@ -120,3 +120,40 @@ fn the_data_path_does_not_allocate() {
         "write allocated"
     );
 }
+
+#[test]
+fn misses_do_not_allocate() {
+    // Reopened with a cache of 16 pages, too small for the store, so that lookups
+    // and scans keep reading leaves back, and reading ahead.
+    let disk = SimDisk::new();
+    let opts = Options::default().cache_size(16 * 4096);
+    let db = now(Db::open_sim(disk.clone(), opts.clone())).unwrap();
+    let mut batch = WriteBatch::new();
+    fill(&mut batch, 0);
+    now(db.write(&mut batch)).unwrap();
+    drop(db);
+    let disk = disk.restart();
+    let db = now(Db::open_sim(disk.clone(), opts)).unwrap();
+    let read_all = || {
+        for i in (0..ENTRIES).step_by(7) {
+            let found = now(db.get(&key(i), Comparison::Equal, |_, v| v[0])).unwrap();
+            assert_eq!(found, Some(0));
+        }
+    };
+    let scan_all = || {
+        let mut iter = db.range(..);
+        let mut n = 0;
+        while now(iter.next()).unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, ENTRIES);
+    };
+    // The first misses grow the frame pool and the table of reads.
+    read_all();
+    scan_all();
+    let ops = disk.ops();
+    assert_eq!(allocations(read_all), 0, "lookups allocated");
+    assert_eq!(allocations(scan_all), 0, "scans allocated");
+    let leaves = db.tree().leaves().len() as u64;
+    assert!(disk.ops() - ops > leaves, "the reads hit the cache");
+}

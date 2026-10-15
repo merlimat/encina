@@ -123,8 +123,8 @@ pub(crate) fn size(src: &impl Entries, a: usize, b: usize) -> usize {
 }
 
 /// The largest `e` in `a + 1..=b` such that entries `a..e` fit in `limit` bytes,
-/// or `a + 1` if not even one entry does.
-pub(crate) fn fit(src: &impl Entries, a: usize, b: usize, limit: usize) -> usize {
+/// or `a + 1` if not even one entry does, and the bytes those entries take.
+pub(crate) fn fit(src: &impl Entries, a: usize, b: usize, limit: usize) -> (usize, usize) {
     let first = src.key(a);
     let mut prefix = first.len();
     // Record bytes (suffix past the head, plus value) of entries a..e.
@@ -148,7 +148,10 @@ pub(crate) fn fit(src: &impl Entries, a: usize, b: usize, limit: usize) -> usize
         records = r;
         e += 1;
     }
-    e
+    (
+        e,
+        align4(HEADER + prefix) + (e - a) * (HEAD + SLOT) + records,
+    )
 }
 
 /// Writes entries `a..b` of `src`, which must be sorted and fit in `page`, as a node
@@ -352,13 +355,16 @@ pub(crate) struct EntryBuf {
 }
 
 impl EntryBuf {
-    pub(crate) fn clear(&mut self) {
-        self.bytes.clear();
-        self.items.clear();
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// Drops the entries from `len` on.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        if let Some(&[at, _, _]) = self.items.get(len) {
+            self.bytes.truncate(at as usize);
+            self.items.truncate(len);
+        }
     }
 
     pub(crate) fn push(&mut self, key: &[u8], value: &[u8]) {
@@ -367,6 +373,23 @@ impl EntryBuf {
         self.bytes.extend_from_slice(value);
         self.items
             .push([at as u32, key.len() as u32, value.len() as u32]);
+    }
+
+    /// Appends a copy of entries `a..b`.
+    pub(crate) fn extend_from_within(&mut self, a: usize, b: usize) {
+        if a == b {
+            return;
+        }
+        // The entries' bytes are contiguous.
+        let start = self.items[a][0];
+        let [at, key_len, len] = self.items[b - 1];
+        let shift = self.bytes.len() as u32 - start;
+        self.bytes
+            .extend_from_within(start as usize..(at + key_len + len) as usize);
+        for i in a..b {
+            let [at, key_len, len] = self.items[i];
+            self.items.push([at + shift, key_len, len]);
+        }
     }
 
     /// Copies entry `i` of `node`.
@@ -492,9 +515,10 @@ mod tests {
             for (k, v) in &map {
                 buf.push(k, v);
             }
-            let e = fit(&buf, 0, buf.len(), limit);
+            let (e, used) = fit(&buf, 0, buf.len(), limit);
             prop_assert!(e >= 1 && e <= buf.len());
-            prop_assert!(e == 1 || size(&buf, 0, e) <= limit);
+            prop_assert_eq!(used, size(&buf, 0, e));
+            prop_assert!(e == 1 || used <= limit);
             if e < buf.len() {
                 prop_assert!(size(&buf, 0, e + 1) > limit);
             }

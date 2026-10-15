@@ -70,13 +70,12 @@ pub(crate) struct Space {
     lowest_free: u64,
     /// The run each [`Life`] allocates from, while a write is in progress.
     runs: [Run; 2],
-    /// Pages the write in progress allocated and freed again, as when two nodes
-    /// merge: holes in its runs, which its next short-lived pages fill.
+    /// Pages the write in progress allocated and freed again: holes in its runs,
+    /// which its next short-lived pages fill.
     holes: Vec<u64>,
-    /// Pages the write in progress allocated, and how many of them were for nodes
-    /// it moved.
-    allocated: u64,
-    moved: u64,
+    /// How many pages the write in progress freed again.
+    #[cfg(test)]
+    pub(crate) freed: usize,
     /// Pages that published versions replaced, with the generation that replaced
     /// them, oldest first.
     dropped: VecDeque<(u64, u64)>,
@@ -94,8 +93,8 @@ impl Space {
             lowest_free: 0,
             runs: [Run::default(); 2],
             holes: Vec::new(),
-            allocated: 0,
-            moved: 0,
+            #[cfg(test)]
+            freed: 0,
             dropped: VecDeque::new(),
             readers: Vec::new(),
         }
@@ -123,7 +122,10 @@ impl Space {
     pub(crate) fn restart(&mut self) {
         self.runs = [Run::default(); 2];
         self.holes.clear();
-        (self.allocated, self.moved) = (0, 0);
+        #[cfg(test)]
+        {
+            self.freed = 0;
+        }
         let last = self.used.iter().rposition(|&w| w != 0);
         self.high_water = last.map_or(0, |i| {
             (i as u64 + 1) * 64 - u64::from(self.used[i].leading_zeros())
@@ -136,7 +138,6 @@ impl Space {
     /// run is used up, the next stretch of at least [`MIN_RUN`] free pages takes
     /// over, or else the end of the file.
     pub(crate) fn alloc(&mut self, life: Life) -> u64 {
-        self.allocated += 1;
         // A run can take in holes, and a hole can be taken while in a run: both
         // ways skip the pages the other took.
         if life == Life::Short {
@@ -166,24 +167,13 @@ impl Space {
         page
     }
 
-    /// Whether the write in progress should move a node it keeps, on `page`, to
-    /// a page from [`alloc_moved`](Self::alloc_moved), freeing `page` once the
-    /// write is published: whether `page` sits in a window of 64 pages, below the
-    /// high-water mark, with at most [`MOVE_AT`] in use. A write moves at most as
-    /// many nodes as it writes otherwise.
+    /// Whether a node on `page` that the write in progress keeps should move to a
+    /// new page, freeing `page` once the write is published: whether `page` sits
+    /// in a window of 64 pages, below the high-water mark, with at most
+    /// [`MOVE_AT`] in use.
     pub(crate) fn should_move(&self, page: u64) -> bool {
         let word = page / 64;
-        (word + 1) * 64 <= self.high_water
-            && self.used[word as usize].count_ones() <= MOVE_AT
-            && 2 * self.moved < self.allocated
-    }
-
-    /// A page for a node that the write in progress moves: the next short-lived
-    /// one, so that the moved node shares a request with the nodes the write
-    /// builds.
-    pub(crate) fn alloc_moved(&mut self) -> u64 {
-        self.moved += 1;
-        self.alloc(Life::Short)
+        (word + 1) * 64 <= self.high_water && self.used[word as usize].count_ones() <= MOVE_AT
     }
 
     /// The first stretch of free pages at or after `from`, outside the `other`
@@ -239,6 +229,10 @@ impl Space {
     pub(crate) fn free(&mut self, page: u64) {
         self.unmark(page);
         self.holes.push(page);
+        #[cfg(test)]
+        {
+            self.freed += 1;
+        }
     }
 
     fn unmark(&mut self, page: u64) {
@@ -278,12 +272,6 @@ impl Space {
             self.unmark(page);
             freed(page);
         }
-    }
-
-    /// Pages the last write moved.
-    #[cfg(test)]
-    pub(crate) fn moved(&self) -> u64 {
-        self.moved
     }
 
     /// Pages dropped but not reclaimed yet.
@@ -411,7 +399,7 @@ mod tests {
     fn kept_pages_move_out_of_mostly_free_windows() {
         // Of each window of 64 pages, the first has one page in use too many, the
         // second just few enough, the third is full, and the file ends in the
-        // fourth. No free stretch but the end of the file makes a run.
+        // fourth.
         let few = u64::from(MOVE_AT);
         let mut space = Space::new(224);
         let used = (0..4 * few)
@@ -422,19 +410,10 @@ mod tests {
         for page in used {
             space.mark_used(page);
         }
-        assert!(!space.should_move(68), "the write built nothing yet");
-        assert_eq!(space.alloc(Life::Short), 193);
-        assert!(space.should_move(68));
         assert!(!space.should_move(4));
+        assert!(space.should_move(68));
         assert!(!space.should_move(130));
         assert!(!space.should_move(192), "the window runs past the end");
-        // A write moves at most as many pages as it builds.
-        assert_eq!(space.alloc_moved(), 194);
-        assert!(!space.should_move(68));
-        space.alloc(Life::Short);
-        assert!(space.should_move(68));
-        space.restart();
-        assert!(!space.should_move(68));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 # encina — design
 
 > Status: M1 and M2 are implemented: the tree, persistence and the leaf cache.
-> M3, performance, is next (§12).
+> M3, performance, is under way (§12): concurrent misses share one read, and
+> iterators read ahead (§8).
 
 encina is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. Its first
@@ -53,7 +54,7 @@ The costs to accept:
 | Topic | Decision |
 |---|---|
 | Durability | Each `write()` is an atomic, durable commit: when it returns, the batch is on disk, and readers see it from that moment on. There is no separate flush and no internal WAL: after a crash the store opens at the last completed write, and the caller's journal replays anything newer. |
-| Threading | One `!Send` instance per compio thread, no locks or atomics. Scale by sharding (for example, by ledger id) above the library. |
+| Threading | One `!Send` instance per compio thread, no locks or atomics, except in wakers, which Rust requires to be `Send` and `Sync` (§8). Scale by sharding (for example, by ledger id) above the library. |
 | Memory | Bounded from day one and managed entirely by encina: internal nodes stay resident, and leaves live in encina's own leaf cache with a budget, read on demand (§8). No reliance on the OS page cache or `mmap`: the data file is opened for direct I/O (§9). |
 | Allocation | No heap allocation on the data path. Page frames in the leaf cache are the only exception (§8); write batches, cursors and reader bookkeeping reuse their memory. compio itself allocates once per I/O operation, so cache misses and commits are not allocation-free (§9). |
 | Keys and values | **Proposed:** arbitrary byte strings, starting with one node format, slotted, which handles any lengths. A dense format for fixed-size data can be added later as a per-node specialization if benchmarks justify it (§5). |
@@ -199,7 +200,8 @@ ledger's settled entries then stop being rewritten by later appends, even when o
 leaf holds the tails of several ledgers. Smaller runs, like scattered inserts, don't
 get leaves of their own, and whatever follows the last split point is split evenly
 by bytes. There is no strict 50% minimum fill: a rebuilt node below ~25% merges with
-a neighbor, if the neighbor is in memory.
+a neighbor, if the neighbor is in memory. A level's new nodes are only built once
+its merges are decided, so a write builds no node that a merge then replaces.
 
 ### `delete_range(start..end)`
 
@@ -222,7 +224,8 @@ nothing.
 - `range(r)`: an iterator holding a version and a cursor stack of (node, index) per
   level, stored inline (the tree is shallow), so creating one doesn't allocate. It
   is a point-in-time snapshot. Holding one keeps replaced nodes in memory and holds
-  back page reuse (§8), so iterators should be short-lived.
+  back page reuse (§8), so iterators should be short-lived. When the leaf it moves
+  to isn't cached, it also reads the next leaves ahead (§8).
 
 ## 7. Commit and on-disk format
 
@@ -288,8 +291,8 @@ free stretch of at least 16 pages (64 KiB with 4 KiB pages), then the next one,
 and at the end of the file, 256 pages at a time. Shorter holes are skipped: each
 would cost a request for a page or two, and they become usable once the pages
 around them are freed too. Every write starts over from the lowest free page. The
-pages it frees again before it ends, as when two nodes merge, are holes in its own
-runs, which its next short-lived pages fill (see below).
+pages it frees again before it ends, as when its new root loses more than one
+level, are holes in its own runs, which its next short-lived pages fill (see below).
 
 Pages replaced together should be freed together, as runs again, so a write
 allocates from two runs at once: one for pages likely to be replaced soon
@@ -306,7 +309,7 @@ to the pages it builds, if they sit in a window of 64 pages (one word of the
 bitmap) with at most 16 in use, and, for leaves, if they are cached. Their parent
 is rebuilt anyway, so a move takes no read and no other write; each page moved
 frees at least three, and the window, once empty, makes a run for a later write. A
-write moves at most as many pages as it builds.
+write moves at most as many nodes as it builds for its changes.
 
 The file gives back its end once that is free: every write starts by lowering the
 high-water mark to the last page in use, which its meta page records, and the
@@ -323,25 +326,26 @@ shown.
 | Workload | Allocation | File | Requests | Pages |
 |---|---|---:|---:|---:|
 | Benchmark load | lowest free page | 1.02× | 1,790 | 1,790 |
-| | runs | 1.23× | 39 | 1,790 |
-| | runs, moving pages | 1.23× | 34 | 1,809 |
+| | runs | 1.21× | 25 | 1,790 |
+| | runs, moving pages | 1.22× | 26 | 1,807 |
 | Random, 20,000 per commit | lowest free page | 1.72× | 10,882 | 10,882 |
-| | runs | 2.74× | 436 | 10,882 |
-| | runs, moving pages | 2.64× | 315 | 11,308 |
+| | runs | 2.73× | 433 | 10,882 |
+| | runs, moving pages | 2.63× | 316 | 11,319 |
 | Random, 1,000 per commit | lowest free page | 1.70× | 1,158 | 1,158 |
-| | runs | 3.30× | 58 | 1,158 |
-| | runs, moving pages | 2.21× | 25 | 1,471 |
+| | runs | 3.00× | 57 | 1,158 |
+| | runs, moving pages | 2.08× | 26 | 1,420 |
 | Random, 10 per commit | lowest free page | 1.70× | 23 | 23 |
-| | runs | 4.67× | 1.8 | 23 |
-| | runs, moving pages | 3.01× | 1.9 | 30 |
+| | runs | 4.16× | 1.8 | 23 |
+| | runs, moving pages | 2.87× | 1.9 | 29 |
 
 Taking the lowest free page sends a request per page, and the random keys' load
 sets its file size. Moving pages costs page writes where updates are small and
-spread out, but takes fewer requests, since the emptied windows make longer runs.
-Big commits gain little: the windows a commit fills still hold over a quarter of
-their pages after the next one, too many to move, and the commit after replaces
-most of those anyway. On the benchmark VM, writing in runs cut the load's requests from 169,500
-of 4 KiB to 4,540 averaging 158 KiB, and made it three times as fast.
+spread out, but takes fewer requests there, since the emptied windows make longer
+runs; the benchmark's load barely changes. Big commits gain little: the windows a
+commit fills still hold over a quarter of their pages after the next one, too many
+to move, and the commit after replaces most of those anyway. On the benchmark VM,
+writing in runs cut the load's requests from 169,500 of 4 KiB to 4,540 averaging
+158 KiB, and made it three times as fast.
 
 ### Recovery
 
@@ -354,8 +358,11 @@ of 4 KiB to 4,540 averaging 158 KiB, and made it three times as fast.
    the file.
 3. Build the free bitmap from the pages the tree reaches.
 
-A file too short to hold a meta page, or with no intact slot, isn't a store
-(`Error::InvalidFile`): a crash while a store is being created can leave one.
+Opening an empty file creates a store. It first syncs the file's directory, since a
+new file's name is durable only once its directory is: without that, a crash could
+lose a store whose every write had been synced. Then it writes both meta slots and
+syncs them. A file too short to hold a meta page, or with no intact slot, isn't a
+store (`Error::InvalidFile`): a crash while a store is being created can leave one.
 
 There is no log to replay: the caller's journal covers anything newer than the last
 completed write.
@@ -372,10 +379,9 @@ completed write.
   changes and the ones it builds until it publishes, and a reader pins the leaf it
   is on. Exposing cache numbers is left to a later metrics design.
 - **Misses** read the page straight into a free frame (direct I/O) and verify the
-  checksum. Concurrent misses on the same page each read it, and all but the first
-  to finish drop their copy; sharing one read is planned for M3. A frame left
-  behind by a cancelled read is reclaimed by the clock hand once the read
-  completes.
+  checksum. Concurrent misses on the same page share one read, and iterators read
+  ahead (below). A frame left behind by a cancelled read is reclaimed by the clock
+  hand once the read completes.
 - **Page reuse.** A page dropped by a write becomes reusable once that write is
   published and no reader that started before the publish is still alive (such a
   reader might still need to read it). Iterators always register as readers;
@@ -385,12 +391,62 @@ completed write.
   cache holds roughly 40M entries. A dense format (~5 B/entry) would raise that to
   roughly 200M, which is the main reason to add it later.
 
+### Reads in flight
+
+Leaf reads go through a table of the reads in flight. A reader that misses looks
+there before starting a read, so concurrent misses on a page share one read. Each
+read sits in a slot that counts the readers holding it. Whichever of them is polled
+drives the read, and the first to find it finished claims it: it verifies and
+caches the page. The others then find the page cached, or, if the read failed,
+read it again themselves: a failure goes to the reader that claimed it.
+
+No reader depends on another being polled, not even the one that started the
+read: the read is polled with a waker of its own, which wakes every reader waiting
+for it. That waker keeps the waiting readers in a `Mutex`, because Rust requires
+wakers to be `Send` and `Sync`. It is never contended: a store's reads all run on
+its thread. A read whose last reader lets go of it is cancelled. Its frame is freed
+at once if the read is done with it, and otherwise reclaimed by the clock hand once
+the read finishes: the buffer the runtime holds keeps the frame alive until then.
+
+Slots are reused: once the table has grown to the most reads ever in flight at
+once, a miss allocates nothing but compio's operation (§9).
+
+### Reading ahead
+
+Leaves are scattered on disk (§2), and direct I/O leaves no OS read-ahead anyway,
+so iterators read ahead themselves. Internal nodes are resident, so an iterator
+knows the pages of the leaves it will visit. When the leaf it moves to isn't
+cached, it waits for that leaf's read and meanwhile starts reads of the following
+leaves that aren't cached either, so that a cold scan keeps many reads in flight
+instead of one. Each such miss tops the window up again. The window spans
+`IO_WINDOW` (16) leaves past the current one, and at most a quarter of the cache
+budget. It ends at the last leaf, and at the end of the range: the internal key
+above a leaf is its smallest key, so the iterator knows which leaves the range
+reaches without reading them.
+
+The reads ahead sit in the table like any other read: another reader needing one of
+those pages waits for it, and so does the iterator when it gets there, rather than
+reading the page again. Reading ahead only takes frames within the cache budget: it
+evicts cold leaves but, unlike a read someone waits for, never grows the pool. A
+read ahead that fails is reported when the iterator reaches its leaf, and calling
+`next` again reads the leaf again. Dropping an iterator cancels the reads it
+holds.
+
+On a Linux VM (6 vCPUs, ext4 on virtio), reading ahead took a cold scan of 10M
+BookKeeper-shaped entries through a 64 MiB cache from 4.2 s to 0.75 s, reading the
+same 282 MiB.
+
 ## 9. Concurrency and I/O
 
 - `Db` is `!Send` and `!Sync` (`Rc`, `RefCell`, `Cell`). It is a cheap `Clone`
   handle shared by the tasks of one compio runtime thread. BookKeeper already keeps
   one index per ledger directory; here, one instance per core or shard plays the
   same role. A `Send` facade (compio dispatcher or channels) can come later.
+- **One owner per file.** Opening takes an exclusive `flock` on the file, which
+  closing it releases, so a second open fails with `Error::Locked` instead of
+  corrupting the store. A `flock` lock belongs to the open file rather than to the
+  process, so it also stops a second open from another thread of the same process,
+  the likely mistake with one instance per thread.
 - All file I/O goes through compio 0.19: `read_at` / `write_at` on `&File`, with
   frames as the owned buffers, `sync_data`, and `set_len` to cut the file. A commit
   writes each run of pages with `write_vectored_at`, whose buffers are the frames
@@ -405,8 +461,10 @@ completed write.
   and a vectored write also allocates its `iovec` array. The cache-hit path does no
   I/O and stays allocation-free; a miss pays one allocation per page read, and a
   commit two per write request. encina adds none: a write keeps its in-flight
-  operations in a fixed-size array, and reuses their lists of frames. If compio's
-  show up in profiles, the fix belongs upstream (pooled operation slots).
+  operations in a fixed-size array, and reuses their lists of frames; an iterator
+  keeps the reads it holds inline; and the table of reads in flight reuses its
+  slots (§8). If compio's show up in profiles, the fix belongs upstream (pooled
+  operation slots).
 - CPU-heavy steps, large merges in particular, don't yield to the executor yet;
   that is planned for M3.
 - **Linux with io_uring is the target.** macOS works for development, but there
@@ -501,14 +559,26 @@ complete without suspending.
   must pass the invariant checker, one left failed must reject writes, and
   reopening must yield the state after the last successful write (or after the
   failed one, when the failure hit a commit).
-  This enumerates every failure point instead of sampling them. Measuring coverage
-  of error-handling branches in CI (`cargo llvm-cov`), where an uncovered failure
-  path needs a test or a written reason, is planned for M3.
+  This enumerates every failure point instead of sampling them; the scenario's
+  reads include scans, so failures hit reads ahead too. Measuring coverage of
+  error-handling branches in CI (`cargo llvm-cov`), where an uncovered failure path
+  needs a test or a written reason, is planned for M3.
+- **Reads in flight:** the simulated disk can also hold leaf reads until a test
+  releases them, and keeps the buffer of a held read that is cancelled, as a kernel
+  would. Tests use it to check that concurrent misses share one read, that an
+  iterator reads ahead and waits for the leaf it read ahead rather than reading it
+  again, that a read survives as long as some reader holds it, that a failed read
+  reaches the reader that claims it, and that a cancelled read's frame is only
+  reused once the read finishes.
 - **Damage:** a flipped bit in a leaf fails the reads that need it, and one in an
   internal node fails the open, both with `Error::Corruption`.
+- **Real files** cover what the simulated disk doesn't model: reopening, the lock
+  that keeps out a second open, and syncing the directory of a new store, including
+  a directory that can't be synced.
 - **Allocation tests:** a counting global allocator asserts that `get` and
-  iteration over cached pages, and `write` with a reused batch on the simulated
-  disk, perform no allocations. On a real disk, compio adds one per I/O operation.
+  iteration over cached pages, `get` and iteration that miss the cache (reading
+  ahead included), and `write` with a reused batch, all on the simulated disk,
+  perform no allocations. On a real disk, compio adds one per I/O operation.
 - **Benchmarks** against RocksDB on the BookKeeper workload: sorted batches over
   *A* active ledgers, random point reads, floor lookups, and `delete_range` of old
   ledgers. On the simulated disk, an ignored test measures the file's size and the
@@ -525,7 +595,8 @@ complete without suspending.
 3. **M3, performance:** group commit (writes that queue up during a commit share
    the next one), the dense node format if benchmarks justify it, yielding inside
    large merges, writing large batches' new leaves early, one shared read for
-   concurrent misses, coverage measured in CI, and benchmarks against RocksDB.
+   concurrent misses and reading ahead in iterators (done, §8), coverage measured
+   in CI, and benchmarks against RocksDB.
 
 ## Non-goals (for now)
 
