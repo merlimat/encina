@@ -1045,6 +1045,21 @@ fn cancelled_reads_keep_their_frames_until_they_finish() {
     store.db.check();
 }
 
+#[test]
+fn a_dropped_store_keeps_its_frames_until_its_reads_finish() {
+    let (store, _) = cold_store(2000, 64);
+    store.disk.hold();
+    let mut iter = store.db.range(..);
+    assert!(poll(pin!(iter.next())).is_pending());
+    assert_eq!(loading_frames(&store.db), (1 + WINDOW as usize, 0));
+    // The disk finishes the reads after the store is gone: their buffers must keep
+    // the frame memory alive until then. Only a sanitizer or Miri sees if they don't.
+    let Store { disk, db, .. } = store;
+    drop(iter);
+    drop(db);
+    disk.release();
+}
+
 /// A step of readers sharing held reads.
 #[derive(Clone, Debug)]
 enum Action {
