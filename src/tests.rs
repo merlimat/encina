@@ -18,12 +18,13 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Bound;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use proptest::prelude::*;
 
+use crate::pool::Holds;
 use crate::sim::{Fault, SimDisk};
 use crate::{Comparison, Db, Error, Options, WriteBatch};
 
@@ -245,7 +246,7 @@ fn run(opts: Options, steps: &[Step]) {
                 let ops = step.ops();
                 write(&store.db, &ops);
                 apply(&mut model, &ops);
-                store.db.tree().check();
+                store.db.check();
             }
             Step::Get(key, cmp) => {
                 let got = get(&store.db, key, *cmp);
@@ -276,11 +277,11 @@ fn run(opts: Options, steps: &[Step]) {
                 }
                 assert_eq!(seen, before, "the scan saw a later write");
                 drop(iter);
-                store.db.tree().check();
+                store.db.check();
             }
             Step::Reopen => {
                 store.reopen();
-                store.db.tree().check();
+                store.db.check();
             }
         }
     }
@@ -300,7 +301,7 @@ fn run(opts: Options, steps: &[Step]) {
             }
         }
     }
-    store.db.tree().check();
+    store.db.check();
 }
 
 // Set PROPTEST_CASES to run more than the default 256 cases.
@@ -360,7 +361,7 @@ fn bookkeeper_workload() {
             }
         }
         now(store.db.write(&mut batch)).unwrap();
-        store.db.tree().check();
+        store.db.check();
     }
     let (leaves, used) = store.db.tree().leaf_usage();
     let fill = used as f64 / (leaves * store.db.tree().page_size()) as f64;
@@ -372,9 +373,9 @@ fn bookkeeper_workload() {
         batch.delete_range(&entry_key(1000 + ledger, 0), &entry_key(1001 + ledger, 0));
     }
     now(store.db.write(&mut batch)).unwrap();
-    store.db.tree().check();
+    store.db.check();
     store.reopen();
-    store.db.tree().check();
+    store.db.check();
     for ledger in 0..ledgers {
         let (id, entries) = (1000 + ledger, next_entry[ledger as usize]);
         let (start, end) = (entry_key(id, 0), entry_key(id + 1, 0));
@@ -488,7 +489,7 @@ fn iterators_keep_their_version() {
     assert_eq!(seen, 200);
     drop(iter);
     // Dropping the iterator freed the old version.
-    store.db.tree().check();
+    store.db.check();
     assert_eq!(scan(&store.db, ALL).len(), 100);
 }
 
@@ -503,7 +504,7 @@ fn deleting_everything_empties_the_tree() {
         &store.db,
         &[Op::DeleteRange(vec![], vec![0xff, 0xff, 0xff])],
     );
-    store.db.tree().check();
+    store.db.check();
     assert!(store.db.tree().current().root.is_none());
     store.reopen();
     assert!(scan(&store.db, ALL).is_empty());
@@ -526,14 +527,14 @@ fn reopening_with_a_cold_cache_reads_everything_back() {
         apply(&mut model, &ops);
     }
     store.reopen();
-    store.db.tree().check();
+    store.db.check();
     assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
     for key in model.keys().step_by(13) {
         for cmp in COMPARISONS {
             assert_eq!(get(&store.db, key, cmp), expected(&model, key, cmp));
         }
     }
-    store.db.tree().check();
+    store.db.check();
 }
 
 #[test]
@@ -592,12 +593,21 @@ fn try_scenario(disk: &Rc<SimDisk>, opts: &Options, batches: &[Vec<Op>]) -> (Opt
         if now(db.write(&mut batch_of(ops))).is_err() {
             return (Some(db), done);
         }
-        // Read too, so that reads meet failures as well.
-        if now(db.get(&[0, 0, 0, 0x7f], Comparison::Ceiling, |_, _| ())).is_err() {
+        // Read too, so that reads meet failures as well: a lookup, and a scan, which
+        // reads ahead.
+        if now(db.get(&[0, 0, 0, 0x7f], Comparison::Ceiling, |_, _| ())).is_err()
+            || try_scan(&db).is_err()
+        {
             return (Some(db), done + 1);
         }
     }
     (Some(db), batches.len())
+}
+
+fn try_scan(db: &Db) -> crate::Result<()> {
+    let mut iter = db.range(..);
+    while now(iter.next())?.is_some() {}
+    Ok(())
 }
 
 /// Creating a store takes three operations: two meta slots and a sync.
@@ -633,7 +643,7 @@ fn every_single_failure_leaves_a_recoverable_store() {
                     ));
                 } else {
                     // A write that failed before committing left the store as it was.
-                    db.tree().check();
+                    db.check();
                 }
             }
             drop(db);
@@ -643,7 +653,7 @@ fn every_single_failure_leaves_a_recoverable_store() {
                 Err(Error::InvalidFile(_)) if op < CREATE_OPS => continue,
                 Err(e) => panic!("{fault:?} at operation {op}: reopening failed: {e}"),
             };
-            reopened.tree().check();
+            reopened.check();
             let state = scan(&reopened, ALL);
             // After a failure during a commit, either outcome is valid.
             let ok = state == states[done] || (failed && states.get(done + 1) == Some(&state));
@@ -717,7 +727,7 @@ fn commits_write_each_run_of_pages_with_one_request() {
             "batch {n}: {} pages took {requests} requests",
             written.len()
         );
-        store.db.tree().check();
+        store.db.check();
     }
 }
 
@@ -744,7 +754,7 @@ fn a_failed_page_write_leaves_its_pages_to_the_next_write() {
             let res = now(store.db.write(&mut batch_of(&ops)));
             assert!(matches!(res, Err(Error::Io(_))));
             assert!(!store.db.has_failed());
-            store.db.tree().check();
+            store.db.check();
         }
         write(&store.db, &ops);
         apply(&mut model, &ops);
@@ -752,8 +762,428 @@ fn a_failed_page_write_leaves_its_pages_to_the_next_write() {
         assert_eq!(store.db.tree().pages(), twin.db.tree().pages());
     }
     store.reopen();
-    store.db.tree().check();
+    store.db.check();
     assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+}
+
+/// Polls a future once.
+fn poll<F: Future + ?Sized>(f: Pin<&mut F>) -> Poll<F::Output> {
+    f.poll(&mut Context::from_waker(Waker::noop()))
+}
+
+/// A store of `n` entries on 256-byte pages, reopened with a cache of `frames`
+/// pages, so that none of its leaves is cached.
+fn cold_store(n: u32, frames: usize) -> (Store, Model) {
+    let mut store = Store::new(Options::new().page_size(256).cache_size(frames * 256));
+    let puts: Vec<_> = (0..n)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![i as u8; 8]))
+        .collect();
+    write(&store.db, &puts);
+    let mut model = Model::new();
+    apply(&mut model, &puts);
+    store.reopen();
+    (store, model)
+}
+
+/// Frames that reads are filling, and frames that cancelled reads left behind.
+fn loading_frames(db: &Db) -> (usize, usize) {
+    let tree = db.tree();
+    let pool = &tree.pages.pool;
+    let loading = (0..pool.len() as u32).filter(|&f| pool.frame(f).holds == Holds::Loading);
+    loading.fold((0, 0), |(busy, idle), f| match pool.refs(f) {
+        0 => (busy, idle + 1),
+        _ => (busy + 1, idle),
+    })
+}
+
+/// How many keys of `model` sort below `key`.
+fn below(model: &Model, key: &[u8]) -> usize {
+    model
+        .range::<[u8], _>((Bound::Unbounded, Bound::Excluded(key)))
+        .count()
+}
+
+// The window a cold store with a 64-page cache reads ahead.
+const WINDOW: u64 = 16;
+
+#[test]
+fn a_cold_scan_reads_ahead() {
+    let (store, model) = cold_store(2000, 64);
+    let leaves = store.db.tree().leaves().len() as u64;
+    assert!(leaves > 4 * WINDOW);
+    store.disk.hold();
+    let ops = store.disk.ops();
+    let mut iter = store.db.range(..);
+    assert!(poll(pin!(iter.next())).is_pending());
+    // The first leaf goes out together with the leaves after it.
+    assert_eq!(store.disk.ops() - ops, 1 + WINDOW);
+    store.disk.release();
+    let mut seen = 0;
+    while now(iter.next()).unwrap().is_some() {
+        seen += 1;
+    }
+    assert_eq!(seen, model.len());
+    // Each leaf was read once.
+    assert_eq!(store.disk.ops() - ops, leaves);
+    drop(iter);
+    store.db.check();
+}
+
+#[test]
+fn an_iterator_waits_for_the_leaf_read_ahead() {
+    let (store, model) = cold_store(2000, 64);
+    let leaves = store.db.tree().leaves();
+    store.disk.hold();
+    let ops = store.disk.ops();
+    let mut iter = store.db.range(..);
+    assert!(poll(pin!(iter.next())).is_pending());
+    // Only the first leaf's read finishes.
+    store.disk.release_through(ops);
+    for _ in 0..below(&model, &leaves[1].1) {
+        assert!(now(iter.next()).unwrap().is_some());
+    }
+    // The second leaf's read is in flight: the iterator waits for it, and reads
+    // one more leaf ahead, rather than reading the second one again.
+    assert!(poll(pin!(iter.next())).is_pending());
+    assert_eq!(store.disk.ops() - ops, 1 + WINDOW + 1);
+    store.disk.release();
+    let mut seen = below(&model, &leaves[1].1);
+    while now(iter.next()).unwrap().is_some() {
+        seen += 1;
+    }
+    assert_eq!(seen, model.len());
+    assert_eq!(store.disk.ops() - ops, leaves.len() as u64);
+    drop(iter);
+    store.db.check();
+}
+
+#[test]
+fn concurrent_misses_share_one_read() {
+    let (store, model) = cold_store(2000, 64);
+    let key = 1234u32.to_be_bytes();
+    store.disk.hold();
+    let ops = store.disk.ops();
+    let value = |_: &[u8], v: &[u8]| v.to_vec();
+    let mut a = Box::pin(store.db.get(&key, Comparison::Equal, value));
+    let mut b = pin!(store.db.get(&key, Comparison::Equal, value));
+    let mut c = pin!(store.db.get(&key, Comparison::Equal, value));
+    assert!(poll(a.as_mut()).is_pending());
+    assert!(poll(b.as_mut()).is_pending());
+    assert!(poll(c.as_mut()).is_pending());
+    assert_eq!(store.disk.ops() - ops, 1, "a lookup read the leaf again");
+    // A lookup dropped while it waits leaves the read to the others.
+    drop(a);
+    store.disk.release();
+    let value = Some(model[&key[..]].clone());
+    for get in [b, c] {
+        assert_eq!(now(get).unwrap(), value);
+    }
+    assert_eq!(store.disk.ops() - ops, 1);
+    store.db.check();
+}
+
+#[test]
+fn a_failed_shared_read_is_read_again_by_the_others() {
+    let (store, model) = cold_store(2000, 64);
+    let key = 1234u32.to_be_bytes();
+    store.disk.hold();
+    let ops = store.disk.ops();
+    store.disk.inject(ops, Fault::Error);
+    let mut a = pin!(store.db.get(&key, Comparison::Equal, |_, v| v.to_vec()));
+    let mut b = pin!(store.db.get(&key, Comparison::Equal, |_, v| v.to_vec()));
+    assert!(poll(a.as_mut()).is_pending());
+    assert!(poll(b.as_mut()).is_pending());
+    store.disk.release();
+    // The lookup that claims the failed read reports it; the other reads the leaf
+    // itself.
+    assert!(matches!(now(a), Err(Error::Io(_))));
+    assert_eq!(now(b).unwrap(), Some(model[&key[..]].clone()));
+    assert_eq!(store.disk.ops() - ops, 2);
+    store.db.check();
+}
+
+#[test]
+fn a_lookup_keeps_a_read_ahead_going() {
+    let (store, model) = cold_store(2000, 64);
+    let key = store.db.tree().leaves()[3].1.clone();
+    store.disk.hold();
+    let ops = store.disk.ops();
+    let mut iter = store.db.range(..);
+    assert!(poll(pin!(iter.next())).is_pending());
+    let mut get = pin!(store.db.get(&key, Comparison::Equal, |_, v| v.to_vec()));
+    assert!(poll(get.as_mut()).is_pending());
+    // The lookup waits for the read of the leaf that the iterator reads ahead,
+    // which goes on when the iterator is dropped.
+    drop(iter);
+    store.disk.release();
+    assert_eq!(now(get).unwrap(), Some(model[&key].clone()));
+    assert_eq!(store.disk.ops() - ops, 1 + WINDOW);
+    store.db.check();
+}
+
+#[test]
+fn reading_ahead_joins_the_reads_in_flight() {
+    let (store, model) = cold_store(2000, 64);
+    let leaves = store.db.tree().leaves();
+    store.disk.hold();
+    let ops = store.disk.ops();
+    let key = leaves[3].1.clone();
+    let mut get = Box::pin(store.db.get(&key, Comparison::Equal, |_, v| v.to_vec()));
+    assert!(poll(get.as_mut()).is_pending());
+    let mut iter = store.db.range(..);
+    assert!(poll(pin!(iter.next())).is_pending());
+    // The iterator reads ahead past the fourth leaf, whose read the lookup started.
+    assert_eq!(store.disk.ops() - ops, 1 + WINDOW);
+    // That read goes on without the lookup.
+    drop(get);
+    store.disk.release();
+    let mut seen = 0;
+    while now(iter.next()).unwrap().is_some() {
+        seen += 1;
+    }
+    assert_eq!(seen, model.len());
+    assert_eq!(store.disk.ops() - ops, leaves.len() as u64);
+    drop(iter);
+    store.db.check();
+}
+
+#[test]
+fn reading_ahead_stops_at_the_end_of_the_range() {
+    let (store, model) = cold_store(2000, 64);
+    let leaves = store.db.tree().leaves();
+    let (lo, hi) = (&leaves[5].1[..], &leaves[8].1[..]);
+    let ops = store.disk.ops();
+    let range = (Bound::Included(lo), Bound::Excluded(hi));
+    assert_eq!(scan(&store.db, range), expected_scan(&model, range));
+    // Leaves 5 to 7, and 8 to find where the range ends.
+    assert_eq!(store.disk.ops() - ops, 4);
+    let range = (Bound::Included(lo), Bound::Included(hi));
+    assert_eq!(scan(&store.db, range), expected_scan(&model, range));
+    store.db.check();
+}
+
+#[test]
+fn reading_ahead_stays_within_the_cache_budget() {
+    // Internal nodes alone fill the 8-page cache.
+    let (store, model) = cold_store(2000, 8);
+    assert!(store.db.tree().pages.pool.in_use() > 8);
+    store.disk.hold();
+    let ops = store.disk.ops();
+    let mut iter = store.db.range(..);
+    assert!(poll(pin!(iter.next())).is_pending());
+    assert_eq!(store.disk.ops() - ops, 1, "read ahead past the budget");
+    store.disk.release();
+    let mut seen = 0;
+    while now(iter.next()).unwrap().is_some() {
+        seen += 1;
+    }
+    assert_eq!(seen, model.len());
+    drop(iter);
+    store.db.check();
+}
+
+#[test]
+fn a_failed_read_ahead_fails_at_its_leaf() {
+    let (store, model) = cold_store(2000, 64);
+    let leaves = store.db.tree().leaves();
+    // The read of the fourth leaf, read ahead, fails.
+    store.disk.inject(store.disk.ops() + 3, Fault::Error);
+    let mut iter = store.db.range(..);
+    let (mut seen, mut failed) = (Vec::new(), 0);
+    loop {
+        match now(iter.next()) {
+            Ok(Some((k, _))) => seen.push(k.to_vec()),
+            Ok(None) => break,
+            Err(e) => {
+                assert!(matches!(e, Error::Io(_)));
+                assert_eq!(seen.len(), below(&model, &leaves[3].1));
+                failed += 1;
+            }
+        }
+    }
+    // Calling again read the leaf again, and the scan went on.
+    assert_eq!(failed, 1);
+    assert!(seen.iter().eq(model.keys()));
+    drop(iter);
+    store.db.check();
+
+    // A damaged leaf read ahead fails the scan when it gets there.
+    store.disk.flip(leaves[3].0 * 256 + 100);
+    let mut iter = store.db.range(..);
+    for _ in 0..below(&model, &leaves[3].1) {
+        assert!(now(iter.next()).unwrap().is_some());
+    }
+    assert!(matches!(now(iter.next()), Err(Error::Corruption { page }) if page == leaves[3].0));
+    drop(iter);
+    store.db.check();
+}
+
+#[test]
+fn cancelled_reads_keep_their_frames_until_they_finish() {
+    let (store, model) = cold_store(2000, 64);
+    store.disk.hold();
+    let mut iter = store.db.range(..);
+    assert!(poll(pin!(iter.next())).is_pending());
+    let mut get = Box::pin(
+        store
+            .db
+            .get(&[0xff; 4], Comparison::Floor, |_, v| v.to_vec()),
+    );
+    assert!(poll(get.as_mut()).is_pending());
+    assert_eq!(loading_frames(&store.db), (1 + WINDOW as usize + 1, 0));
+    // Dropping the readers cancels their reads, but the disk still fills the
+    // frames: they are only reclaimed once the reads finish.
+    drop(iter);
+    drop(get);
+    assert_eq!(loading_frames(&store.db), (1 + WINDOW as usize + 1, 0));
+    store.disk.release();
+    assert_eq!(loading_frames(&store.db), (0, 1 + WINDOW as usize + 1));
+    store.db.check();
+    // The clock hand reuses them.
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    assert_eq!(loading_frames(&store.db), (0, 0));
+    store.db.check();
+}
+
+/// A step of readers sharing held reads.
+#[derive(Clone, Debug)]
+enum Action {
+    Scan(Bound<u32>, Bound<u32>),
+    Get(u32, Comparison),
+    /// Polls a reader once. A scan polls a new `next()` future, which it drops if
+    /// it has to wait.
+    Poll(usize),
+    Drop(usize),
+    /// Lets this many more held reads finish.
+    Release(u8),
+}
+
+fn action() -> impl Strategy<Value = Action> {
+    let key = || 0..2100u32;
+    let bound = move || {
+        prop_oneof![
+            Just(Bound::Unbounded),
+            key().prop_map(Bound::Included),
+            key().prop_map(Bound::Excluded),
+        ]
+    };
+    prop_oneof![
+        1 => (bound(), bound()).prop_map(|(lo, hi)| Action::Scan(lo, hi)),
+        1 => (key(), prop::sample::select(COMPARISONS.to_vec()))
+            .prop_map(|(k, cmp)| Action::Get(k, cmp)),
+        6 => any::<usize>().prop_map(Action::Poll),
+        1 => any::<usize>().prop_map(Action::Drop),
+        2 => (0..20u8).prop_map(Action::Release),
+    ]
+}
+
+type Lookup<'a> = Pin<Box<dyn Future<Output = crate::Result<Option<Entry>>> + 'a>>;
+
+enum Reader<'a> {
+    Scan {
+        iter: Box<crate::Iter>,
+        range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
+        seen: Vec<Entry>,
+        done: bool,
+    },
+    Get {
+        lookup: Lookup<'a>,
+        want: Option<Entry>,
+        got: Option<Option<Entry>>,
+    },
+}
+
+impl Reader<'_> {
+    /// Polls once. Returns false if the reader is done.
+    fn poll(&mut self) -> bool {
+        match self {
+            Reader::Scan { done: true, .. } | Reader::Get { got: Some(_), .. } => false,
+            Reader::Scan {
+                iter, seen, done, ..
+            } => {
+                if let Poll::Ready(next) = poll(pin!(iter.next())) {
+                    match next.unwrap() {
+                        Some((k, v)) => seen.push((k.to_vec(), v.to_vec())),
+                        None => *done = true,
+                    }
+                }
+                true
+            }
+            Reader::Get { lookup, got, .. } => {
+                if let Poll::Ready(found) = poll(lookup.as_mut()) {
+                    *got = Some(found.unwrap());
+                }
+                true
+            }
+        }
+    }
+
+    fn check(&self, model: &Model) {
+        match self {
+            Reader::Scan { range, seen, .. } => {
+                let range = (
+                    range.0.as_ref().map(Vec::as_slice),
+                    range.1.as_ref().map(Vec::as_slice),
+                );
+                assert_eq!(seen, &expected_scan(model, range), "scan {range:?}");
+            }
+            Reader::Get { want, got, .. } => assert_eq!(got.as_ref(), Some(want)),
+        }
+    }
+}
+
+proptest! {
+    // Scans and lookups share reads that the disk holds and releases bit by bit,
+    // and are polled, cancelled and dropped in any order.
+    #[test]
+    fn readers_share_reads_in_any_order(
+        frames in prop::sample::select(vec![8usize, 16, 64]),
+        actions in prop::collection::vec(action(), 1..200),
+    ) {
+        let (store, model) = cold_store(2000, frames);
+        store.disk.hold();
+        let mut released = store.disk.ops();
+        let key = |k: u32| k.to_be_bytes().to_vec();
+        let value = |k: &[u8], v: &[u8]| (k.to_vec(), v.to_vec());
+        let mut readers: Vec<Reader> = Vec::new();
+        for action in &actions {
+            match action {
+                Action::Scan(lo, hi) => {
+                    let range = (lo.map(key), hi.map(key));
+                    let bounds = (range.0.as_ref().map(Vec::as_slice), range.1.as_ref().map(Vec::as_slice));
+                    let iter = store.db.range(bounds);
+                    readers.push(Reader::Scan { iter: Box::new(iter), range, seen: Vec::new(), done: false });
+                }
+                Action::Get(k, cmp) => {
+                    let (k, cmp) = (key(*k), *cmp);
+                    let want = expected(&model, &k, cmp);
+                    let db = &store.db;
+                    let lookup = Box::pin(async move { db.get(&k, cmp, value).await });
+                    readers.push(Reader::Get { lookup, want, got: None });
+                }
+                Action::Poll(i) if !readers.is_empty() => {
+                    let i = i % readers.len();
+                    if !readers[i].poll() {
+                        readers.swap_remove(i).check(&model);
+                    }
+                }
+                Action::Drop(i) if !readers.is_empty() => {
+                    readers.swap_remove(i % readers.len());
+                }
+                Action::Release(n) => {
+                    released += u64::from(*n);
+                    store.disk.release_through(released.saturating_sub(1));
+                }
+                Action::Poll(_) | Action::Drop(_) => {}
+            }
+        }
+        store.disk.release();
+        for mut reader in readers {
+            while reader.poll() {}
+            reader.check(&model);
+        }
+        store.db.check();
+    }
 }
 
 #[compio::test]
@@ -790,5 +1220,59 @@ async fn a_file_store_survives_reopening() {
     }
     assert_eq!(count, 10_000);
     drop(iter);
+    db.close().await.unwrap();
+}
+
+#[compio::test]
+async fn a_file_store_has_one_owner_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let second = Db::open(&path, Options::default()).await.map(drop);
+    assert!(matches!(second, Err(Error::Locked)), "{second:?}");
+
+    // The failed open left the store alone.
+    let mut batch = WriteBatch::new();
+    batch.put(b"key", b"value");
+    db.write(&mut batch).await.unwrap();
+
+    // Closing the store lets go of it, and so does dropping it.
+    db.close().await.unwrap();
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let found = db.get(b"key", Comparison::Equal, |_, v| v.to_vec());
+    assert_eq!(found.await.unwrap(), Some(b"value".to_vec()));
+    drop(db);
+    Db::open(&path, Options::default()).await.unwrap();
+}
+
+#[cfg(unix)]
+#[compio::test]
+async fn a_new_store_needs_its_directory_synced() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::{fs, io};
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // Permissions don't stop root.
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+    let mode = |mode| fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+
+    // Without read permission, a file can be created in the directory, but the
+    // directory can't be opened to sync it.
+    mode(0o300);
+    let result = Db::open(&path, Options::default()).await.map(drop);
+    mode(0o700);
+    assert!(
+        matches!(&result, Err(Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied),
+        "{result:?}"
+    );
+
+    // The file left behind is empty, so opening it again creates the store.
+    assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let mut batch = WriteBatch::new();
+    batch.put(b"key", b"value");
+    db.write(&mut batch).await.unwrap();
     db.close().await.unwrap();
 }

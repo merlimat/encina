@@ -24,6 +24,7 @@ mod meta;
 mod node;
 mod options;
 mod pool;
+mod reads;
 #[cfg(test)]
 mod sim;
 mod space;

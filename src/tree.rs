@@ -98,21 +98,13 @@ impl Pages {
         self.cache.get(&mut self.pool, page)
     }
 
-    /// Caches the leaf page just read into `frame`, which the caller holds a
-    /// reference to. If another read cached the page meanwhile, frees `frame` and
-    /// pins that one instead. Returns the pinned frame.
-    pub(crate) fn adopt_leaf(&mut self, frame: FrameId, page: u64) -> FrameId {
-        if let Some(cached) = self.cached(page) {
-            self.pool.unref(frame);
-            self.pool.free(frame);
-            self.pool.retain(cached);
-            return cached;
-        }
+    /// Caches the leaf page just read into `frame`. Reads of a page are shared, so
+    /// it can't be cached already.
+    pub(crate) fn adopt_leaf(&mut self, frame: FrameId, page: u64) {
         let info = self.pool.frame_mut(frame);
         info.holds = Holds::Leaf;
         info.page = page;
         self.cache.insert(page, frame);
-        frame
     }
 }
 
@@ -321,6 +313,13 @@ impl Tree {
         }
         let (frame, i) = cur.path[cur.depth - 1];
         Some(self.node(frame).child_page(usize::from(i)))
+    }
+
+    /// Compares the smallest key of the leaf `cur` is at, below the root, with
+    /// `key`.
+    pub(crate) fn cmp_leaf_key(&self, cur: &Cursor, key: &[u8]) -> Ordering {
+        let (frame, i) = cur.path[cur.depth - 1];
+        self.node(frame).cmp_key(usize::from(i), key)
     }
 
     /// Looks up the entry matching `key` under `cmp` in the version rooted at
@@ -1201,7 +1200,15 @@ impl Tree {
             crate::meta::META_PAGES + stats.pages,
             "pages leaked"
         );
-        assert_eq!(pool.in_use(), stats.internal + cache.len(), "frames leaked");
+        // Frames that cancelled reads left behind wait for the clock hand.
+        let cancelled = (0..pool.len() as FrameId)
+            .filter(|&f| pool.frame(f).holds == Holds::Loading && pool.refs(f) == 0)
+            .count();
+        assert_eq!(
+            pool.in_use(),
+            stats.internal + cache.len() + cancelled,
+            "frames leaked"
+        );
         for (page, frame) in cache.entries() {
             let info = pool.frame(frame);
             assert_eq!(
@@ -1313,6 +1320,27 @@ impl Tree {
         }
         pages.sort_unstable();
         pages
+    }
+
+    /// Each leaf's page and smallest key, in key order, found from the internal
+    /// nodes. The key is empty for a root leaf.
+    pub(crate) fn leaves(&self) -> Vec<(u64, Vec<u8>)> {
+        let Some(root) = self.root else {
+            return Vec::new();
+        };
+        let mut cur = Cursor::new();
+        let mut page = Some(self.descend_first(root, &mut cur));
+        let mut leaves = Vec::new();
+        while let Some(leaf) = page {
+            let mut key = Vec::new();
+            if cur.depth > 0 {
+                let (frame, i) = cur.path[cur.depth - 1];
+                self.node(frame).key_into(usize::from(i), &mut key);
+            }
+            leaves.push((leaf, key));
+            page = self.next_leaf(&mut cur, true);
+        }
+        leaves
     }
 
     /// Number of cached leaves, and the bytes they use.
