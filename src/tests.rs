@@ -1186,7 +1186,9 @@ proptest! {
     }
 }
 
+// The tests on real files need compio's runtime, which Miri can't run.
 #[compio::test]
+#[cfg_attr(miri, ignore)]
 async fn a_file_store_survives_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
@@ -1224,6 +1226,7 @@ async fn a_file_store_survives_reopening() {
 }
 
 #[compio::test]
+#[cfg_attr(miri, ignore)]
 async fn a_file_store_has_one_owner_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
@@ -1247,6 +1250,7 @@ async fn a_file_store_has_one_owner_at_a_time() {
 
 #[cfg(unix)]
 #[compio::test]
+#[cfg_attr(miri, ignore)]
 async fn a_new_store_needs_its_directory_synced() {
     use std::os::unix::fs::PermissionsExt;
     use std::{fs, io};

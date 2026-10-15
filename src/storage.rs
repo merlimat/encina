@@ -293,6 +293,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore)] // Miri can't run compio's runtime.
     async fn reads_past_the_end_fail() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file");

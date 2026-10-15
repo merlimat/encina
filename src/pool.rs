@@ -136,12 +136,13 @@ impl Pool {
         let data = unsafe { alloc::alloc_zeroed(layout) };
         let data = NonNull::new(data).unwrap_or_else(|| alloc::handle_alloc_error(layout));
         let refs: Box<[Cell<u32>]> = (0..CHUNK_FRAMES).map(|_| Cell::new(0)).collect();
-        let refs_ptr = NonNull::from(&refs[0]);
-        self.mem
-            .chunks
-            .borrow_mut()
-            .push(Chunk { data, _refs: refs });
-        self.chunks.push((data, refs_ptr));
+        let mut chunks = self.mem.chunks.borrow_mut();
+        chunks.push(Chunk { data, _refs: refs });
+        // A pointer to all the counts, taken once the box has moved into place:
+        // moving a box invalidates the pointers taken from it.
+        let refs = NonNull::from(&chunks.last().unwrap()._refs[..]).cast();
+        drop(chunks);
+        self.chunks.push((data, refs));
         let first = self.frames.len();
         let blank = Frame {
             holds: Holds::Nothing,
