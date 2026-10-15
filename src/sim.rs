@@ -102,6 +102,12 @@ impl SimDisk {
         land(&mut disk.durable, offset as usize, data);
     }
 
+    /// The `len` bytes at `offset`, as last written.
+    pub(crate) fn bytes(&self, offset: u64, len: usize) -> Vec<u8> {
+        let disk = self.0.borrow();
+        disk.current[offset as usize..][..len].to_vec()
+    }
+
     /// Makes operation number `op`, counting from 0, suffer `fault`.
     pub(crate) fn inject(&self, op: u64, fault: Fault) {
         self.0.borrow_mut().fault = Some((op, fault));

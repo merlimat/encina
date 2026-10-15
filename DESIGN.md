@@ -1,8 +1,8 @@
 # encina — design
 
 > Status: M1 and M2 are implemented: the tree, persistence and the leaf cache.
-> M3, performance, is under way (§12): concurrent misses share one read, and
-> iterators read ahead (§8).
+> M3, performance, is under way (§12): concurrent misses share one read,
+> iterators read ahead (§8), and nodes whose entries allow it are dense (§5).
 
 encina is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. Its first
@@ -57,7 +57,7 @@ The costs to accept:
 | Threading | One `!Send` instance per compio thread, no locks or atomics, except in wakers, which Rust requires to be `Send` and `Sync` (§8). Scale by sharding (for example, by ledger id) above the library. |
 | Memory | Bounded from day one and managed entirely by encina: internal nodes stay resident, and leaves live in encina's own leaf cache with a budget, read on demand (§8). No reliance on the OS page cache or `mmap`: the data file is opened for direct I/O (§9). |
 | Allocation | No heap allocation on the data path. Page frames in the leaf cache are the only exception (§8); write batches, cursors and reader bookkeeping reuse their memory. compio itself allocates once per I/O operation, so cache misses and commits are not allocation-free (§9). |
-| Keys and values | **Proposed:** arbitrary byte strings, starting with one node format, slotted, which handles any lengths. A dense format for fixed-size data can be added later as a per-node specialization if benchmarks justify it (§5). |
+| Keys and values | Arbitrary byte strings. Two node formats: slotted, which handles any lengths, and dense, for nodes whose keys share one length and whose values share another, chosen per node when it is built (§5). |
 
 ## 4. Architecture
 
@@ -144,25 +144,34 @@ What this shows:
   striped subset of each ledger's entries, and compaction moves entries between
   logs), so expect less than 6×. Only the leaf level is measured, on one machine.
 
-### Node format
+### Node formats
 
-v1 starts with one format, **slotted**, because it handles any key and value
-lengths. The header holds the prefix that all keys in the node share. The body holds
-a contiguous array of 4-byte key heads (the first bytes of each suffix, as a
-big-endian `u32`), a slot array (offset, suffix length, value length), and a heap
-with the rest of each suffix and the value. The node is searched in place without
-decoding: the binary search reads only the heads, and ties fall back to the heap.
-Internal nodes use the same format, with child page ids as fixed-size values.
+Both formats store the prefix that all keys in the node share once, in the header,
+and both are searched in place, without decoding. The page header records each
+node's format, so copy-on-write picks one for every node it builds.
 
-The specialization path stays open. The page header records each node's format, so
-a **dense** format (for nodes whose entries all share a key length and a value
-length: shared key and value prefixes in the header, suffixes at a fixed stride,
-compared as big-endian integers) can be added later, chosen per node when it is
-built, without changing the API or invalidating existing files.
+- **Slotted** handles any key and value lengths. The body holds a contiguous array
+  of 4-byte key heads (the first bytes of each suffix, as a big-endian `u32`), a
+  slot array (offset, suffix length, value length), and a heap with the rest of each
+  suffix and the value. The binary search reads only the heads, and ties fall back
+  to the heap.
+- **Dense** holds nodes whose keys all have one length and whose values all have
+  one length. A leaf also stores once the prefix its values share. The key suffixes
+  sit in one array at a fixed stride, and the value suffixes in another, so an entry
+  costs only its two suffixes. Key suffixes of up to 8 bytes compare as big-endian
+  integers.
 
-Reads never allocate. Results reach the caller as borrowed slices: the value comes
-straight from the leaf page (the slotted heap stores it contiguously), and the key
-is rebuilt from prefix and suffix in a buffer owned by the call.
+A node is dense whenever its entries allow it, since it is then never larger. On the
+benchmark's BookKeeper-shaped data, a full 4 KiB leaf holds 807 entries, 5.1 bytes
+each, against about 26 for slotted leaves, as the experiment above predicted.
+Internal nodes use the same formats, with child references as fixed-size values. A
+dense internal node never shares a value prefix, since loading it rewrites the
+frame in each reference.
+
+Reads never allocate. Results reach the caller as borrowed slices. The key is
+rebuilt from prefix and suffix in a buffer owned by the call. The value comes
+straight from the leaf page, except in a dense leaf whose values share a prefix,
+where it is rebuilt in the same buffer, after the key.
 
 ## 6. Operations
 
@@ -182,8 +191,9 @@ doesn't allocate. The operations are applied in order and atomically.
 3. **Apply ranges** (see below).
 4. **Bulk merge.** Descend recursively, partitioning the sorted operations by child
    key range. Each touched leaf is rebuilt once from its old entries plus the
-   operations and re-encoded into one or more pages. Each parent rebuilds its child
-   list, splitting if needed, up to the root.
+   operations and re-encoded into one or more pages: the old entries between two
+   operations are found with a search, and copied without comparing each. Each
+   parent rebuilds its child list, splitting if needed, up to the root.
 5. **Commit** the new version (§7).
 6. **Publish** the new root. Readers see the batch only now, once it is durable,
    and the pages of the nodes it replaced become free, subject to §8.
@@ -268,7 +278,7 @@ future is harmless until it starts writing pages; after that, it also puts the
 instance in the failed state, even while it only cuts the file: a cut still in
 flight could cut what a later write adds.
 
-### File layout (format v1)
+### File layout (format v2)
 
 One file with a fixed page size (default 4 KiB, chosen at creation, a power of two
 from 4 to 64 KiB).
@@ -276,7 +286,11 @@ from 4 to 64 KiB).
 | Pages | Content |
 |---|---|
 | 0, 1 | Meta slots: checksum, magic, format version, page size, root level, generation, root page, high-water mark. |
-| ≥ 2 | Tree pages, each with a header: crc32c, node format (slotted in v1), level, entry count, generation written. |
+| ≥ 2 | Tree pages, each with a header: crc32c, node format (slotted or dense), level, entry count, generation written. |
+
+Version 2 added dense nodes. encina still opens version 1 files, which hold only
+slotted nodes, and a store's first commit marks its file version 2, which older
+versions refuse to open.
 
 ### Free space is derived, not stored
 
@@ -387,9 +401,9 @@ completed write.
   reader might still need to read it). Iterators always register as readers;
   point reads register only when they have to wait for I/O. Reclaiming a page
   evicts any stale cache entry for it.
-- **Capacity.** At ~26 B/entry for slotted nodes on BookKeeper-shaped data, a 1 GiB
-  cache holds roughly 40M entries. A dense format (~5 B/entry) would raise that to
-  roughly 200M, which is the main reason to add it later.
+- **Capacity.** On BookKeeper-shaped data, dense leaves take ~5 B/entry, so a 1 GiB
+  cache holds roughly 200M entries. Slotted leaves, at ~26 B/entry, would hold
+  roughly 40M.
 
 ### Reads in flight
 
@@ -649,7 +663,7 @@ complete without suspending.
    at the end of `write()`, open and recovery, free bitmap, leaf cache with budget
    and eviction, snapshot-aware page reuse, failure-path tests.
 3. **M3, performance:** group commit (writes that queue up during a commit share
-   the next one), the dense node format if benchmarks justify it, yielding inside
+   the next one), the dense node format (done, §5), yielding inside
    large merges, writing large batches' new leaves early, one shared read for
    concurrent misses and reading ahead in iterators (done, §8), coverage measured
    in CI (done, §11), and benchmarks against RocksDB.

@@ -146,6 +146,10 @@ enum Outcome {
 pub(crate) enum Find {
     /// Found: the value's address and length. The key was copied out.
     Found(*const u8, usize),
+    /// Found, and both the key and the value were copied out, the value after the
+    /// key: the key's length. A dense leaf stores no value whole when its values
+    /// share a prefix.
+    Copied(usize),
     NotFound,
     /// The lookup needs this leaf page, which isn't cached.
     Missing(u64),
@@ -378,8 +382,14 @@ impl Tree {
         };
         let node = self.node(frame);
         node.key_into(at, out);
-        let (offset, len) = node.value_span(at);
-        Find::Found(self.addr(frame, offset), len)
+        match node.whole_value(at) {
+            Some((offset, len)) => Find::Found(self.addr(frame, offset), len),
+            None => {
+                let key_len = out.len();
+                node.append_value(at, out);
+                Find::Copied(key_len)
+            }
+        }
     }
 
     // Writes.
@@ -725,14 +735,27 @@ impl Tree {
                 }
                 if r < ranges.len() && n.cmp_key(i, batch.range_start(ranges[r].0)).is_ge() {
                     changed = true;
-                } else {
-                    if in_run {
-                        run_ends.push(leaf.len() as u32);
-                        in_run = false;
-                    }
-                    leaf.push_from(&n, i);
+                    i += 1;
+                    continue;
                 }
-                i += 1;
+                // The entries below the next put or delete, and below the next range,
+                // all stay: copy them without comparing each.
+                let mut end = old;
+                if j < ops.len() {
+                    end = end.min(n.search(batch.key(ops[j])).0);
+                }
+                if r < ranges.len() {
+                    end = end.min(n.search(batch.range_start(ranges[r].0)).0);
+                }
+                debug_assert!(end > i);
+                if in_run {
+                    run_ends.push(leaf.len() as u32);
+                    in_run = false;
+                }
+                for k in i..end {
+                    leaf.push_from(&n, k);
+                }
+                i = end;
                 continue;
             }
             let op = ops[j];
@@ -760,7 +783,7 @@ impl Tree {
         if n == base {
             return Outcome::Replaced;
         }
-        let used = node::size(&out.entries, base, n);
+        let used = node::size(&out.entries, base, n, 0);
         if used <= page {
             out.emit(base, n, used, Life::Short);
             self.added += 1;
@@ -774,18 +797,18 @@ impl Tree {
         let mut s = base;
         for &end in &self.run_ends {
             let end = end as usize;
-            if node::size(&out.entries, s, end) < page / 4 {
+            if node::size(&out.entries, s, end, 0) < page / 4 {
                 continue;
             }
             while s < end {
-                let (e, used) = node::fit(&out.entries, s, end, page);
+                let (e, used) = node::fit(&out.entries, s, end, page, 0);
                 // The run's full leaves are likely to stay; appends go on in its last.
                 let life = if e < end { Life::Long } else { Life::Short };
                 out.emit(s, e, used, life);
                 s = e;
             }
         }
-        out.emit_even(s, n, page);
+        out.emit_even(s, n, page, 0);
         self.added += out.len() - items;
         Outcome::Replaced
     }
@@ -836,7 +859,7 @@ impl Tree {
         for i in mark.items..children.len() {
             parents.entries.push(children.key(i), children.value(i));
         }
-        parents.emit_even(a, parents.entries.len(), self.page_size);
+        parents.emit_even(a, parents.entries.len(), self.page_size, level as u8 + 1);
         self.added += parents.len() - items;
         children.truncate(mark);
     }
@@ -883,7 +906,7 @@ impl Tree {
                 }
             }
             let b = list.entries.len();
-            list.restage(k, a, b, node::size(&list.entries, a, b));
+            list.restage(k, a, b, node::size(&list.entries, a, b, level as u8));
             self.dropped.push(item.page);
             if level > 0 {
                 self.release(frame);
@@ -920,25 +943,40 @@ impl Tree {
     fn merge_pair(&mut self, level: usize, a: usize) -> bool {
         let list = &mut self.lists[level];
         let (x, y) = (list.items[a], list.items[a + 1]);
+        // Find the frames of the unchanged nodes. A merged node spends at least the
+        // bytes both nodes spend on their entries, so skip a pair that can't fit
+        // before copying them.
+        let mut frames = [NO_FRAME; 2];
+        let mut least = node::HEADER;
+        for (item, frame) in [x, y].iter().zip(&mut frames) {
+            if item.fresh {
+                let (start, used) = (item.start as usize, item.used as usize);
+                least += node::entry_bytes_at_least(&list.entries, start, used);
+                continue;
+            }
+            *frame = if level > 0 {
+                item.frame
+            } else if let Some(frame) = self.pages.cached(item.page) {
+                frame
+            } else {
+                return false;
+            };
+            least += Node::new(self.pages.pool.page(*frame)).entry_bytes();
+        }
+        if least > self.page_size {
+            return false;
+        }
         let len = list.entries.len();
         let (start, end) = if x.fresh && y.fresh && x.end == y.start {
             // Both are entries next to each other already.
             (x.start as usize, y.end as usize)
         } else {
-            for item in [x, y] {
+            for (item, frame) in [x, y].into_iter().zip(frames) {
                 if item.fresh {
                     list.entries
                         .extend_from_within(item.start as usize, item.end as usize);
                     continue;
                 }
-                let frame = if level > 0 {
-                    item.frame
-                } else if let Some(frame) = self.pages.cached(item.page) {
-                    frame
-                } else {
-                    list.entries.truncate(len);
-                    return false;
-                };
                 let node = Node::new(self.pages.pool.page(frame));
                 for i in 0..node.count() {
                     list.entries.push_from(&node, i);
@@ -946,7 +984,8 @@ impl Tree {
             }
             (len, list.entries.len())
         };
-        let used = node::size(&list.entries, start, end);
+        let used = node::size(&list.entries, start, end, level as u8);
+        debug_assert!(used >= least);
         if used > self.page_size {
             list.entries.truncate(len);
             return false;
@@ -1154,17 +1193,23 @@ impl NodeList {
         });
     }
 
-    /// Adds nodes holding `entries[a..b]`: as few as fit in pages of `page_size`
-    /// bytes, of similar sizes.
-    fn emit_even(&mut self, a: usize, b: usize, page_size: usize) {
+    /// Adds nodes at `level` holding `entries[a..b]`: as few as fit in pages of
+    /// `page_size` bytes, of similar sizes.
+    fn emit_even(&mut self, a: usize, b: usize, page_size: usize, level: u8) {
         let mut s = a;
         while s < b {
-            let total = node::size(&self.entries, s, b);
+            let total = node::size(&self.entries, s, b, level);
             if total <= page_size {
                 self.emit(s, b, total, Life::Short);
                 return;
             }
-            let (e, used) = node::fit(&self.entries, s, b, total / total.div_ceil(page_size));
+            let (e, used) = node::fit(
+                &self.entries,
+                s,
+                b,
+                total / total.div_ceil(page_size),
+                level,
+            );
             self.emit(s, e, used, Life::Short);
             s = e;
         }
@@ -1322,7 +1367,11 @@ impl Tree {
         for i in 0..n {
             entries.push_from(&node, i);
         }
-        assert_eq!(node.used(), node::size(&entries, 0, n), "corrupt layout");
+        assert_eq!(
+            node.used(),
+            node::size(&entries, 0, n, level),
+            "corrupt layout"
+        );
         assert!(node.used() <= self.page_size, "node overflows its page");
         for i in 1..n {
             assert!(entries.key(i - 1) < entries.key(i), "keys out of order");

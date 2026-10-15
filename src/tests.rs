@@ -239,6 +239,37 @@ fn step(max_value: usize) -> impl Strategy<Value = Step> {
     ]
 }
 
+/// Keys of one length, as dense nodes need.
+fn dense_key() -> impl Strategy<Value = Vec<u8>> {
+    prop::collection::vec(prop::sample::select(&[0u8, 1, 2, 0x7f, 0xff][..]), 4)
+}
+
+/// Puts and deletes of keys of one length, with values of one length that often
+/// share a prefix, so that nodes are dense. Ranges have bounds of any length.
+fn dense_op() -> impl Strategy<Value = Op> {
+    let value = prop::collection::vec(prop::sample::select(&[0u8, 0, 1, 0xff][..]), 3);
+    prop_oneof![
+        8 => (dense_key(), value).prop_map(|(k, v)| Op::Put(k, v)),
+        2 => dense_key().prop_map(Op::Delete),
+        1 => (key(), key()).prop_map(|(start, end)| Op::DeleteRange(start, end)),
+    ]
+}
+
+/// Steps that keep every key and every value at one length.
+fn dense_step() -> impl Strategy<Value = Step> {
+    let prefix = prop::collection::vec(prop::sample::select(&[0u8, 1, 2, 0x7f, 0xff][..]), 2);
+    prop_oneof![
+        4 => prop::collection::vec(dense_op(), 1..40).prop_map(Step::Write),
+        // Two-byte prefixes and two-byte counters make four-byte keys.
+        1 => (prefix, any::<u16>(), 1..300u16)
+            .prop_map(|(prefix, first, count)| Step::Load { prefix, first, count, value_len: 3 }),
+        3 => (key(), prop::sample::select(COMPARISONS.to_vec())).prop_map(|(k, cmp)| Step::Get(k, cmp)),
+        1 => (bound(), bound()).prop_map(|(lo, hi)| Step::Scan(lo, hi)),
+        1 => prop::collection::vec(dense_op(), 1..40).prop_map(Step::WriteDuringScan),
+        1 => Just(Step::Reopen),
+    ]
+}
+
 fn run(opts: Options, steps: &[Step]) {
     let mut store = Store::new(opts);
     let mut model = Model::new();
@@ -325,6 +356,19 @@ proptest! {
     fn matches_the_model_with_default_pages(steps in prop::collection::vec(step(200), 1..40)) {
         run(Options::new(), &steps);
     }
+
+    // Keys and values of one length each make every node dense.
+    #[test]
+    fn matches_the_model_with_dense_nodes(steps in prop::collection::vec(dense_step(), 1..40)) {
+        run(Options::new().page_size(256), &steps);
+    }
+
+    #[test]
+    fn matches_the_model_with_dense_nodes_and_a_tiny_cache(
+        steps in prop::collection::vec(dense_step(), 1..40),
+    ) {
+        run(Options::new().page_size(256).cache_size(16 * 256), &steps);
+    }
 }
 
 fn entry_key(ledger: u64, entry: u64) -> [u8; 16] {
@@ -350,13 +394,13 @@ fn decode_key(key: &[u8]) -> (u64, u64) {
 fn bookkeeper_workload() {
     let mut store = Store::new(Options::default());
     let mut batch = WriteBatch::new();
-    let ledgers = 64;
+    let ledgers = 16;
     let mut next_entry = vec![0; ledgers as usize];
     for round in 0..30 {
         // Each batch appends to most ledgers.
         batch.clear();
         for ledger in (0..ledgers).filter(|l| (l + round) % 5 != 0) {
-            for _ in 0..40 {
+            for _ in 0..160 {
                 let entry = &mut next_entry[ledger as usize];
                 batch.put(&entry_key(1000 + ledger, *entry), &location(ledger, *entry));
                 *entry += 1;
@@ -539,9 +583,10 @@ fn deleting_everything_empties_the_tree() {
     assert!(scan(&store.db, ALL).is_empty());
 }
 
-/// A store of 2000 keys on 256-byte pages, whose root is three levels above the
-/// leaves.
+/// A store of 2000 keys on 256-byte slotted pages, whose root is three levels above
+/// the leaves.
 fn deep_store() -> (Store, Model) {
+    node::slotted_only();
     let store = Store::new(Options::new().page_size(256));
     let puts: Vec<_> = (0..2000u32)
         .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![i as u8; 8]))
@@ -793,6 +838,7 @@ fn is_stale<T: PartialEq + std::fmt::Debug>(
 
 #[test]
 fn a_read_only_view_reads_its_version_until_it_is_overwritten() {
+    node::slotted_only();
     // Small caches, so that the view reads its leaves from the disk.
     let opts = Options::new().page_size(256).cache_size(16 * 256);
     let store = Store::new(opts.clone());
@@ -852,6 +898,7 @@ fn a_read_only_view_of_a_quiet_store_reports_damage() {
 
 #[test]
 fn a_read_only_view_is_stale_once_the_owner_cuts_its_pages() {
+    node::slotted_only();
     // A small cache, so that the view reads its leaves from the disk.
     let opts = Options::new().page_size(256).cache_size(16 * 256);
     let store = Store::new(opts.clone());
@@ -880,6 +927,7 @@ const RECOVER_OPS: u64 = 3;
 
 #[test]
 fn a_read_only_view_overwritten_while_it_opens_is_stale() {
+    node::slotted_only();
     let opts = Options::new().page_size(256);
     let store = Store::new(opts.clone());
     for round in 0..2 {
@@ -944,7 +992,13 @@ fn bad_meta_pages_are_rejected() {
             }],
             "unsupported page size",
         ),
-        (&[Meta { version: 2, ..meta }], "unsupported format version"),
+        (
+            &[Meta {
+                version: crate::meta::FORMAT_VERSION + 1,
+                ..meta
+            }],
+            "unsupported format version",
+        ),
         // The root is at the high-water mark, beyond the pages in use.
         (&[Meta { root: 2, ..meta }], "inconsistent meta page"),
         // The newer slot has another page size.
@@ -973,6 +1027,28 @@ fn bad_meta_pages_are_rejected() {
             "{reason}"
         );
     }
+}
+
+#[test]
+fn version_1_files_open_and_their_first_commit_marks_them_version_2() {
+    let mut file = vec![0; 512];
+    let v1 = Meta {
+        version: 1,
+        ..Meta::empty(256)
+    };
+    v1.encode(&mut file[..256]);
+    let disk = SimDisk::new();
+    disk.set_bytes(0, &file);
+    let opts = Options::new().page_size(256);
+    let db = now(Db::open_sim(disk.clone(), opts)).unwrap();
+    write(&db, &[Op::Put(b"key".to_vec(), b"value".to_vec())]);
+    // The commit went to slot 1.
+    let meta = Meta::decode(&disk.bytes(256, 256)).unwrap();
+    assert_eq!(meta.version, crate::meta::FORMAT_VERSION);
+    assert_eq!(
+        get(&db, b"key", Comparison::Equal),
+        Some((b"key".to_vec(), b"value".to_vec()))
+    );
 }
 
 /// Opens the store on `disk` with each read of the open failing in turn: that
@@ -1167,6 +1243,7 @@ fn mostly_free_windows(store: &Store) -> usize {
 
 #[test]
 fn writes_move_what_they_keep_out_of_mostly_free_windows() {
+    node::slotted_only();
     let batches = moving_scenario();
     // Leaves that aren't cached don't move.
     for (cache, moves) in [(64 << 20, true), (16 * 256, false)] {
@@ -1190,6 +1267,7 @@ fn writes_move_what_they_keep_out_of_mostly_free_windows() {
 
 #[test]
 fn writes_move_internal_nodes_too() {
+    node::slotted_only();
     let mut store = Store::new(Options::new().page_size(256));
     let key = |i: u32| i.to_be_bytes().to_vec();
     let put = |i: u32, value: u8| Op::Put(key(i), vec![value; 8]);
@@ -1220,6 +1298,7 @@ fn writes_move_internal_nodes_too() {
 
 #[test]
 fn freeing_the_end_of_the_file_cuts_it() {
+    node::slotted_only();
     let mut store = Store::new(Options::new().page_size(256));
     let batches = moving_scenario();
     let mut model = Model::new();
@@ -1266,6 +1345,7 @@ fn requests_for(pages: &[u64], max_run: usize) -> u64 {
 
 #[test]
 fn commits_write_each_run_of_pages_with_one_request() {
+    node::slotted_only();
     let store = Store::new(Options::new().page_size(256));
     let max_run = crate::db::max_run(256);
     let key = |i: u32| i.to_be_bytes().to_vec();
@@ -1570,7 +1650,7 @@ fn reading_ahead_stops_at_the_end_of_the_range() {
 #[test]
 fn reading_ahead_stays_within_the_cache_budget() {
     // Internal nodes alone fill the 8-page cache.
-    let (store, model) = cold_store(2000, 8);
+    let (store, model) = cold_store(6000, 8);
     assert!(store.db.tree().pages.pool.in_use() > 8);
     store.disk.hold();
     let ops = store.disk.ops();

@@ -329,6 +329,10 @@ impl Db {
                     let value = unsafe { slice::from_raw_parts(value, len) };
                     return Ok(Some(f(&read.key, value)));
                 }
+                Find::Copied(key_len) => {
+                    let (key, value) = read.key.split_at(key_len);
+                    return Ok(Some(f(key, value)));
+                }
                 Find::NotFound => return Ok(None),
                 Find::Missing(page) => {
                     if read.version.is_none() {
@@ -537,7 +541,7 @@ async fn recover(storage: &Storage, len: u64) -> Result<Meta> {
         (Some(m), None) | (None, Some(m)) => m,
         (None, None) => return Err(Error::InvalidFile("no intact meta page")),
     };
-    if meta.version != FORMAT_VERSION {
+    if !(meta::OLDEST_FORMAT_VERSION..=FORMAT_VERSION).contains(&meta.version) {
         return Err(Error::InvalidFile("unsupported format version"));
     }
     let root_ok = meta.root == 0 || (meta::META_PAGES..meta.high_water).contains(&meta.root);
@@ -1068,7 +1072,12 @@ impl Iter {
             return Ok(None);
         }
         self.state = State::Returned;
-        let (offset, len) = node.value_span(self.at);
+        let Some((offset, len)) = node.whole_value(self.at) else {
+            // A dense leaf: the value goes after the key.
+            let key_len = self.key.len();
+            node.append_value(self.at, &mut self.key);
+            return Ok(Some(self.key.split_at(key_len)));
+        };
         let value = tree.addr(frame, offset);
         drop(tree);
         // SAFETY: the iterator pins this leaf, and frames are never modified while

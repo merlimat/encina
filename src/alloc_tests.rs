@@ -77,12 +77,19 @@ fn key(i: u64) -> [u8; 16] {
     key
 }
 
-const ENTRIES: u64 = 5000;
+/// A location, starting with `round`.
+fn value(i: u64, round: u8) -> [u8; 16] {
+    let mut value = [round; 16];
+    value[8..].copy_from_slice(&(i * 1024).to_be_bytes());
+    value
+}
 
-fn fill(batch: &mut WriteBatch, value: u8) {
+const ENTRIES: u64 = 20_000;
+
+fn fill(batch: &mut WriteBatch, round: u8) {
     batch.clear();
     for i in 0..ENTRIES {
-        batch.put(&key(i), &[value; 16]);
+        batch.put(&key(i), &value(i, round));
     }
 }
 
