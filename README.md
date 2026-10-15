@@ -32,14 +32,21 @@ and ordered lookups, range scans, and deleting whole key ranges at once.
 
 ## Status
 
-Early development. [DESIGN.md](DESIGN.md) covers the design and the milestones:
+[DESIGN.md](DESIGN.md) covers the design and the milestones:
 
 - [x] **M1, in-memory tree:** the node format, batched writes, `get` with five
   comparisons, range iterators, and range deletes.
 - [x] **M2, persistence and caching:** atomic durable commits, recovery, the leaf
   cache, and direct I/O.
-- [ ] **M3, performance:** group commit and a dense node format (both done), and
-  benchmarks against RocksDB.
+- [ ] **M3, performance:** group commit, a dense node format and benchmarks against
+  RocksDB are done. Yielding inside large merges
+  ([#24](https://github.com/merlimat/encina/issues/24)) and writing a large batch's
+  new leaves before it commits ([#25](https://github.com/merlimat/encina/issues/25))
+  remain.
+
+Until 1.0, a minor release may change the API and the file format. A store records
+its format version, and encina refuses to open one whose version it doesn't know,
+with `Error::InvalidFile`.
 
 ## Example
 
@@ -130,16 +137,16 @@ The `encina` command, in [cli/](cli), puts, gets and scans entries, for inspecti
 store by hand:
 
 ```sh
-cargo install --path cli
+cargo install encina-cli
 encina put data.db user/0001 alice
 encina get data.db user/0001         # alice
 encina scan data.db user/ user0      # one key<TAB>value line per entry
 encina scan -x data.db               # keys and values as hexdump -C shows them
 ```
 
-`cargo install --path cli` builds the command and copies it to `~/.cargo/bin`. To
-build it in place instead, run `cargo build --release` at the root, which leaves it at
-`target/release/encina`.
+`cargo install encina-cli` builds the command and copies it to `~/.cargo/bin`. From a
+checkout, `cargo install --path cli` does the same, and `cargo build --release` at the
+root builds it in place, at `target/release/encina`.
 
 `get` and `scan` open the store read-only, so they work while another process has
 it open. If that process overwrites the version they read, they open the store

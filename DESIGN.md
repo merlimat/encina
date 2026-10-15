@@ -2,8 +2,9 @@
 
 > Status: M1 and M2 are implemented: the tree, persistence and the leaf cache.
 > M3, performance, is under way (§12): writes that queue up share commits (§6),
-> concurrent misses share one read, iterators read ahead (§8), and nodes whose
-> entries allow it are dense (§5).
+> concurrent misses share one read, iterators read ahead (§8), nodes whose entries
+> allow it are dense (§5), and bench/ compares encina with RocksDB (§11). Yielding
+> inside large merges and writing large batches' new leaves early remain.
 
 encina is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. Its first
@@ -716,9 +717,11 @@ complete without suspending.
    and eviction, snapshot-aware page reuse, failure-path tests.
 3. **M3, performance:** group commit (writes that queue up during a commit share
    the next one, done, §6), the dense node format (done, §5), yielding inside
-   large merges, writing large batches' new leaves early, one shared read for
+   large merges ([#24](https://github.com/merlimat/encina/issues/24)), writing
+   large batches' new leaves early
+   ([#25](https://github.com/merlimat/encina/issues/25)), one shared read for
    concurrent misses and reading ahead in iterators (done, §8), coverage measured
-   in CI (done, §11), and benchmarks against RocksDB.
+   in CI (done, §11), and benchmarks against RocksDB (done, §11).
 
 ## Non-goals (for now)
 
