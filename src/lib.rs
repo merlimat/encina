@@ -26,7 +26,8 @@
 //! - **Bounded memory.** Internal nodes stay in memory, and leaves are cached within
 //!   [`Options::cache_size`]. The store bypasses the OS page cache.
 //! - **One owner per store.** A [`Db`] is neither `Send` nor `Sync`: each compio
-//!   runtime thread owns its stores, and a store file has one `Db` at a time.
+//!   runtime thread owns its stores, and a store file has one `Db` at a time. A
+//!   [`ReadOnlyDb`] can read it meanwhile, as of when the view opened.
 //!
 //! Keys sort bytewise, so encode integers big-endian. A key plus its value may not
 //! exceed [`Options::max_entry_size`], a bit under a quarter of the page size.

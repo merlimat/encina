@@ -519,8 +519,9 @@ impl Db {
         cmp: Comparison,
         f: impl FnOnce(&[u8], &[u8]) -> R,
     ) -> Result<Option<R>>;
-    /// Point-in-time iterator. Creating and advancing it never allocates.
-    pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter;
+    /// Point-in-time iterator. Creating and advancing it never allocates. The bounds
+    /// are byte slices, in any range form: `&a[..]..&b[..]`, `..`, a pair of `Bound`s.
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter;
     /// Closes the store. Every successful `write()` is already durable.
     pub async fn close(self) -> Result<()>;
 }
@@ -540,7 +541,7 @@ impl ReadOnlyDb {
         cmp: Comparison,
         f: impl FnOnce(&[u8], &[u8]) -> R,
     ) -> Result<Option<R>>;
-    pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter;
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter;
     pub async fn close(self) -> Result<()>;
 }
 
