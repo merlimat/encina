@@ -33,11 +33,7 @@
 pub(crate) const META_PAGES: u64 = 2;
 
 const MAGIC: [u8; 8] = *b"encina\0\0";
-/// Version 2 added dense nodes. Version 1 files hold only slotted nodes, which
-/// version 2 reads, and a store's first commit marks its file version 2.
-pub(crate) const FORMAT_VERSION: u32 = 2;
-/// The oldest format version this version of encina opens.
-pub(crate) const OLDEST_FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 1;
 const LEN: usize = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

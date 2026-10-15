@@ -278,7 +278,7 @@ future is harmless until it starts writing pages; after that, it also puts the
 instance in the failed state, even while it only cuts the file: a cut still in
 flight could cut what a later write adds.
 
-### File layout (format v2)
+### File layout (format v1)
 
 One file with a fixed page size (default 4 KiB, chosen at creation, a power of two
 from 4 to 64 KiB).
@@ -287,10 +287,6 @@ from 4 to 64 KiB).
 |---|---|
 | 0, 1 | Meta slots: checksum, magic, format version, page size, root level, generation, root page, high-water mark. |
 | ≥ 2 | Tree pages, each with a header: crc32c, node format (slotted or dense), level, entry count, generation written. |
-
-Version 2 added dense nodes. encina still opens version 1 files, which hold only
-slotted nodes, and a store's first commit marks its file version 2, which older
-versions refuse to open.
 
 ### Free space is derived, not stored
 

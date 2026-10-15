@@ -992,13 +992,7 @@ fn bad_meta_pages_are_rejected() {
             }],
             "unsupported page size",
         ),
-        (
-            &[Meta {
-                version: crate::meta::FORMAT_VERSION + 1,
-                ..meta
-            }],
-            "unsupported format version",
-        ),
+        (&[Meta { version: 2, ..meta }], "unsupported format version"),
         // The root is at the high-water mark, beyond the pages in use.
         (&[Meta { root: 2, ..meta }], "inconsistent meta page"),
         // The newer slot has another page size.
@@ -1027,28 +1021,6 @@ fn bad_meta_pages_are_rejected() {
             "{reason}"
         );
     }
-}
-
-#[test]
-fn version_1_files_open_and_their_first_commit_marks_them_version_2() {
-    let mut file = vec![0; 512];
-    let v1 = Meta {
-        version: 1,
-        ..Meta::empty(256)
-    };
-    v1.encode(&mut file[..256]);
-    let disk = SimDisk::new();
-    disk.set_bytes(0, &file);
-    let opts = Options::new().page_size(256);
-    let db = now(Db::open_sim(disk.clone(), opts)).unwrap();
-    write(&db, &[Op::Put(b"key".to_vec(), b"value".to_vec())]);
-    // The commit went to slot 1.
-    let meta = Meta::decode(&disk.bytes(256, 256)).unwrap();
-    assert_eq!(meta.version, crate::meta::FORMAT_VERSION);
-    assert_eq!(
-        get(&db, b"key", Comparison::Equal),
-        Some((b"key".to_vec(), b"value".to_vec()))
-    );
 }
 
 /// Opens the store on `disk` with each read of the open failing in turn: that

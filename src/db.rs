@@ -541,7 +541,7 @@ async fn recover(storage: &Storage, len: u64) -> Result<Meta> {
         (Some(m), None) | (None, Some(m)) => m,
         (None, None) => return Err(Error::InvalidFile("no intact meta page")),
     };
-    if !(meta::OLDEST_FORMAT_VERSION..=FORMAT_VERSION).contains(&meta.version) {
+    if meta.version != FORMAT_VERSION {
         return Err(Error::InvalidFile("unsupported format version"));
     }
     let root_ok = meta.root == 0 || (meta::META_PAGES..meta.high_water).contains(&meta.root);
