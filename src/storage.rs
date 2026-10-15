@@ -146,7 +146,7 @@ impl Storage {
         match self {
             Storage::File(file) => file.set_len(len).await,
             #[cfg(test)]
-            Storage::Sim(disk) => disk.set_len(len),
+            Storage::Sim(disk) => disk.set_len(len).await,
         }
     }
 
@@ -155,7 +155,7 @@ impl Storage {
         match self {
             Storage::File(file) => file.sync_data().await,
             #[cfg(test)]
-            Storage::Sim(disk) => disk.sync(),
+            Storage::Sim(disk) => disk.sync().await,
         }
     }
 }

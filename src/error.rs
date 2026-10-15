@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::fmt;
+use std::io;
 
 /// Errors returned by encina.
 #[derive(Debug)]
@@ -50,6 +51,28 @@ pub enum Error {
 
 /// The result of encina's operations, which fail with an [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// A copy of the error, for each write of a group that failed together.
+    pub(crate) fn duplicate(&self) -> Error {
+        match self {
+            Error::EntryTooLarge { size, max } => Error::EntryTooLarge {
+                size: *size,
+                max: *max,
+            },
+            Error::InvalidOptions(reason) => Error::InvalidOptions(reason),
+            Error::InvalidFile(reason) => Error::InvalidFile(reason),
+            Error::Locked => Error::Locked,
+            Error::Corruption { page } => Error::Corruption { page: *page },
+            Error::Io(e) => Error::Io(match e.raw_os_error() {
+                Some(code) => io::Error::from_raw_os_error(code),
+                None => io::Error::new(e.kind(), e.to_string()),
+            }),
+            Error::Failed => Error::Failed,
+            Error::Stale => Error::Stale,
+        }
+    }
+}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -117,7 +140,26 @@ mod tests {
         ];
         for (e, message) in others {
             assert_eq!(e.to_string(), message);
+            assert_eq!(e.duplicate().to_string(), message);
             assert!(e.source().is_none(), "{e}");
+        }
+    }
+
+    #[test]
+    fn io_errors_duplicate_their_kind_and_message() {
+        let os = Error::from(std::io::Error::from_raw_os_error(28));
+        let custom = Error::from(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "short read",
+        ));
+        for e in [os, custom] {
+            let copy = e.duplicate();
+            let (Error::Io(a), Error::Io(b)) = (&e, &copy) else {
+                panic!("not an I/O error: {copy}");
+            };
+            assert_eq!(a.kind(), b.kind());
+            assert_eq!(a.raw_os_error(), b.raw_os_error());
+            assert_eq!(e.to_string(), copy.to_string());
         }
     }
 }

@@ -172,6 +172,9 @@ enum Step {
     Scan(Bound<Vec<u8>>, Bound<Vec<u8>>),
     /// Starts a full scan, writes, then finishes the scan, which mustn't see the write.
     WriteDuringScan(Vec<Op>),
+    /// Writes that start together: the first waits for its sync, and the others
+    /// queue up behind it. Those marked are dropped while they wait.
+    Group(Vec<(Vec<Op>, bool)>),
     /// Restarts the machine and reopens the store.
     Reopen,
 }
@@ -192,7 +195,7 @@ impl Step {
                     Op::Put(key, vec![i as u8; *value_len])
                 })
                 .collect(),
-            Step::Get(..) | Step::Scan(..) | Step::Reopen => Vec::new(),
+            Step::Get(..) | Step::Scan(..) | Step::Group(_) | Step::Reopen => Vec::new(),
         }
     }
 }
@@ -235,6 +238,11 @@ fn step(max_value: usize) -> impl Strategy<Value = Step> {
         3 => (key(), prop::sample::select(COMPARISONS.to_vec())).prop_map(|(k, cmp)| Step::Get(k, cmp)),
         1 => (bound(), bound()).prop_map(|(lo, hi)| Step::Scan(lo, hi)),
         1 => prop::collection::vec(op(max_value), 1..40).prop_map(Step::WriteDuringScan),
+        1 => prop::collection::vec(
+            (prop::collection::vec(op(max_value), 1..20), prop::bool::weighted(0.25)),
+            2..6,
+        )
+        .prop_map(Step::Group),
         1 => Just(Step::Reopen),
     ]
 }
@@ -312,6 +320,15 @@ fn run(opts: Options, steps: &[Step]) {
                 drop(iter);
                 store.db.check();
             }
+            Step::Group(writes) => {
+                let applied = write_group(&store, writes);
+                for ((ops, _), applied) in writes.iter().zip(applied) {
+                    if applied {
+                        apply(&mut model, ops);
+                    }
+                }
+                store.db.check();
+            }
             Step::Reopen => {
                 store.reopen();
                 store.db.check();
@@ -335,6 +352,40 @@ fn run(opts: Options, steps: &[Step]) {
         }
     }
     store.db.check();
+}
+
+/// Starts `writes` together: the first to wait waits for its sync, and the others
+/// queue up behind it. Drops those marked that queued, then lets the syncs go and
+/// finishes the rest. Returns which writes applied.
+fn write_group(store: &Store, writes: &[(Vec<Op>, bool)]) -> Vec<bool> {
+    let mut batches: Vec<_> = writes.iter().map(|(ops, _)| batch_of(ops)).collect();
+    store.disk.hold_syncs();
+    let mut futures: Vec<_> = batches
+        .iter_mut()
+        .map(|batch| Some(Box::pin(store.db.write(batch))))
+        .collect();
+    let mut applied = vec![true; writes.len()];
+    let mut committing = false;
+    for (i, future) in futures.iter_mut().enumerate() {
+        match poll(future.as_mut().unwrap().as_mut()) {
+            // A batch that changes nothing commits nothing.
+            Poll::Ready(result) => {
+                result.unwrap();
+                *future = None;
+            }
+            Poll::Pending if !committing => committing = true,
+            Poll::Pending if writes[i].1 => {
+                *future = None;
+                applied[i] = false;
+            }
+            Poll::Pending => {}
+        }
+    }
+    store.disk.release_syncs();
+    for future in futures.into_iter().flatten() {
+        now(future).unwrap();
+    }
+    applied
 }
 
 // Set PROPTEST_CASES to run more than the default 256 cases.
@@ -1402,7 +1453,7 @@ fn a_failed_page_write_leaves_its_pages_to_the_next_write() {
 }
 
 /// Polls a future once.
-fn poll<F: Future + ?Sized>(f: Pin<&mut F>) -> Poll<F::Output> {
+pub(crate) fn poll<F: Future + ?Sized>(f: Pin<&mut F>) -> Poll<F::Output> {
     f.poll(&mut Context::from_waker(Waker::noop()))
 }
 
@@ -1715,6 +1766,467 @@ fn a_dropped_store_keeps_its_frames_until_its_reads_finish() {
     drop(iter);
     drop(db);
     disk.release();
+}
+
+// Writes that queue up behind a commit share the next one.
+
+fn put_op(i: u32, value: u8) -> Op {
+    Op::Put(i.to_be_bytes().to_vec(), vec![value; 8])
+}
+
+fn range_op(start: u32, end: u32) -> Op {
+    Op::DeleteRange(start.to_be_bytes().to_vec(), end.to_be_bytes().to_vec())
+}
+
+fn puts(keys: std::ops::Range<u32>, value: u8) -> Vec<Op> {
+    keys.map(|i| put_op(i, value)).collect()
+}
+
+/// The generation of the store's current version: each commit adds one.
+fn generation(db: &Db) -> u64 {
+    db.tree().current().generation
+}
+
+type Write<'a> = Pin<Box<dyn Future<Output = crate::Result<()>> + 'a>>;
+
+/// Starts writing each batch: polls each write once, which must wait.
+fn start_writes<'a>(db: &'a Db, batches: &'a mut [WriteBatch]) -> Vec<Write<'a>> {
+    let mut writes: Vec<Write> = Vec::new();
+    for batch in batches {
+        let mut write: Write = Box::pin(db.write(batch));
+        assert!(poll(write.as_mut()).is_pending(), "the write didn't wait");
+        writes.push(write);
+    }
+    writes
+}
+
+/// A store with `n` entries on 256-byte pages, and its model.
+fn store_of(n: u32) -> (Store, Model) {
+    let store = Store::new(Options::new().page_size(256));
+    let mut model = Model::new();
+    write(&store.db, &puts(0..n, 1));
+    apply(&mut model, &puts(0..n, 1));
+    (store, model)
+}
+
+#[test]
+fn writes_queued_behind_a_commit_share_the_next_one() {
+    let (mut store, mut model) = store_of(200);
+    let first = puts(0..50, 2);
+    // Each batch overrides parts of those before it: a range removes some of the
+    // keys the first put, and a later batch puts some of them back.
+    let queued = [
+        puts(100..150, 3),
+        vec![range_op(120, 180), put_op(130, 4)],
+        vec![put_op(125, 5), put_op(130, 5), put_op(179, 5)],
+    ];
+    let start = generation(&store.db);
+    store.disk.hold_syncs();
+    let mut batch = batch_of(&first);
+    let mut first_write = Box::pin(store.db.write(&mut batch));
+    // The first write waits for its sync, and the others queue up behind it.
+    assert!(poll(first_write.as_mut()).is_pending());
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let writes = start_writes(&store.db, &mut batches);
+    store.disk.release_syncs();
+    now(first_write).unwrap();
+    assert_eq!(generation(&store.db), start + 1);
+    for write in writes {
+        now(write).unwrap();
+    }
+    // One commit took all three, in order.
+    assert_eq!(generation(&store.db), start + 2);
+    for ops in [&first].into_iter().chain(&queued) {
+        apply(&mut model, ops);
+    }
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+    // The batches are left as they were: writing one again applies it again.
+    now(store.db.write(&mut batches[1])).unwrap();
+    apply(&mut model, &queued[1]);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.reopen();
+    store.db.check();
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+}
+
+#[test]
+fn an_oversized_batch_is_rejected_on_its_own() {
+    let (store, mut model) = store_of(200);
+    let start = generation(&store.db);
+    let too_large = vec![0; store.opts.max_entry_size()];
+    store.disk.hold_syncs();
+    let mut first = batch_of(&puts(0..10, 2));
+    let mut first_write = pin!(store.db.write(&mut first));
+    assert!(poll(first_write.as_mut()).is_pending());
+    let mut second = batch_of(&puts(10..20, 3));
+    let mut second_write = pin!(store.db.write(&mut second));
+    assert!(poll(second_write.as_mut()).is_pending());
+    // Rejected before it joins the others.
+    let mut oversized = batch_of(&[put_op(20, 4), Op::Put(vec![1], too_large)]);
+    assert!(matches!(
+        poll(pin!(store.db.write(&mut oversized))),
+        Poll::Ready(Err(Error::EntryTooLarge { .. }))
+    ));
+    let mut third = batch_of(&puts(30..40, 5));
+    let mut third_write = pin!(store.db.write(&mut third));
+    assert!(poll(third_write.as_mut()).is_pending());
+    store.disk.release_syncs();
+    now(first_write).unwrap();
+    now(second_write).unwrap();
+    now(third_write).unwrap();
+    assert_eq!(generation(&store.db), start + 2);
+    for ops in [puts(0..10, 2), puts(10..20, 3), puts(30..40, 5)] {
+        apply(&mut model, &ops);
+    }
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+/// Starts a write of `first`, which waits for its sync, and queues writes of
+/// `queued` behind it. Then lets the first finish.
+fn queue_behind<'a>(
+    store: &Store,
+    first: &[Op],
+    queued: &'a mut [WriteBatch],
+    db: &'a Db,
+) -> Vec<Write<'a>> {
+    store.disk.hold_syncs();
+    let mut batch = batch_of(first);
+    let mut first_write = pin!(store.db.write(&mut batch));
+    assert!(poll(first_write.as_mut()).is_pending());
+    let writes = start_writes(db, queued);
+    store.disk.release_syncs();
+    now(first_write).unwrap();
+    writes
+}
+
+#[test]
+fn a_failure_before_the_commit_fails_the_whole_group() {
+    let (store, mut model) = store_of(200);
+    let first = puts(0..50, 2);
+    let queued = [puts(50..100, 3), puts(100..150, 4)];
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let db = store.db.clone();
+    let writes = queue_behind(&store, &first, &mut batches, &db);
+    apply(&mut model, &first);
+    // The group's first operation, a page write, fails.
+    store.disk.inject(store.disk.ops(), Fault::Error);
+    for write in writes {
+        assert!(matches!(now(write), Err(Error::Io(_))));
+    }
+    // The store is as it was, and takes writes again.
+    assert!(!store.db.has_failed());
+    store.db.check();
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    for ops in &queued {
+        write(&store.db, ops);
+        apply(&mut model, ops);
+    }
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+}
+
+#[test]
+fn a_failure_during_the_commit_fails_the_store_for_the_whole_group() {
+    let first = puts(0..50, 2);
+    let queued = [puts(50..100, 3), vec![range_op(0, 75)]];
+    // The group's first sync, its meta page and its second sync.
+    for at in 0..3 {
+        let (mut store, mut model) = store_of(200);
+        let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+        let db = store.db.clone();
+        let mut writes = queue_behind(&store, &first, &mut batches, &db);
+        apply(&mut model, &first);
+        let before = expected_scan(&model, ALL);
+        // The group's leader writes its pages, and waits for its sync.
+        store.disk.hold_syncs();
+        assert!(poll(writes[0].as_mut()).is_pending());
+        store.disk.inject(store.disk.ops() + at, Fault::Error);
+        store.disk.release_syncs();
+        for write in writes {
+            assert!(matches!(now(write), Err(Error::Io(_))), "failure at {at}");
+        }
+        assert!(store.db.has_failed());
+        assert!(matches!(
+            now(store.db.write(&mut WriteBatch::new())),
+            Err(Error::Failed)
+        ));
+        drop(db);
+        // Either every batch in the group committed, or none did.
+        store.reopen();
+        store.db.check();
+        for ops in &queued {
+            apply(&mut model, ops);
+        }
+        let state = scan(&store.db, ALL);
+        assert!(
+            state == before || state == expected_scan(&model, ALL),
+            "failure at {at}"
+        );
+    }
+}
+
+#[test]
+fn a_write_dropped_while_queued_is_withdrawn() {
+    let (store, mut model) = store_of(200);
+    let start = generation(&store.db);
+    let first = puts(0..50, 2);
+    let queued = [puts(50..100, 3), vec![range_op(0, 150)], puts(100..150, 4)];
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    store.disk.hold_syncs();
+    let mut batch = batch_of(&first);
+    let mut first_write = pin!(store.db.write(&mut batch));
+    assert!(poll(first_write.as_mut()).is_pending());
+    let mut writes = start_writes(&store.db, &mut batches);
+    // The range goes before it commits.
+    drop(writes.remove(1));
+    store.disk.release_syncs();
+    now(first_write).unwrap();
+    for write in writes {
+        now(write).unwrap();
+    }
+    assert_eq!(generation(&store.db), start + 2);
+    for ops in [&first, &queued[0], &queued[2]] {
+        apply(&mut model, ops);
+    }
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+#[test]
+fn writes_dropped_while_queued_leave_nothing_behind() {
+    let (store, mut model) = store_of(200);
+    let first = puts(0..50, 2);
+    let mut batches = [batch_of(&puts(50..100, 3)), batch_of(&[range_op(0, 200)])];
+    store.disk.hold_syncs();
+    let mut batch = batch_of(&first);
+    let mut first_write = pin!(store.db.write(&mut batch));
+    assert!(poll(first_write.as_mut()).is_pending());
+    drop(start_writes(&store.db, &mut batches));
+    store.disk.release_syncs();
+    now(first_write).unwrap();
+    apply(&mut model, &first);
+    store.db.check();
+    // The next write commits alone.
+    let start = generation(&store.db);
+    write(&store.db, &puts(100..150, 4));
+    apply(&mut model, &puts(100..150, 4));
+    assert_eq!(generation(&store.db), start + 1);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+}
+
+/// A cold store, whose leaves aren't cached, and three batches to write as a
+/// group: the first puts a key that the second's range removes, so that the group
+/// doesn't read the leaves the range covers, and the third puts elsewhere.
+fn cold_group() -> (Store, Model, [Vec<Op>; 3]) {
+    let (store, model) = cold_store(2000, 64);
+    let queued = [
+        vec![put_op(1000, 2)],
+        vec![range_op(500, 1500)],
+        vec![put_op(1800, 4)],
+    ];
+    (store, model, queued)
+}
+
+/// Queues writes of `queued` behind a first write, then has the first of them
+/// lead its group until it waits for its leaves.
+fn hold_group_building<'a>(
+    store: &Store,
+    model: &mut Model,
+    queued: &'a mut [WriteBatch],
+    db: &'a Db,
+) -> Vec<Write<'a>> {
+    let first = vec![put_op(10, 1)];
+    let mut writes = queue_behind(store, &first, queued, db);
+    apply(model, &first);
+    store.disk.hold();
+    assert!(poll(writes[0].as_mut()).is_pending());
+    writes
+}
+
+#[test]
+fn a_write_dropped_while_its_group_builds_is_withdrawn() {
+    let (store, mut model, queued) = cold_group();
+    let start = generation(&store.db);
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let db = store.db.clone();
+    let mut writes = hold_group_building(&store, &mut model, &mut batches, &db);
+    drop(writes.remove(1));
+    // Without the range, the group needs the leaf of the first put, which it
+    // didn't read: it starts over.
+    store.disk.release();
+    for write in writes {
+        now(write).unwrap();
+    }
+    assert_eq!(generation(&store.db), start + 2);
+    apply(&mut model, &queued[0]);
+    apply(&mut model, &queued[2]);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+#[test]
+fn a_write_dropped_while_leading_its_group_leaves_it_to_the_others() {
+    let (store, mut model, queued) = cold_group();
+    let start = generation(&store.db);
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let db = store.db.clone();
+    let mut writes = hold_group_building(&store, &mut model, &mut batches, &db);
+    // The leader goes before it writes anything; the next write takes over.
+    drop(writes.remove(0));
+    store.disk.release();
+    for write in writes {
+        now(write).unwrap();
+    }
+    assert!(!store.db.has_failed());
+    assert_eq!(generation(&store.db), start + 2);
+    apply(&mut model, &queued[1]);
+    apply(&mut model, &queued[2]);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+#[test]
+fn a_group_whose_writes_all_went_away_is_dropped() {
+    let (store, mut model, queued) = cold_group();
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let db = store.db.clone();
+    let mut writes = hold_group_building(&store, &mut model, &mut batches, &db);
+    // The leader goes, then the rest.
+    drop(writes.remove(0));
+    drop(writes);
+    store.disk.release();
+    store.db.check();
+    let start = generation(&store.db);
+    write(&store.db, &puts(0..10, 5));
+    apply(&mut model, &puts(0..10, 5));
+    assert_eq!(generation(&store.db), start + 1);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+}
+
+#[test]
+fn a_write_dropped_while_its_group_commits_still_commits() {
+    let (store, mut model) = store_of(200);
+    let start = generation(&store.db);
+    let first = puts(0..50, 2);
+    let queued = [puts(50..100, 3), vec![range_op(0, 75)], puts(60..70, 4)];
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let db = store.db.clone();
+    let mut writes = queue_behind(&store, &first, &mut batches, &db);
+    store.disk.hold_syncs();
+    assert!(poll(writes[0].as_mut()).is_pending());
+    // The group is writing: its batches go to disk together, or not at all.
+    drop(writes.remove(1));
+    store.disk.release_syncs();
+    for write in writes {
+        now(write).unwrap();
+    }
+    assert_eq!(generation(&store.db), start + 2);
+    for ops in [&first].into_iter().chain(&queued) {
+        apply(&mut model, ops);
+    }
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+#[test]
+fn a_write_dropped_while_committing_its_group_fails_the_store() {
+    let (mut store, mut model) = store_of(200);
+    let first = puts(0..50, 2);
+    let queued = [puts(50..100, 3), vec![range_op(0, 75)]];
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let db = store.db.clone();
+    let mut writes = queue_behind(&store, &first, &mut batches, &db);
+    apply(&mut model, &first);
+    let before = expected_scan(&model, ALL);
+    store.disk.hold_syncs();
+    assert!(poll(writes[0].as_mut()).is_pending());
+    // A write queues up for the next group.
+    let mut later = batch_of(&puts(150..160, 5));
+    let mut later_write = Box::pin(store.db.write(&mut later));
+    assert!(poll(later_write.as_mut()).is_pending());
+    // The group's leader goes while it waits for its sync.
+    drop(writes.remove(0));
+    assert!(store.db.has_failed());
+    store.disk.release_syncs();
+    assert!(matches!(now(writes.remove(0)), Err(Error::Failed)));
+    assert!(matches!(now(later_write), Err(Error::Failed)));
+    drop(writes);
+    drop(db);
+    store.reopen();
+    store.db.check();
+    for ops in &queued {
+        apply(&mut model, ops);
+    }
+    let state = scan(&store.db, ALL);
+    assert!(state == before || state == expected_scan(&model, ALL));
+}
+
+#[test]
+fn a_write_dropped_while_cutting_the_file_leaves_its_group_committed() {
+    let (mut store, mut model) = store_of(0);
+    let batches = moving_scenario();
+    for ops in &batches[..3] {
+        write(&store.db, ops);
+        apply(&mut model, ops);
+    }
+    let len = store.disk.len();
+    // Freeing the upper half of the keys lets the commit after it cut the file.
+    let queued = [batches[4].clone(), puts(0..10, 5)];
+    let mut group: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let db = store.db.clone();
+    let mut writes = queue_behind(&store, &batches[3], &mut group, &db);
+    apply(&mut model, &batches[3]);
+    // The group's leader syncs, writes the meta page, syncs again, then cuts.
+    store.disk.hold_syncs();
+    assert!(poll(writes[0].as_mut()).is_pending());
+    store.disk.allow_syncs(2);
+    assert!(poll(writes[0].as_mut()).is_pending());
+    // The group committed: its other write returns.
+    let leader = writes.remove(0);
+    now(writes.remove(0)).unwrap();
+    // The leader goes while it cuts the file.
+    drop(leader);
+    assert!(store.db.has_failed());
+    store.disk.release_syncs();
+    assert_eq!(store.disk.len(), len);
+    drop(writes);
+    drop(db);
+    store.reopen();
+    store.db.check();
+    for ops in &queued {
+        apply(&mut model, ops);
+    }
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+}
+
+#[test]
+fn a_group_holds_the_batches_that_fit() {
+    let (store, mut model) = store_of(200);
+    let first = puts(0..50, 2);
+    let queued = [puts(50..60, 3), puts(55..65, 4), puts(60..70, 5)];
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    // Two of them fit in a group, not three.
+    store.db.set_group_limit(2 * batches[0].size());
+    let start = generation(&store.db);
+    let db = store.db.clone();
+    let writes = queue_behind(&store, &first, &mut batches, &db);
+    for write in writes {
+        now(write).unwrap();
+    }
+    assert_eq!(generation(&store.db), start + 3);
+    // A batch larger than the limit still joins an empty group.
+    store.db.set_group_limit(1);
+    let mut again: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    for write in queue_behind(&store, &first, &mut again, &db) {
+        now(write).unwrap();
+    }
+    assert_eq!(generation(&store.db), start + 7);
+    for ops in [&first].into_iter().chain(&queued).cycle().take(8) {
+        apply(&mut model, ops);
+    }
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
 }
 
 /// A step of readers sharing held reads.
