@@ -76,8 +76,9 @@ With `--cache-mb 64 --reads 200000`, reads go to disk:
 | Peak memory, MiB | 89 | 184 |
 
 Floor finds a ledger's last entry: the largest key at or below a given one. RocksDB
-compresses its blocks with LZ4, while encina stores keys and values as they are, so its
-file is 347 MiB for 305 MiB of data.
+compresses its blocks with LZ4, which takes its files from 291 MiB to 110 MiB. encina
+doesn't compress: its pages in use take 285 MiB, and the file's other 62 MiB is free
+pages that later writes reuse.
 
 ## Example
 
