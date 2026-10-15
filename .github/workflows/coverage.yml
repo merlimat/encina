@@ -1,0 +1,57 @@
+name: Coverage
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  # To post the totals as a commit status.
+  statuses: write
+
+# A new push to a pull request cancels its previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Test coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # cargo-llvm-cov leaves out tests.rs and alloc_tests.rs; the simulated disk is
+      # test code too. A fixed seed makes the property tests, and so the numbers, the
+      # same on every run.
+      - name: Run the tests under cargo-llvm-cov
+        run: cargo llvm-cov --json --output-path target/coverage.json --ignore-filename-regex 'src/sim\.rs$'
+        env:
+          PROPTEST_RNG_SEED: 1
+      - name: Summarize
+        id: summary
+        run: python3 .github/scripts/coverage-summary.py target/coverage.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Post the totals as a commit status
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          TOTALS: ${{ steps.summary.outputs.totals }}
+        run: >
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA"
+          -f state=success -f context=coverage -f description="$TOTALS"
+          -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+      # A pull request from a fork gets a read-only token, which can't post a status.
+      - name: Note that a fork gets no status
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: >
+          echo "This pull request comes from a fork, whose token can't post the totals
+          as a status." >> "$GITHUB_STEP_SUMMARY"
