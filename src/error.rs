@@ -152,14 +152,16 @@ mod tests {
             std::io::ErrorKind::UnexpectedEof,
             "short read",
         ));
+        let io = |e: &Error| {
+            let e = e
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap();
+            (e.kind(), e.raw_os_error(), e.to_string())
+        };
         for e in [os, custom] {
-            let copy = e.duplicate();
-            let (Error::Io(a), Error::Io(b)) = (&e, &copy) else {
-                panic!("not an I/O error: {copy}");
-            };
-            assert_eq!(a.kind(), b.kind());
-            assert_eq!(a.raw_os_error(), b.raw_os_error());
-            assert_eq!(e.to_string(), copy.to_string());
+            assert_eq!(io(&e.duplicate()), io(&e));
         }
     }
 }

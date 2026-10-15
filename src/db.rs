@@ -1010,25 +1010,25 @@ fn for_drop<T>(cell: &RefCell<T>) -> Option<RefMut<'_, T>> {
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
-        if let Some(mut tree) = for_drop(&self.inner.tree) {
-            match self.stage {
-                Stage::Done => {}
-                Stage::Building => tree.discard(),
-                // In-flight writes still hold the pending version's frames: leave them.
-                Stage::Writing => {
-                    self.inner.failed.set(true);
-                    tree.unpin_touched();
-                }
-                Stage::Committing => {
-                    self.inner.failed.set(true);
-                    tree.discard();
-                }
-                Stage::Cutting => self.inner.failed.set(true),
-            }
-        }
-        let Some(mut writes) = for_drop(&self.inner.writes) else {
+        let (Some(mut tree), Some(mut writes)) =
+            (for_drop(&self.inner.tree), for_drop(&self.inner.writes))
+        else {
             return;
         };
+        match self.stage {
+            Stage::Done => {}
+            Stage::Building => tree.discard(),
+            // In-flight writes still hold the pending version's frames: leave them.
+            Stage::Writing => {
+                self.inner.failed.set(true);
+                tree.unpin_touched();
+            }
+            Stage::Committing => {
+                self.inner.failed.set(true);
+                tree.discard();
+            }
+            Stage::Cutting => self.inner.failed.set(true),
+        }
         // Dropped before the group's writes had their outcome.
         if self.group && !self.delivered {
             if self.stage == Stage::Building {

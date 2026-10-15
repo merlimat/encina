@@ -2126,20 +2126,27 @@ fn writes_dropped_while_queued_leave_nothing_behind() {
     let (store, mut model) = store_of(200);
     let first = puts(0..50, 2);
     let mut batches = [batch_of(&puts(50..100, 3)), batch_of(&[range_op(0, 200)])];
-    store.disk.hold_syncs();
-    let mut batch = batch_of(&first);
-    let mut first_write = pin!(store.db.write(&mut batch));
-    assert!(poll(first_write.as_mut()).is_pending());
-    drop(start_writes(&store.db, &mut batches));
-    store.disk.release_syncs();
-    now(first_write).unwrap();
+    // The second finds the group full, and waits for room.
+    store.db.set_group_limit(batches[0].size());
+    let db = store.db.clone();
+    drop(queue_behind(&store, &first, &mut batches, &db));
     apply(&mut model, &first);
+    store.db.check();
+    // A write whose group committed goes before it learns so.
+    store.db.set_group_limit(crate::writes::GROUP_SIZE);
+    let queued = [puts(100..150, 4), puts(150..200, 5)];
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let mut writes = queue_behind(&store, &first, &mut batches, &db);
+    now(writes.remove(0)).unwrap();
+    drop(writes);
     store.db.check();
     // The next write commits alone.
     let start = generation(&store.db);
-    write(&store.db, &puts(100..150, 4));
-    apply(&mut model, &puts(100..150, 4));
+    write(&store.db, &puts(200..250, 6));
     assert_eq!(generation(&store.db), start + 1);
+    for ops in [&first, &queued[0], &queued[1], &puts(200..250, 6)] {
+        apply(&mut model, ops);
+    }
     assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
 }
 
