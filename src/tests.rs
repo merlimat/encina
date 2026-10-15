@@ -12,20 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Store tests: a `BTreeMap` model, and BookKeeper-shaped scenarios.
+//! Store tests: a `BTreeMap` model, BookKeeper-shaped scenarios, failures injected
+//! into a simulated disk, and a real file.
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Bound;
 use std::pin::pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use proptest::prelude::*;
 
+use crate::sim::{Fault, SimDisk};
 use crate::{Comparison, Db, Error, Options, WriteBatch};
 
-/// Runs a future that must finish without waiting, as everything does while the
-/// store lives only in memory.
+/// Runs a future that must finish without waiting, as everything does on the
+/// simulated disk.
 pub(crate) fn now<F: Future>(f: F) -> F::Output {
     match pin!(f).poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(output) => output,
@@ -39,6 +42,27 @@ type Range<'a> = (Bound<&'a [u8]>, Bound<&'a [u8]>);
 
 const ALL: Range<'static> = (Bound::Unbounded, Bound::Unbounded);
 
+/// A store on a simulated disk.
+struct Store {
+    disk: Rc<SimDisk>,
+    db: Db,
+    opts: Options,
+}
+
+impl Store {
+    fn new(opts: Options) -> Store {
+        let disk = SimDisk::new();
+        let db = now(Db::open_sim(disk.clone(), opts.clone())).unwrap();
+        Store { disk, db, opts }
+    }
+
+    /// Restarts the machine, and opens the store again.
+    fn reopen(&mut self) {
+        self.disk = self.disk.restart();
+        self.db = now(Db::open_sim(self.disk.clone(), self.opts.clone())).unwrap();
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Op {
     Put(Vec<u8>, Vec<u8>),
@@ -46,7 +70,7 @@ enum Op {
     DeleteRange(Vec<u8>, Vec<u8>),
 }
 
-fn write(db: &Db, ops: &[Op]) {
+fn batch_of(ops: &[Op]) -> WriteBatch {
     let mut batch = WriteBatch::new();
     for op in ops {
         match op {
@@ -55,7 +79,11 @@ fn write(db: &Db, ops: &[Op]) {
             Op::DeleteRange(start, end) => batch.delete_range(start, end),
         }
     }
-    now(db.write(&mut batch)).unwrap();
+    batch
+}
+
+fn write(db: &Db, ops: &[Op]) {
+    now(db.write(&mut batch_of(ops))).unwrap();
 }
 
 fn apply(model: &mut Model, ops: &[Op]) {
@@ -119,6 +147,14 @@ fn expected_scan(model: &Model, (lo, hi): Range) -> Vec<Entry> {
         .collect()
 }
 
+const COMPARISONS: [Comparison; 5] = [
+    Comparison::Equal,
+    Comparison::Floor,
+    Comparison::Ceiling,
+    Comparison::Lower,
+    Comparison::Higher,
+];
+
 #[derive(Clone, Debug)]
 enum Step {
     Write(Vec<Op>),
@@ -133,6 +169,8 @@ enum Step {
     Scan(Bound<Vec<u8>>, Bound<Vec<u8>>),
     /// Starts a full scan, writes, then finishes the scan, which mustn't see the write.
     WriteDuringScan(Vec<Op>),
+    /// Restarts the machine and reopens the store.
+    Reopen,
 }
 
 impl Step {
@@ -151,7 +189,7 @@ impl Step {
                     Op::Put(key, vec![i as u8; *value_len])
                 })
                 .collect(),
-            Step::Get(..) | Step::Scan(..) => Vec::new(),
+            Step::Get(..) | Step::Scan(..) | Step::Reopen => Vec::new(),
         }
     }
 }
@@ -187,36 +225,30 @@ fn bound() -> impl Strategy<Value = Bound<Vec<u8>>> {
 
 /// Steps whose values are at most `max_value` bytes.
 fn step(max_value: usize) -> impl Strategy<Value = Step> {
-    let comparison = prop::sample::select(vec![
-        Comparison::Equal,
-        Comparison::Floor,
-        Comparison::Ceiling,
-        Comparison::Lower,
-        Comparison::Higher,
-    ]);
     prop_oneof![
         4 => prop::collection::vec(op(max_value), 1..40).prop_map(Step::Write),
         1 => (key(), any::<u16>(), 1..300u16, 0..=max_value)
             .prop_map(|(prefix, first, count, value_len)| Step::Load { prefix, first, count, value_len }),
-        3 => (key(), comparison).prop_map(|(k, cmp)| Step::Get(k, cmp)),
+        3 => (key(), prop::sample::select(COMPARISONS.to_vec())).prop_map(|(k, cmp)| Step::Get(k, cmp)),
         1 => (bound(), bound()).prop_map(|(lo, hi)| Step::Scan(lo, hi)),
         1 => prop::collection::vec(op(max_value), 1..40).prop_map(Step::WriteDuringScan),
+        1 => Just(Step::Reopen),
     ]
 }
 
-fn run(page_size: usize, steps: &[Step]) {
-    let db = Db::in_memory(Options::new().page_size(page_size)).unwrap();
+fn run(opts: Options, steps: &[Step]) {
+    let mut store = Store::new(opts);
     let mut model = Model::new();
     for step in steps {
         match step {
             Step::Write(_) | Step::Load { .. } => {
                 let ops = step.ops();
-                write(&db, &ops);
+                write(&store.db, &ops);
                 apply(&mut model, &ops);
-                db.tree().check();
+                store.db.tree().check();
             }
             Step::Get(key, cmp) => {
-                let got = get(&db, key, *cmp);
+                let got = get(&store.db, key, *cmp);
                 assert_eq!(got, expected(&model, key, *cmp), "get({key:?}, {cmp:?})");
             }
             Step::Scan(lo, hi) => {
@@ -225,65 +257,70 @@ fn run(page_size: usize, steps: &[Step]) {
                     hi.as_ref().map(Vec::as_slice),
                 );
                 assert_eq!(
-                    scan(&db, range),
+                    scan(&store.db, range),
                     expected_scan(&model, range),
                     "scan {range:?}"
                 );
             }
             Step::WriteDuringScan(ops) => {
                 let before = expected_scan(&model, ALL);
-                let mut iter = db.range(..);
+                let mut iter = store.db.range(..);
                 let mut seen = Vec::new();
                 if let Some((k, v)) = now(iter.next()).unwrap() {
                     seen.push((k.to_vec(), v.to_vec()));
                 }
-                write(&db, ops);
+                write(&store.db, ops);
                 apply(&mut model, ops);
                 while let Some((k, v)) = now(iter.next()).unwrap() {
                     seen.push((k.to_vec(), v.to_vec()));
                 }
                 assert_eq!(seen, before, "the scan saw a later write");
                 drop(iter);
-                db.tree().check();
+                store.db.tree().check();
+            }
+            Step::Reopen => {
+                store.reopen();
+                store.db.tree().check();
             }
         }
     }
-    assert_eq!(scan(&db, ALL), expected_scan(&model, ALL));
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
     // Every comparison, on every key and on the gap just above it, which covers the
     // first and last keys of every leaf.
     for key in model.keys() {
         let mut above = key.clone();
         above.push(0);
         for probe in [key, &above] {
-            for cmp in [
-                Comparison::Equal,
-                Comparison::Floor,
-                Comparison::Ceiling,
-                Comparison::Lower,
-                Comparison::Higher,
-            ] {
+            for cmp in COMPARISONS {
                 assert_eq!(
-                    get(&db, probe, cmp),
+                    get(&store.db, probe, cmp),
                     expected(&model, probe, cmp),
                     "get({probe:?}, {cmp:?})"
                 );
             }
         }
     }
+    store.db.tree().check();
 }
 
-// Set PROPTEST_CASES to run more cases than the default 256.
+// Set PROPTEST_CASES to run more than the default 256 cases.
 proptest! {
     // Small pages grow deep trees from few entries.
     #[test]
     fn matches_the_model_with_small_pages(steps in prop::collection::vec(step(12), 1..40)) {
-        run(256, &steps);
+        run(Options::new().page_size(256), &steps);
+    }
+
+    // A cache of 16 pages keeps evicting leaves and reading them back.
+    #[test]
+    fn matches_the_model_with_a_tiny_cache(steps in prop::collection::vec(step(12), 1..40)) {
+        run(Options::new().page_size(256).cache_size(16 * 256), &steps);
     }
 
     // Large values fill default pages quickly enough to grow internal levels.
     #[test]
     fn matches_the_model_with_default_pages(steps in prop::collection::vec(step(200), 1..40)) {
-        run(4096, &steps);
+        run(Options::new(), &steps);
     }
 }
 
@@ -308,7 +345,7 @@ fn decode_key(key: &[u8]) -> (u64, u64) {
 
 #[test]
 fn bookkeeper_workload() {
-    let db = Db::in_memory(Options::default()).unwrap();
+    let mut store = Store::new(Options::default());
     let mut batch = WriteBatch::new();
     let ledgers = 64;
     let mut next_entry = vec![0; ledgers as usize];
@@ -322,22 +359,11 @@ fn bookkeeper_workload() {
                 *entry += 1;
             }
         }
-        now(db.write(&mut batch)).unwrap();
-        db.tree().check();
+        now(store.db.write(&mut batch)).unwrap();
+        store.db.tree().check();
     }
-    for ledger in 0..ledgers {
-        let (id, entries) = (1000 + ledger, next_entry[ledger as usize]);
-        for entry in (0..entries).step_by(7) {
-            let found = now(db.get(&entry_key(id, entry), Comparison::Equal, |_, v| v.to_vec()));
-            assert_eq!(found.unwrap(), Some(location(ledger, entry).to_vec()));
-        }
-        let last = now(db.get(&entry_key(id, u64::MAX), Comparison::Floor, |k, _| {
-            decode_key(k)
-        }));
-        assert_eq!(last.unwrap(), Some((id, entries - 1)));
-    }
-    let (leaves, used) = db.tree().leaf_usage();
-    let fill = used as f64 / (leaves * db.tree().page_size()) as f64;
+    let (leaves, used) = store.db.tree().leaf_usage();
+    let fill = used as f64 / (leaves * store.db.tree().page_size()) as f64;
     assert!(fill > 0.8, "leaves are only {:.0}% full", fill * 100.0);
 
     // Deleting ledgers removes their entries and nothing else.
@@ -345,30 +371,45 @@ fn bookkeeper_workload() {
     for ledger in (0..ledgers).step_by(2) {
         batch.delete_range(&entry_key(1000 + ledger, 0), &entry_key(1001 + ledger, 0));
     }
-    now(db.write(&mut batch)).unwrap();
-    db.tree().check();
+    now(store.db.write(&mut batch)).unwrap();
+    store.db.tree().check();
+    store.reopen();
+    store.db.tree().check();
     for ledger in 0..ledgers {
-        let (start, end) = (entry_key(1000 + ledger, 0), entry_key(1001 + ledger, 0));
-        let found = scan(&db, (Bound::Included(&start), Bound::Excluded(&end))).len() as u64;
-        assert_eq!(
-            found,
-            if ledger % 2 == 0 {
-                0
-            } else {
-                next_entry[ledger as usize]
-            }
-        );
+        let (id, entries) = (1000 + ledger, next_entry[ledger as usize]);
+        let (start, end) = (entry_key(id, 0), entry_key(id + 1, 0));
+        let found = scan(&store.db, (Bound::Included(&start), Bound::Excluded(&end))).len() as u64;
+        let last = now(store
+            .db
+            .get(&entry_key(id, u64::MAX), Comparison::Floor, |k, _| {
+                decode_key(k)
+            }));
+        if ledger % 2 == 0 {
+            assert_eq!(found, 0);
+            continue;
+        }
+        assert_eq!(found, entries);
+        assert_eq!(last.unwrap(), Some((id, entries - 1)));
+        for entry in (0..entries).step_by(7) {
+            let found = now(store
+                .db
+                .get(&entry_key(id, entry), Comparison::Equal, |_, v| v.to_vec()));
+            assert_eq!(found.unwrap(), Some(location(ledger, entry).to_vec()));
+        }
     }
 }
 
 #[test]
 fn comparisons_at_the_edges() {
     use Comparison::{Ceiling, Equal, Floor, Higher, Lower};
-    let db = Db::in_memory(Options::default()).unwrap();
-    for cmp in [Equal, Floor, Ceiling, Lower, Higher] {
-        assert_eq!(get(&db, b"x", cmp), None);
+    let store = Store::new(Options::default());
+    for cmp in COMPARISONS {
+        assert_eq!(get(&store.db, b"x", cmp), None);
     }
-    write(&db, &[10u8, 20, 30].map(|k| Op::Put(vec![k], vec![k / 10])));
+    write(
+        &store.db,
+        &[10u8, 20, 30].map(|k| Op::Put(vec![k], vec![k / 10])),
+    );
     let e = |k: u8| Some((vec![k], vec![k / 10]));
     let cases = [
         (5, [None, None, e(10), None, e(10)]),
@@ -379,41 +420,39 @@ fn comparisons_at_the_edges() {
     ];
     for (key, want) in cases {
         for (cmp, want) in [Equal, Floor, Ceiling, Lower, Higher].into_iter().zip(want) {
-            assert_eq!(get(&db, &[key], cmp), want, "get({key}, {cmp:?})");
+            assert_eq!(get(&store.db, &[key], cmp), want, "get({key}, {cmp:?})");
         }
     }
 }
 
 #[test]
 fn oversized_entries_leave_the_store_unchanged() {
-    let db = Db::in_memory(Options::default()).unwrap();
+    let store = Store::new(Options::default());
     let max = Options::default().max_entry_size();
     let mut batch = WriteBatch::new();
     batch.put(b"a", b"1");
     batch.put(b"big", &vec![0; max - 2]);
     assert!(matches!(
-        now(db.write(&mut batch)),
+        now(store.db.write(&mut batch)),
         Err(Error::EntryTooLarge { .. })
     ));
-    assert_eq!(get(&db, b"a", Comparison::Equal), None);
+    assert_eq!(get(&store.db, b"a", Comparison::Equal), None);
     batch.clear();
     batch.put(b"big", &vec![0; max - 3]);
-    now(db.write(&mut batch)).unwrap();
-    assert!(get(&db, b"big", Comparison::Equal).is_some());
+    now(store.db.write(&mut batch)).unwrap();
+    assert!(get(&store.db, b"big", Comparison::Equal).is_some());
 }
 
 #[test]
 fn iterators_keep_their_version() {
-    let db = Db::in_memory(Options::new().page_size(256)).unwrap();
+    let store = Store::new(Options::new().page_size(256));
+    let puts: Vec<_> = (0..200u16)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![1]))
+        .collect();
+    write(&store.db, &puts);
+    let mut iter = store.db.range(..);
     write(
-        &db,
-        &(0..200u16)
-            .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![1]))
-            .collect::<Vec<_>>(),
-    );
-    let mut iter = db.range(..);
-    write(
-        &db,
+        &store.db,
         &[
             Op::DeleteRange(vec![0, 50], vec![0, 150]),
             Op::Put(vec![0, 7], vec![2]),
@@ -427,21 +466,207 @@ fn iterators_keep_their_version() {
     assert_eq!(seen, 200);
     drop(iter);
     // Dropping the iterator freed the old version.
-    db.tree().check();
-    assert_eq!(scan(&db, ALL).len(), 100);
+    store.db.tree().check();
+    assert_eq!(scan(&store.db, ALL).len(), 100);
 }
 
 #[test]
 fn deleting_everything_empties_the_tree() {
-    let db = Db::in_memory(Options::new().page_size(256)).unwrap();
+    let mut store = Store::new(Options::new().page_size(256));
+    let puts: Vec<_> = (0..500u16)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![0; 8]))
+        .collect();
+    write(&store.db, &puts);
     write(
-        &db,
-        &(0..500u16)
-            .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![0; 8]))
-            .collect::<Vec<_>>(),
+        &store.db,
+        &[Op::DeleteRange(vec![], vec![0xff, 0xff, 0xff])],
     );
-    write(&db, &[Op::DeleteRange(vec![], vec![0xff, 0xff, 0xff])]);
-    db.tree().check();
-    assert!(db.tree().root().is_none());
-    assert!(scan(&db, ALL).is_empty());
+    store.db.tree().check();
+    assert!(store.db.tree().current().root.is_none());
+    store.reopen();
+    assert!(scan(&store.db, ALL).is_empty());
+}
+
+#[test]
+fn reopening_with_a_cold_cache_reads_everything_back() {
+    let mut store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
+    let mut model = Model::new();
+    for round in 0..5u32 {
+        let ops: Vec<_> = (0..400u32)
+            .map(|i| {
+                Op::Put(
+                    (i * 7 + round).to_be_bytes().to_vec(),
+                    round.to_be_bytes().to_vec(),
+                )
+            })
+            .collect();
+        write(&store.db, &ops);
+        apply(&mut model, &ops);
+    }
+    store.reopen();
+    store.db.tree().check();
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    for key in model.keys().step_by(13) {
+        for cmp in COMPARISONS {
+            assert_eq!(get(&store.db, key, cmp), expected(&model, key, cmp));
+        }
+    }
+    store.db.tree().check();
+}
+
+#[test]
+fn damaged_pages_are_reported() {
+    let mut store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
+    let puts: Vec<_> = (0..300u32)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![7; 8]))
+        .collect();
+    write(&store.db, &puts);
+    let (root, leaf) = {
+        let tree = store.db.tree();
+        let root = tree.current().root.unwrap();
+        assert!(root.level > 0);
+        (
+            root.page,
+            tree.descend_first(root, &mut crate::tree::Cursor::new()),
+        )
+    };
+    // A damaged leaf fails the reads that need it.
+    store.disk.flip(leaf * 256 + 100);
+    store.reopen();
+    let mut iter = store.db.range(..);
+    assert!(matches!(now(iter.next()), Err(Error::Corruption { page }) if page == leaf));
+    drop(iter);
+    // A damaged internal node fails the open.
+    store.disk.flip(root * 256 + 100);
+    let opened = now(Db::open_sim(store.disk.restart(), store.opts.clone()));
+    assert!(matches!(opened, Err(Error::Corruption { page }) if page == root));
+}
+
+/// Batches that build a few levels on 256-byte pages, then rewrite and delete
+/// parts of them.
+fn failure_scenario() -> Vec<Vec<Op>> {
+    let key = |i: u32| i.to_be_bytes().to_vec();
+    vec![
+        (0..300).map(|i| Op::Put(key(i), vec![1; 8])).collect(),
+        (100..200).map(|i| Op::Put(key(i), vec![2; 8])).collect(),
+        vec![
+            Op::DeleteRange(key(50), key(250)),
+            Op::Put(key(120), vec![3]),
+        ],
+        (0..300)
+            .step_by(7)
+            .map(|i| Op::Put(key(i), vec![4; 4]))
+            .collect(),
+    ]
+}
+
+/// Runs the scenario until an operation fails. Returns the store, if it opened,
+/// and how many batches were written.
+fn try_scenario(disk: &Rc<SimDisk>, opts: &Options, batches: &[Vec<Op>]) -> (Option<Db>, usize) {
+    let Ok(db) = now(Db::open_sim(disk.clone(), opts.clone())) else {
+        return (None, 0);
+    };
+    for (done, ops) in batches.iter().enumerate() {
+        if now(db.write(&mut batch_of(ops))).is_err() {
+            return (Some(db), done);
+        }
+        // Read too, so that reads meet failures as well.
+        if now(db.get(&[0, 0, 0, 0x7f], Comparison::Ceiling, |_, _| ())).is_err() {
+            return (Some(db), done + 1);
+        }
+    }
+    (Some(db), batches.len())
+}
+
+/// Creating a store takes three operations: two meta slots and a sync.
+const CREATE_OPS: u64 = 3;
+
+#[test]
+fn every_single_failure_leaves_a_recoverable_store() {
+    // A small cache, so that writes read leaves back from the disk.
+    let opts = Options::new().page_size(256).cache_size(16 * 256);
+    let batches = failure_scenario();
+    let mut states = vec![Vec::new()];
+    let mut model = Model::new();
+    for ops in &batches {
+        apply(&mut model, ops);
+        states.push(expected_scan(&model, ALL));
+    }
+    let clean = SimDisk::new();
+    let (db, done) = try_scenario(&clean, &opts, &batches);
+    assert_eq!(done, batches.len());
+    drop(db);
+    let total = clean.ops();
+    for fault in [Fault::Error, Fault::Crash] {
+        for op in 0..total {
+            let disk = SimDisk::new();
+            disk.inject(op, fault);
+            let (db, done) = try_scenario(&disk, &opts, &batches);
+            let failed = db.as_ref().is_some_and(Db::has_failed);
+            if let Some(db) = &db {
+                if failed {
+                    assert!(matches!(
+                        now(db.write(&mut WriteBatch::new())),
+                        Err(Error::Failed)
+                    ));
+                } else {
+                    // A write that failed before committing left the store as it was.
+                    db.tree().check();
+                }
+            }
+            drop(db);
+            let reopened = match now(Db::open_sim(disk.restart(), opts.clone())) {
+                Ok(db) => db,
+                // A failure while creating the store may leave no store at all.
+                Err(Error::InvalidFile(_)) if op < CREATE_OPS => continue,
+                Err(e) => panic!("{fault:?} at operation {op}: reopening failed: {e}"),
+            };
+            reopened.tree().check();
+            let state = scan(&reopened, ALL);
+            // After a failure during a commit, either outcome is valid.
+            let ok = state == states[done] || (failed && states.get(done + 1) == Some(&state));
+            assert!(
+                ok,
+                "{fault:?} at operation {op}: {} entries after {done} batches",
+                state.len()
+            );
+        }
+    }
+}
+
+#[compio::test]
+async fn a_file_store_survives_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+    let key = |i: u32| i.to_be_bytes();
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let mut batch = WriteBatch::new();
+    for i in 0..20_000u32 {
+        batch.put(&key(i), &key(i * 2));
+    }
+    db.write(&mut batch).await.unwrap();
+    batch.clear();
+    batch.delete_range(&key(5_000), &key(15_000));
+    db.write(&mut batch).await.unwrap();
+    db.close().await.unwrap();
+
+    // The page size comes from the file. A small cache sends reads to the disk.
+    let opts = Options::default().page_size(65536).cache_size(16 * 4096);
+    let db = Db::open(&path, opts).await.unwrap();
+    for i in (0..20_000u32).step_by(97) {
+        let found = db
+            .get(&key(i), Comparison::Equal, |_, v| v.to_vec())
+            .await
+            .unwrap();
+        let expected = (!(5_000..15_000).contains(&i)).then(|| key(i * 2).to_vec());
+        assert_eq!(found, expected, "key {i}");
+    }
+    let mut iter = db.range(..);
+    let mut count = 0;
+    while iter.next().await.unwrap().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 10_000);
+    drop(iter);
+    db.close().await.unwrap();
 }

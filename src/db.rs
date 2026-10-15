@@ -12,16 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cell::RefCell;
+use std::array;
+use std::cell::{Cell, RefCell};
+use std::future::{Future, poll_fn};
 use std::mem;
 use std::ops::{Bound, RangeBounds};
+use std::path::Path;
+use std::pin::pin;
 use std::rc::Rc;
 use std::slice;
+use std::task::{Poll, Waker};
 
 use crate::batch::WriteBatch;
-use crate::error::Result;
-use crate::pool::FrameId;
-use crate::tree::{Cursor, Tree};
+use crate::cache::Cache;
+use crate::error::{Error, Result};
+use crate::meta::{self, FORMAT_VERSION, Meta};
+use crate::node::{self, NO_FRAME, Node};
+use crate::options::{MIN_PAGE_SIZE, Options};
+use crate::pool::{FrameId, Holds, Pool};
+use crate::space::Space;
+use crate::storage::Storage;
+use crate::tree::{Cursor, Find, Pages, Root, Tree, Version};
+
+/// How many page reads or writes a write or an open keeps in flight.
+const IO_WINDOW: usize = 16;
 
 /// How [`Db::get`] matches its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +63,11 @@ pub struct Db {
 
 struct Inner {
     tree: RefCell<Tree>,
+    storage: Storage,
+    writer: WriteLock,
+    /// Set when an I/O error left it unknown whether a write reached the disk.
+    failed: Cell<bool>,
+    page_size: usize,
     max_entry: usize,
     /// Key buffers for reads and iterators, reused so that reads don't allocate.
     buffers: RefCell<Vec<Vec<u8>>>,
@@ -66,18 +85,54 @@ impl Inner {
         buffer.clear();
         self.buffers.borrow_mut().push(buffer);
     }
+
+    fn offset(&self, page: u64) -> u64 {
+        page * self.page_size as u64
+    }
 }
 
 impl Db {
-    /// An empty store kept only in memory. Persistence comes in the next milestone.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Db::open replaces it with persistence")
-    )]
-    pub(crate) fn in_memory(opts: crate::Options) -> Result<Db> {
+    /// Opens the store at `path`, creating it if needed.
+    ///
+    /// A new store takes its page size from `opts`; an existing one keeps the page
+    /// size it was created with.
+    pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
         opts.validate()?;
+        let (storage, len) = Storage::open(path.as_ref()).await?;
+        Db::open_on(storage, len, opts).await
+    }
+
+    /// Opens a store on a simulated disk.
+    #[cfg(test)]
+    pub(crate) async fn open_sim(disk: Rc<crate::sim::SimDisk>, opts: Options) -> Result<Db> {
+        opts.validate()?;
+        let len = disk.len();
+        Db::open_on(Storage::Sim(disk), len, opts).await
+    }
+
+    async fn open_on(storage: Storage, len: u64, opts: Options) -> Result<Db> {
+        let meta = if len == 0 {
+            create(&storage, &opts).await?
+        } else {
+            recover(&storage, len).await?
+        };
+        let page_size = meta.page_size as usize;
+        let opts = Options { page_size, ..opts };
+        let mut pages = Pages {
+            pool: Pool::new(page_size),
+            cache: Cache::new(opts.cache_frames()),
+            space: Space::new(meta.high_water),
+        };
+        for page in 0..meta::META_PAGES {
+            pages.space.mark_used(page);
+        }
+        let root = load_internal(&storage, &mut pages, &meta).await?;
         let inner = Inner {
-            tree: RefCell::new(Tree::new(opts.page_size)),
+            tree: RefCell::new(Tree::new(pages, page_size, root, meta.generation)),
+            storage,
+            writer: WriteLock::default(),
+            failed: Cell::new(false),
+            page_size,
             max_entry: opts.max_entry_size(),
             buffers: RefCell::new(Vec::new()),
         };
@@ -86,15 +141,70 @@ impl Db {
         })
     }
 
-    /// Applies `batch` atomically: once this returns `Ok`, reads see all of it.
+    /// Applies `batch` atomically and durably: once this returns `Ok`, the batch is
+    /// on disk and visible to reads.
     ///
-    /// Fails with [`Error::EntryTooLarge`](crate::Error::EntryTooLarge), applying
-    /// nothing, if a put's key plus value exceeds
-    /// [`Options::max_entry_size`](crate::Options::max_entry_size). The batch is
-    /// left as it was, ready to be cleared and reused.
+    /// Fails with [`Error::EntryTooLarge`], applying nothing, if a put's key plus
+    /// value exceeds [`Options::max_entry_size`]. An I/O error before the commit
+    /// also leaves the store unchanged. One during the commit leaves it unknown
+    /// whether the batch is durable, and makes this and later writes fail with
+    /// [`Error::Failed`] until the store is reopened; dropping the future
+    /// mid-commit does the same. The batch is left as it was, ready to be cleared
+    /// and reused.
     pub async fn write(&self, batch: &mut WriteBatch) -> Result<()> {
-        batch.prepare(self.inner.max_entry)?;
-        self.inner.tree.borrow_mut().apply(batch);
+        let inner = &*self.inner;
+        if inner.failed.get() {
+            return Err(Error::Failed);
+        }
+        batch.prepare(inner.max_entry)?;
+        let _writer = inner.writer.lock().await;
+        if inner.failed.get() {
+            return Err(Error::Failed);
+        }
+        let mut guard = WriteGuard {
+            inner,
+            stage: Stage::Building,
+        };
+
+        // Load the leaves the batch changes, keeping them in the cache.
+        inner.tree.borrow_mut().plan(batch);
+        let touched = inner.tree.borrow().touched.len();
+        for start in (0..touched).step_by(IO_WINDOW) {
+            let loads: [_; IO_WINDOW] = array::from_fn(|i| {
+                let page = inner.tree.borrow().touched.get(start + i).copied();
+                page.map(|page| load_leaf(inner, page))
+            });
+            let mut error = None;
+            for loaded in join(loads).await.into_iter().flatten() {
+                match loaded {
+                    Ok(frame) => inner.tree.borrow_mut().pinned.push(frame),
+                    Err(e) => error = error.or(Some(e)),
+                }
+            }
+            if let Some(e) = error {
+                return Err(e);
+            }
+        }
+
+        // Build the new version.
+        if !inner.tree.borrow_mut().apply(batch) {
+            return Ok(());
+        }
+        let generation = inner.tree.borrow().current().generation + 1;
+        inner.tree.borrow_mut().seal_pending(generation);
+
+        // Commit: write the new nodes, sync, then switch the meta page and sync.
+        guard.stage = Stage::Writing;
+        let written = write_dirty(inner).await;
+        guard.stage = Stage::Building;
+        written?;
+        guard.stage = Stage::Committing;
+        inner.storage.sync().await?;
+        let meta = inner.tree.borrow().pending_meta(generation);
+        write_meta(inner, &meta).await?;
+        inner.storage.sync().await?;
+        inner.tree.borrow_mut().publish(generation);
+        guard.stage = Stage::Done;
         Ok(())
     }
 
@@ -120,44 +230,64 @@ impl Db {
         cmp: Comparison,
         f: impl FnOnce(&[u8], &[u8]) -> R,
     ) -> Result<Option<R>> {
-        let mut found_key = self.inner.take_buffer();
-        let value = {
-            let tree = self.inner.tree.borrow();
-            let mut cursor = Cursor::new();
-            match tree.root() {
-                Some(root) if tree.seek(root, key, cmp, &mut cursor) => {
-                    let (frame, i) = cursor.leaf();
-                    let node = tree.node(frame);
-                    node.key_into(i, &mut found_key);
-                    let (offset, len) = node.value_span(i);
-                    Some((tree.addr(frame, offset), len))
-                }
-                _ => None,
-            }
+        let inner = &*self.inner;
+        let mut read = Read {
+            inner,
+            key: inner.take_buffer(),
+            version: None,
+            leaves: [NO_FRAME; 2],
+            loaded: 0,
         };
-        // SAFETY: the frame belongs to the current version, which nothing can replace
-        // while `f`, a synchronous closure, runs.
-        let result =
-            value.map(|(ptr, len)| f(&found_key, unsafe { slice::from_raw_parts(ptr, len) }));
-        self.inner.put_buffer(found_key);
-        Ok(result)
+        loop {
+            let found = {
+                let mut tree = inner.tree.borrow_mut();
+                let root = read.version.map_or(tree.current().root, |v| v.root);
+                tree.find(root, key, cmp, &mut read.key)
+            };
+            match found {
+                Find::Found(value, len) => {
+                    // SAFETY: the leaf stays cached while `f`, a synchronous closure, runs:
+                    // nothing that could evict it, or reuse its page, can happen meanwhile.
+                    let value = unsafe { slice::from_raw_parts(value, len) };
+                    return Ok(Some(f(&read.key, value)));
+                }
+                Find::NotFound => return Ok(None),
+                Find::Missing(page) => {
+                    if read.version.is_none() {
+                        // Waiting on the disk lets writes run: pin this version first.
+                        read.version = Some(inner.tree.borrow_mut().pin());
+                        continue;
+                    }
+                    // A lookup reads at most two leaves, which stay pinned until it ends.
+                    assert!(
+                        read.loaded < read.leaves.len(),
+                        "lookup needs too many leaves"
+                    );
+                    read.leaves[read.loaded] = load_leaf(inner, page).await?;
+                    read.loaded += 1;
+                }
+            }
+        }
     }
 
     /// Iterates over the entries with keys in `range`, in key order, as of now:
     /// later writes don't affect it. Creating and advancing it never allocates.
     ///
-    /// An iterator keeps its version, including entries later writes replace or
-    /// delete, in memory until it is dropped, so keep iterators short-lived.
+    /// An iterator keeps its version's internal nodes in memory, and the pages
+    /// later writes replace allocated, until it is dropped, so keep iterators
+    /// short-lived.
     pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter {
         let mut bounds = self.inner.take_buffer();
         let start = copy_bound(range.start_bound(), &mut bounds);
         let start_len = bounds.len();
         let end = copy_bound(range.end_bound(), &mut bounds);
-        let root = self.inner.tree.borrow_mut().pin();
+        let version = self.inner.tree.borrow_mut().pin();
         Iter {
             inner: self.inner.clone(),
-            root,
+            version,
             cursor: Cursor::new(),
+            leaf: None,
+            at: 0,
             state: State::Unstarted,
             start,
             end,
@@ -167,14 +297,348 @@ impl Db {
         }
     }
 
-    /// Closes the store.
+    /// Closes the store, once this is its last handle. Every successful
+    /// [`write`](Self::write) is already durable.
     pub async fn close(self) -> Result<()> {
+        if let Ok(inner) = Rc::try_unwrap(self.inner) {
+            match inner.storage {
+                Storage::File(file) => file.close().await?,
+                #[cfg(test)]
+                Storage::Sim(_) => {}
+            }
+        }
         Ok(())
     }
 
     #[cfg(test)]
-    pub(crate) fn tree(&self) -> std::cell::Ref<'_, Tree> {
-        self.inner.tree.borrow()
+    pub(crate) fn tree(&self) -> std::cell::RefMut<'_, Tree> {
+        self.inner.tree.borrow_mut()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_failed(&self) -> bool {
+        self.inner.failed.get()
+    }
+}
+
+/// Writes the meta page and the empty second slot of a new store.
+async fn create(storage: &Storage, opts: &Options) -> Result<Meta> {
+    let meta = Meta::empty(opts.page_size);
+    let mut pool = Pool::new(opts.page_size);
+    let frame = pool.alloc(Holds::Loading, 0);
+    meta.encode(pool.page_mut(frame));
+    let (res, buf) = storage.write(pool.buf(frame), 0).await;
+    drop(buf);
+    res?;
+    pool.page_mut(frame).fill(0);
+    let (res, buf) = storage.write(pool.buf(frame), opts.page_size as u64).await;
+    drop(buf);
+    res?;
+    storage.sync().await?;
+    Ok(meta)
+}
+
+/// Reads the meta of an existing store: the newer of the two intact slots.
+async fn recover(storage: &Storage, len: u64) -> Result<Meta> {
+    // Probe with the smallest read the storage supports: no page is smaller.
+    let probe = storage.min_read();
+    if len < probe as u64 {
+        return Err(Error::InvalidFile("no intact meta page"));
+    }
+    // Slot 0 gives the page size. If it was torn, look for slot 1 wherever each
+    // page size would put it.
+    let mut page_size = read_meta(storage, probe, 0)
+        .await?
+        .map(|m| m.page_size as usize);
+    let mut size = probe;
+    while page_size.is_none() && size <= 65536 && (size + probe) as u64 <= len {
+        let meta = read_meta(storage, probe, size as u64).await?;
+        page_size = meta.filter(|m| m.page_size as usize == size).map(|_| size);
+        size *= 2;
+    }
+    let page_size = page_size.ok_or(Error::InvalidFile("no intact meta page"))?;
+    if !page_size.is_power_of_two() || !(MIN_PAGE_SIZE..=65536).contains(&page_size) {
+        return Err(Error::InvalidFile("unsupported page size"));
+    }
+    // Both slots, in full.
+    let slot0 = read_meta(storage, page_size, 0).await?;
+    let slot1 = if 2 * page_size as u64 <= len {
+        read_meta(storage, page_size, page_size as u64).await?
+    } else {
+        None
+    };
+    let meta = match (slot0, slot1) {
+        (Some(a), Some(b)) => {
+            if a.generation > b.generation {
+                a
+            } else {
+                b
+            }
+        }
+        (Some(m), None) | (None, Some(m)) => m,
+        (None, None) => return Err(Error::InvalidFile("no intact meta page")),
+    };
+    if meta.version != FORMAT_VERSION {
+        return Err(Error::InvalidFile("unsupported format version"));
+    }
+    let root_ok = meta.root == 0 || (meta::META_PAGES..meta.high_water).contains(&meta.root);
+    if meta.page_size as usize != page_size || !root_ok {
+        return Err(Error::InvalidFile("inconsistent meta page"));
+    }
+    Ok(meta)
+}
+
+/// Reads `len` bytes at `offset`, and decodes them as a meta slot.
+async fn read_meta(storage: &Storage, len: usize, offset: u64) -> Result<Option<Meta>> {
+    let mut pool = Pool::new(len);
+    let frame = pool.alloc(Holds::Loading, 0);
+    let (res, buf) = storage.read(pool.buf(frame), offset).await;
+    drop(buf);
+    res?;
+    Ok(Meta::decode(pool.page(frame)))
+}
+
+/// Loads every internal node of the tree `meta` describes, pointing each parent at
+/// its children's frames, and marks the tree's pages used. Returns the root.
+async fn load_internal(storage: &Storage, pages: &mut Pages, meta: &Meta) -> Result<Option<Root>> {
+    if meta.root == 0 {
+        return Ok(None);
+    }
+    pages.space.mark_used(meta.root);
+    if meta.root_level == 0 {
+        return Ok(Some(Root {
+            page: meta.root,
+            frame: NO_FRAME,
+            level: 0,
+        }));
+    }
+    let page_size = meta.page_size as u64;
+    let root = pages.pool.alloc(Holds::Internal, meta.root);
+    let mut level_nodes = vec![(root, meta.root)];
+    for level in (1..=meta.root_level).rev() {
+        // Read this level.
+        for chunk in level_nodes.chunks(IO_WINDOW) {
+            let reads: [_; IO_WINDOW] = array::from_fn(|i| {
+                let &(frame, page) = chunk.get(i)?;
+                Some(storage.read(pages.pool.buf(frame), page * page_size))
+            });
+            let results = join(reads).await.into_iter().flatten();
+            for (&(frame, page), (res, buf)) in chunk.iter().zip(results) {
+                drop(buf);
+                res?;
+                let bytes = pages.pool.page(frame);
+                let node = Node::new(bytes);
+                let intact = node::verify(bytes)
+                    && node.level() == level
+                    && node.count() > 0
+                    && node.generation() <= meta.generation;
+                if !intact {
+                    return Err(Error::Corruption { page });
+                }
+            }
+        }
+        // Then point it at the level below, which it lists.
+        let mut next = Vec::new();
+        for &(parent, _) in &level_nodes {
+            let count = Node::new(pages.pool.page(parent)).count();
+            for i in 0..count {
+                let page = Node::new(pages.pool.page(parent)).child_page(i);
+                if !(meta::META_PAGES..meta.high_water).contains(&page) || pages.space.is_used(page)
+                {
+                    return Err(Error::Corruption { page });
+                }
+                pages.space.mark_used(page);
+                let frame = if level > 1 {
+                    pages.pool.alloc(Holds::Internal, page)
+                } else {
+                    NO_FRAME
+                };
+                node::set_child_frame(pages.pool.page_mut(parent), i, frame);
+                if level > 1 {
+                    next.push((frame, page));
+                }
+            }
+        }
+        level_nodes = next;
+    }
+    Ok(Some(Root {
+        page: meta.root,
+        frame: root,
+        level: meta.root_level,
+    }))
+}
+
+/// Pins the frame holding a leaf page, reading the page in if it isn't cached.
+async fn load_leaf(inner: &Inner, page: u64) -> Result<FrameId> {
+    let (frame, buf) = {
+        let mut tree = inner.tree.borrow_mut();
+        let pages = &mut tree.pages;
+        if let Some(frame) = pages.cached(page) {
+            pages.pool.retain(frame);
+            return Ok(frame);
+        }
+        let frame = pages.cache.alloc(&mut pages.pool, Holds::Loading, page);
+        // The buffer takes the frame's only reference: if this future is dropped
+        // mid-read, the frame is reclaimed once the read completes.
+        (frame, pages.pool.adopt_buf(frame))
+    };
+    let (res, buf) = inner.storage.read(buf, inner.offset(page)).await;
+    let mut tree = inner.tree.borrow_mut();
+    let pages = &mut tree.pages;
+    pages.pool.retain(frame);
+    drop(buf);
+    let bytes = pages.pool.page(frame);
+    if res.is_err() || !node::verify(bytes) || Node::new(bytes).level() != 0 {
+        pages.pool.unref(frame);
+        pages.pool.free(frame);
+        return Err(res.err().map_or(Error::Corruption { page }, Error::from));
+    }
+    Ok(pages.adopt_leaf(frame, page))
+}
+
+/// Writes the pending version's dirty nodes, `IO_WINDOW` at a time. Every write
+/// completes before this returns, even when one fails.
+async fn write_dirty(inner: &Inner) -> Result<()> {
+    let total = inner.tree.borrow().dirty.len();
+    let mut error = None;
+    for start in (0..total).step_by(IO_WINDOW) {
+        let writes: [_; IO_WINDOW] = {
+            let tree = inner.tree.borrow();
+            array::from_fn(|i| {
+                let &(frame, page) = tree.dirty.get(start + i)?;
+                Some(
+                    inner
+                        .storage
+                        .write(tree.pages.pool.buf(frame), inner.offset(page)),
+                )
+            })
+        };
+        for (res, buf) in join(writes).await.into_iter().flatten() {
+            drop(buf);
+            if let Err(e) = res {
+                error = error.or(Some(e));
+            }
+        }
+    }
+    error.map_or(Ok(()), |e| Err(e.into()))
+}
+
+/// Writes `meta` to its slot.
+async fn write_meta(inner: &Inner, meta: &Meta) -> Result<()> {
+    let (frame, buf) = {
+        let mut tree = inner.tree.borrow_mut();
+        let pages = &mut tree.pages;
+        let frame = pages.cache.alloc(&mut pages.pool, Holds::Loading, 0);
+        meta.encode(pages.pool.page_mut(frame));
+        // The buffer takes the frame's only reference, as in `load_leaf`.
+        (frame, pages.pool.adopt_buf(frame))
+    };
+    let (res, buf) = inner.storage.write(buf, inner.offset(meta.slot())).await;
+    drop(buf);
+    inner.tree.borrow_mut().pages.pool.free(frame);
+    Ok(res?)
+}
+
+/// Runs the futures in `slots` concurrently, returning their outputs in order.
+/// Unlike `join_all`, it keeps everything on the stack.
+async fn join<F: Future, const N: usize>(slots: [Option<F>; N]) -> [Option<F::Output>; N] {
+    let mut outputs: [Option<F::Output>; N] = array::from_fn(|_| None);
+    let mut slots = pin!(slots);
+    poll_fn(|cx| {
+        let mut pending = false;
+        for (i, output) in outputs.iter_mut().enumerate() {
+            // SAFETY: the futures stay pinned in the array, and are only dropped in
+            // place.
+            let mut slot = unsafe { slots.as_mut().map_unchecked_mut(|s| &mut s[i]) };
+            if let Some(future) = slot.as_mut().as_pin_mut() {
+                match future.poll(cx) {
+                    Poll::Ready(value) => {
+                        *output = Some(value);
+                        slot.set(None);
+                    }
+                    Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+    outputs
+}
+
+/// How far a write got, which decides what an early exit has to undo.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Nothing written: the pending version, if any, is thrown away.
+    Building,
+    /// Node writes may be in flight.
+    Writing,
+    /// The nodes are written: whether the commit is durable is unknown.
+    Committing,
+    Done,
+}
+
+struct WriteGuard<'a> {
+    inner: &'a Inner,
+    stage: Stage,
+}
+
+/// The tree, for a destructor. While a panic unwinds, the tree may still be
+/// borrowed by the code that panicked: then the cleanup is skipped.
+fn tree_for_drop(inner: &Inner) -> Option<std::cell::RefMut<'_, Tree>> {
+    match inner.tree.try_borrow_mut() {
+        Ok(tree) => Some(tree),
+        Err(_) if std::thread::panicking() => None,
+        Err(e) => panic!("tree borrowed during cleanup: {e}"),
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        let Some(mut tree) = tree_for_drop(self.inner) else {
+            return;
+        };
+        match self.stage {
+            Stage::Done => {}
+            Stage::Building => tree.discard(),
+            // In-flight writes still hold the pending version's frames: leave them.
+            Stage::Writing => {
+                self.inner.failed.set(true);
+                tree.unpin_touched();
+            }
+            Stage::Committing => {
+                self.inner.failed.set(true);
+                tree.discard();
+            }
+        }
+    }
+}
+
+/// What a lookup holds while it runs: a key buffer, and the version and leaves it
+/// pinned if it had to wait for the disk.
+struct Read<'a> {
+    inner: &'a Inner,
+    key: Vec<u8>,
+    version: Option<Version>,
+    leaves: [FrameId; 2],
+    loaded: usize,
+}
+
+impl Drop for Read<'_> {
+    fn drop(&mut self) {
+        if let Some(mut tree) = tree_for_drop(self.inner) {
+            for &frame in &self.leaves[..self.loaded] {
+                tree.pages.pool.unref(frame);
+            }
+            if let Some(version) = self.version {
+                tree.unpin(version);
+            }
+        }
+        self.inner.put_buffer(mem::take(&mut self.key));
     }
 }
 
@@ -195,9 +659,11 @@ fn copy_bound(bound: Bound<&[u8]>, out: &mut Vec<u8>) -> Bound<()> {
 /// A point-in-time iterator over a range of entries, from [`Db::range`].
 pub struct Iter {
     inner: Rc<Inner>,
-    /// The pinned root of the version being iterated.
-    root: Option<FrameId>,
+    version: Version,
     cursor: Cursor,
+    /// The pinned leaf the iterator is on.
+    leaf: Option<FrameId>,
+    at: usize,
     state: State,
     start: Bound<()>,
     end: Bound<()>,
@@ -207,46 +673,78 @@ pub struct Iter {
     key: Vec<u8>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum State {
     Unstarted,
-    Active,
+    /// Next, enter this leaf: at its first entry, or where the start bound falls.
+    Enter {
+        page: u64,
+        first: bool,
+    },
+    /// The entry at `at` is next.
+    Ready,
+    /// The entry at `at` was returned.
+    Returned,
     Done,
 }
 
 impl Iter {
     /// Lends the next entry's key and value, valid until the next call.
     pub async fn next(&mut self) -> Result<Option<(&[u8], &[u8])>> {
-        let Some(root) = self.root else {
+        let Some(root) = self.version.root else {
             return Ok(None);
         };
-        let tree = self.inner.tree.borrow();
-        let found = match self.state {
-            State::Done => false,
-            State::Active => tree.step(&mut self.cursor, true),
-            State::Unstarted => {
-                let start = &self.bounds[..self.start_len];
-                match self.start {
-                    Bound::Included(()) => {
-                        tree.seek(root, start, crate::Comparison::Ceiling, &mut self.cursor)
+        loop {
+            match self.state {
+                State::Done => return Ok(None),
+                State::Ready => break,
+                State::Unstarted => {
+                    let tree = self.inner.tree.borrow();
+                    let (page, first) = match self.start {
+                        Bound::Unbounded => (tree.descend_first(root, &mut self.cursor), true),
+                        _ => (
+                            tree.descend(root, &self.bounds[..self.start_len], &mut self.cursor),
+                            false,
+                        ),
+                    };
+                    self.state = State::Enter { page, first };
+                }
+                State::Enter { page, first } => {
+                    let frame = load_leaf(&self.inner, page).await?;
+                    let tree = self.inner.tree.borrow();
+                    if let Some(old) = self.leaf.replace(frame) {
+                        tree.pages.pool.unref(old);
                     }
-                    Bound::Excluded(()) => {
-                        tree.seek(root, start, crate::Comparison::Higher, &mut self.cursor)
-                    }
-                    Bound::Unbounded => {
-                        tree.seek_first(root, &mut self.cursor);
-                        true
-                    }
+                    let node = tree.node(frame);
+                    self.at = if first {
+                        0
+                    } else {
+                        let (i, eq) = node.search(&self.bounds[..self.start_len]);
+                        i + usize::from(eq && matches!(self.start, Bound::Excluded(())))
+                    };
+                    let count = node.count();
+                    drop(tree);
+                    self.state = if self.at < count {
+                        State::Ready
+                    } else {
+                        self.next_leaf()
+                    };
+                }
+                State::Returned => {
+                    let count = self.inner.tree.borrow().node(self.leaf.unwrap()).count();
+                    self.at += 1;
+                    self.state = if self.at < count {
+                        State::Ready
+                    } else {
+                        self.next_leaf()
+                    };
                 }
             }
-        };
-        if !found {
-            self.state = State::Done;
-            return Ok(None);
         }
-        let (frame, i) = self.cursor.leaf();
+        let frame = self.leaf.unwrap();
+        let tree = self.inner.tree.borrow();
         let node = tree.node(frame);
-        node.key_into(i, &mut self.key);
+        node.key_into(self.at, &mut self.key);
         let end = &self.bounds[self.start_len..];
         let in_range = match self.end {
             Bound::Included(()) => self.key.as_slice() <= end,
@@ -257,24 +755,69 @@ impl Iter {
             self.state = State::Done;
             return Ok(None);
         }
-        self.state = State::Active;
-        let (offset, len) = node.value_span(i);
+        self.state = State::Returned;
+        let (offset, len) = node.value_span(self.at);
         let value = tree.addr(frame, offset);
         drop(tree);
-        // SAFETY: the pinned root keeps this version's frames allocated, and frames
-        // are never modified while referenced.
+        // SAFETY: the iterator pins this leaf, and frames are never modified while
+        // referenced.
         Ok(Some((&self.key, unsafe {
             slice::from_raw_parts(value, len)
         })))
+    }
+
+    fn next_leaf(&mut self) -> State {
+        match self.inner.tree.borrow().next_leaf(&mut self.cursor, true) {
+            Some(page) => State::Enter { page, first: true },
+            None => State::Done,
+        }
     }
 }
 
 impl Drop for Iter {
     fn drop(&mut self) {
-        if let Some(root) = self.root.take() {
-            self.inner.tree.borrow_mut().release(root);
+        if let Some(mut tree) = tree_for_drop(&self.inner) {
+            if let Some(frame) = self.leaf.take() {
+                tree.pages.pool.unref(frame);
+            }
+            tree.unpin(self.version);
         }
         self.inner.put_buffer(mem::take(&mut self.bounds));
         self.inner.put_buffer(mem::take(&mut self.key));
+    }
+}
+
+/// Lets one write run at a time.
+#[derive(Default)]
+struct WriteLock {
+    locked: Cell<bool>,
+    waiters: RefCell<Vec<Waker>>,
+}
+
+impl WriteLock {
+    async fn lock(&self) -> WriteLockGuard<'_> {
+        poll_fn(|cx| {
+            if self.locked.replace(true) {
+                self.waiters.borrow_mut().push(cx.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
+        WriteLockGuard(self)
+    }
+}
+
+struct WriteLockGuard<'a>(&'a WriteLock);
+
+impl Drop for WriteLockGuard<'_> {
+    fn drop(&mut self) {
+        self.0.locked.set(false);
+        // Wake every waiter, in case some of their futures are gone: one gets the lock.
+        let waiters = mem::take(&mut *self.0.waiters.borrow_mut());
+        for waker in waiters {
+            waker.wake();
+        }
     }
 }

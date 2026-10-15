@@ -1,8 +1,7 @@
 # encina — design
 
-> Status: proposal under review. Durability, threading, memory and allocation are
-> decided (§3). The key/value representation (§5) is proposed, backed by a
-> benchmark.
+> Status: M1 and M2 are implemented: the tree, persistence and the leaf cache.
+> M3, performance, is next (§12).
 
 encina is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. Its first
@@ -72,28 +71,29 @@ write(batch) ─► new version ─► write new pages ─► fsync ─► meta 
 ```
 
 - **Pages live in frames.** All node memory is a pool of page-sized, 4 KiB-aligned
-  frames owned by the leaf cache. A frame table records each frame's page id,
-  reference count, dirty flag and CLOCK bit. Nodes refer to each other by page id
-  or frame index, never by heap pointer, so building and dropping nodes never calls
-  the allocator.
+  frames owned by the leaf cache. A frame table records what each frame holds, its
+  page id, reference count, dirty flag and CLOCK bit. Nodes refer to each other by
+  page id or frame index, never by heap pointer, so building and dropping nodes
+  never calls the allocator. In-flight I/O buffers share the frames' memory and
+  reference counts, and keep them alive until the kernel is done with them: a
+  cancelled read never touches freed memory.
 - **Leaves are pages.** The node format (§5) is searched in place, so a leaf in
   memory is byte-for-byte its on-disk page. A cache miss needs no decoding, and the
   budget is counted in frames. Frames double as I/O buffers, which direct I/O needs
   aligned anyway.
 - **Internal nodes are always resident**: an encoded key block (same format as
-  leaves) plus child references. A child reference holds the child's page id once it
-  has one, and its frame while it is in memory. Internal children always stay in
-  memory. The commit that writes a leaf drops the parent's frame reference to it,
-  leaving the cache as the leaf's only owner, so the leaf becomes evictable.
+  leaves) plus child references. A reference to an internal child holds its frame
+  and page id; a reference to a leaf holds only its page id, and the leaf is found
+  through the cache, so it can be evicted whenever no one is using it.
 - **Versions.** A version is a root reference. A node is never mutated after it is
   published. A write builds new nodes along the paths it touches and shares
   everything else, then swaps the root once its commit is durable. Readers holding
   the old root are unaffected, so an iterator is a consistent snapshot that costs
   one reference-count increment.
 - **Dirty nodes** are the nodes a write has built but not yet written. They exist
-  only while that write is in progress. Path copying means the parent of a dirty
-  node is always dirty, so the commit finds every dirty node by descending through
-  dirty nodes only.
+  only while that write is in progress, and get their page as they are built. Path
+  copying means the parent of a dirty node is always dirty, so the commit finds
+  every dirty node by descending through dirty nodes only.
 - **Single writer.** Writes are serialized by an async lock, held for the whole
   write, including its commit. Reads never take it.
 
@@ -175,17 +175,22 @@ doesn't allocate. The operations are applied in order and atomically.
    batch. Stable-sort the rest by key (through an index array kept in the batch) and
    keep the last operation per key. Sorted input (BookKeeper's write cache is
    sorted) costs one linear check.
-2. **Apply ranges** (see below).
-3. **Bulk merge.** Descend recursively, partitioning the sorted operations by child
+2. **Plan.** Descend the resident internal nodes to find the leaves the batch
+   changes, and load the ones that aren't cached, keeping them pinned. Subtrees
+   that ranges remove whole aren't read.
+3. **Apply ranges** (see below).
+4. **Bulk merge.** Descend recursively, partitioning the sorted operations by child
    key range. Each touched leaf is rebuilt once from its old entries plus the
    operations and re-encoded into one or more pages. Each parent rebuilds its child
    list, splitting if needed, up to the root.
-4. **Commit** the new version (§7).
-5. **Publish** the new root. Readers see the batch only now, once it is durable,
+5. **Commit** the new version (§7).
+6. **Publish** the new root. Readers see the batch only now, once it is durable,
    and the pages of the nodes it replaced become free, subject to §8.
 
-Large batches yield to the executor every N leaves. This is safe because readers
-keep using the old root until the swap, and the lock keeps other writers out.
+Readers keep running while a write waits for the disk. The merge itself doesn't
+yield yet: it is CPU work bounded by the batch, and yielding inside it is planned
+for M3. Doing so is safe: readers keep using the old root until the swap, and the
+lock keeps other writers out.
 
 **Split policy.** A rebuilt leaf that overflows splits right after each run of
 inserted keys that fills at least a quarter page (the per-ledger append case): the
@@ -194,7 +199,7 @@ ledger's settled entries then stop being rewritten by later appends, even when o
 leaf holds the tails of several ledgers. Smaller runs, like scattered inserts, don't
 get leaves of their own, and whatever follows the last split point is split evenly
 by bytes. There is no strict 50% minimum fill: a rebuilt node below ~25% merges with
-a neighbor.
+a neighbor, if the neighbor is in memory.
 
 ### `delete_range(start..end)`
 
@@ -225,30 +230,31 @@ nothing.
 
 Every `write()` ends with a commit that makes its batch durable in one atomic step.
 
-1. Walk the new version's dirty nodes in post-order and allocate a page for each.
-   Leaves are already encoded. Internal nodes are encoded now, embedding their
-   children's page ids, which is why children come first.
-2. Submit the page writes concurrently (bounded window), await them, `sync_data`.
+1. Seal the new version's dirty nodes: stamp the generation and the checksum. Each
+   already has its page, so they can be written in any order.
+2. Write them, 16 at a time, await every write, `sync_data`.
 3. Write the meta page into slot `(gen + 1) % 2`, then `sync_data`. The commit is
    durable.
 4. Publish the new root. The written leaves become evictable, and the pages this
    write dropped become reusable, subject to §8.
 
-A batch whose new leaves would crowd out the cache doesn't have to hold them until
-step 2: it can write them as the merge produces them and evict them right away,
-since nothing reaches them until the meta page does.
+A write keeps the leaves it changes and the ones it builds in memory until it
+publishes, so a batch larger than the cache budget grows the pool past it. Writing
+new leaves out as the merge produces them, which is safe since nothing reaches them
+until the meta page does, is planned for M3.
 
 **Invariant:** a commit never overwrites a page reachable from the last durable
 commit. Whenever a crash happens, the newest valid meta slot describes an intact
 tree. A torn meta write fails its checksum, and recovery uses the other slot.
 
-**Failures.** If one of the batch's page writes fails, nothing is published: once
-its other page writes have finished, the batch is dropped, its pages return to the
-free set, and `write()` returns the error. If a `sync_data` or the meta page write
-fails, what reached the disk is unknown, so the instance enters a failed state:
-reads keep serving the last published version, writes return errors, and the store
-must be reopened. Dropping a `write()` future is harmless until it submits its
-first page write; after that, it also puts the instance in the failed state.
+**Failures.** If loading a leaf or writing a page fails, nothing is published: once
+the rest of that I/O has finished, the batch is dropped, its pages return to the
+free set, and `write()` returns the error, leaving the store as it was. If a
+`sync_data` or the meta page write fails, what reached the disk is unknown, so the
+instance enters a failed state: reads keep serving the last published version,
+writes return `Error::Failed`, and the store must be reopened. Dropping a `write()`
+future is harmless until it starts writing pages; after that, it also puts the
+instance in the failed state.
 
 ### File layout (format v1)
 
@@ -257,7 +263,7 @@ from 4 to 64 KiB).
 
 | Pages | Content |
 |---|---|
-| 0, 1 | Meta slots: magic, format version, page size, generation, root page, height, entry count, high-water mark, checksum. |
+| 0, 1 | Meta slots: checksum, magic, format version, page size, root level, generation, root page, high-water mark. |
 | ≥ 2 | Tree pages, each with a header: crc32c, node format (slotted in v1), level, entry count, generation written. |
 
 ### Free space is derived, not stored
@@ -273,11 +279,17 @@ extends the file.
 
 ### Recovery
 
-1. Read both meta slots and pick the valid one with the highest generation.
-2. Load the internal pages, verifying checksums and structure. Leaves are read on
+1. Read slot 0, which records the page size; if it is torn, look for slot 1 where
+   each possible page size would put it. Then read both slots, and pick the intact
+   one with the highest generation.
+2. Load the internal pages level by level, verifying checksums, levels and
+   generations, and point each parent at its children's frames. Leaves are read on
    demand, so open time scales with the internal pages, a fraction of a percent of
    the file.
-3. Rebuild the free bitmap.
+3. Build the free bitmap from the pages the tree reaches.
+
+A file too short to hold a meta page, or with no intact slot, isn't a store
+(`Error::InvalidFile`): a crash while a store is being created can leave one.
 
 There is no log to replay: the caller's journal covers anything newer than the last
 completed write.
@@ -290,16 +302,19 @@ completed write.
 - **Internal nodes** are always resident. With prefixes stripped, an internal page
   holds several hundred children, so internal nodes are well under 1% of the data.
 - **Leaves** live in the cache, keyed by page id in a table sized at open, with CLOCK
-  eviction. Only clean leaves can be evicted. A write's dirty leaves stay pinned
-  until its commit, unless the batch is large enough to write them out early (§7).
-  Exposing cache numbers is left to a later metrics design.
+  eviction. Only clean, unpinned leaves can be evicted: a write pins the leaves it
+  changes and the ones it builds until it publishes, and a reader pins the leaf it
+  is on. Exposing cache numbers is left to a later metrics design.
 - **Misses** read the page straight into a free frame (direct I/O) and verify the
-  checksum. Concurrent misses on the same page share one read.
+  checksum. Concurrent misses on the same page each read it, and all but the first
+  to finish drop their copy; sharing one read is planned for M3. A frame left
+  behind by a cancelled read is reclaimed by the clock hand once the read
+  completes.
 - **Page reuse.** A page dropped by a write becomes reusable once that write is
   published and no reader that started before the publish is still alive (such a
-  reader might still need to read it). Iterators always register as
-  readers, in a preallocated table; point reads register only when they have to
-  wait for I/O. Reusing a page replaces any stale cache entry for it.
+  reader might still need to read it). Iterators always register as readers;
+  point reads register only when they have to wait for I/O. Reclaiming a page
+  evicts any stale cache entry for it.
 - **Capacity.** At ~26 B/entry for slotted nodes on BookKeeper-shaped data, a 1 GiB
   cache holds roughly 40M entries. A dense format (~5 B/entry) would raise that to
   roughly 200M, which is the main reason to add it later.
@@ -314,15 +329,17 @@ completed write.
   frames as the owned buffers, and `sync_data`.
 - **No OS page cache, no `mmap`.** On Linux the data file is opened with `O_DIRECT`
   (`OpenOptions::custom_flags`), so pages move straight between frames and the
-  device. On macOS, for development only, `F_NOCACHE` is set instead. encina's
-  cache is then the only cache, memory use matches the budget, and no page fault can
-  block the event loop. `sync_data` is still required for durability.
+  device; on file systems that don't support it, like tmpfs, it falls back to
+  buffered I/O. On macOS, for development only, `F_NOCACHE` is set instead.
+  encina's cache is then the only cache, memory use matches the budget, and no page
+  fault can block the event loop. `sync_data` is still required for durability.
 - compio 0.19 heap-allocates a small control block for every submitted operation.
   The cache-hit path does no I/O and stays allocation-free; a miss or a commit pays
-  one allocation per page I/O. If that shows up in profiles, the fix belongs
+  one allocation per page I/O. encina adds none: a write keeps its in-flight
+  operations in a fixed-size array. If compio's show up in profiles, the fix belongs
   upstream (pooled operation slots).
-- CPU-heavy steps yield periodically: large merges and encoding thousands of
-  pages.
+- CPU-heavy steps, large merges in particular, don't yield to the executor yet;
+  that is planned for M3.
 - **Linux with io_uring is the target.** macOS works for development, but there
   compio runs file I/O on a blocking thread pool and `fsync` is a plain `fsync`
   (no `F_FULLFSYNC`), so macOS gives no durability guarantee against power loss.
@@ -404,20 +421,22 @@ complete without suspending.
 - **Invariant checker** after every step: keys sorted, internal keys exact, levels
   consistent, and every page either live or free (never both, never neither).
 - **Failure paths, aiming for ~100% coverage.** All I/O goes through one internal
-  interface with two implementations: compio files, and a simulated file that can
-  fail, tear or crash at any single operation. Each test scenario first runs once to
-  count its I/O operations, then reruns once per operation with a fault injected
-  there: an error, a short or torn write, or a crash that drops unsynced data. After
-  each run, the failing call must report the error, the instance must enter the
-  failed state where §7 says it should, the invariant checker must pass, and
-  reopening must yield the state after the last successful write (or after the
-  failed one, when the fault hit a sync or the meta page). This enumerates every
-  failure point instead of sampling them. Coverage of error-handling branches is
-  measured (`cargo llvm-cov`) and checked in CI; an uncovered failure path needs a
-  test or a written reason.
+  interface with two implementations: compio files, and a simulated disk that can
+  fail or crash at any single operation. A crash keeps what was synced, a
+  pseudo-random subset of the unsynced writes, and the first half of the write in
+  progress. The failure scenario first runs once to count its I/O operations, then
+  reruns once per operation with an error injected there, and once more with a
+  crash. After each run, a store left usable must pass the invariant checker, one
+  left failed must reject writes, and reopening must yield the state after the
+  last successful write (or after the failed one, when the failure hit a commit).
+  This enumerates every failure point instead of sampling them. Measuring coverage
+  of error-handling branches in CI (`cargo llvm-cov`), where an uncovered failure
+  path needs a test or a written reason, is planned for M3.
+- **Damage:** a flipped bit in a leaf fails the reads that need it, and one in an
+  internal node fails the open, both with `Error::Corruption`.
 - **Allocation tests:** a counting global allocator asserts that `get` and
-  iteration perform no allocations once the cache is warm, and that `write` with a
-  reused batch allocates nothing beyond compio's one block per I/O operation.
+  iteration over cached pages, and `write` with a reused batch on the simulated
+  disk, perform no allocations. On a real disk, compio adds one per I/O operation.
 - **Benchmarks** against RocksDB on the BookKeeper workload: sorted batches over
   *A* active ledgers, random point reads, floor lookups, and `delete_range` of old
   ledgers.
@@ -431,8 +450,9 @@ complete without suspending.
    at the end of `write()`, open and recovery, free bitmap, leaf cache with budget
    and eviction, snapshot-aware page reuse, failure-path tests.
 3. **M3, performance:** group commit (writes that queue up during a commit share
-   the next one), the dense node format if benchmarks justify it, benchmarks
-   against RocksDB.
+   the next one), the dense node format if benchmarks justify it, yielding inside
+   large merges, writing large batches' new leaves early, one shared read for
+   concurrent misses, coverage measured in CI, and benchmarks against RocksDB.
 
 ## Non-goals (for now)
 

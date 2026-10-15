@@ -57,16 +57,53 @@ pub(crate) fn max_entry(page_size: usize) -> usize {
     (page_size - HEADER) / 4 - HEAD - SLOT - CHILD_REF
 }
 
-/// Encodes a child reference for an internal node.
-pub(crate) fn child_ref(frame: FrameId) -> [u8; CHILD_REF] {
+/// The frame in a child reference to a leaf. Leaves can be evicted, so they are
+/// found by page id, through the leaf cache.
+pub(crate) const NO_FRAME: FrameId = FrameId::MAX;
+
+/// Encodes a child reference for an internal node: the child's frame, or
+/// [`NO_FRAME`] for a leaf, then its page id. Frames are only meaningful in
+/// memory: loading an internal node rewrites them.
+pub(crate) fn child_ref(frame: FrameId, page: u64) -> [u8; CHILD_REF] {
     let mut r = [0; CHILD_REF];
     r[..4].copy_from_slice(&frame.to_le_bytes());
+    r[4..].copy_from_slice(&page.to_le_bytes());
     r
 }
 
 /// The frame a child reference points to.
 pub(crate) fn child_frame(child_ref: &[u8]) -> FrameId {
     u32::from_le_bytes(child_ref[..4].try_into().unwrap())
+}
+
+/// The page a child reference points to.
+pub(crate) fn child_page(child_ref: &[u8]) -> u64 {
+    u64::from_le_bytes(child_ref[4..CHILD_REF].try_into().unwrap())
+}
+
+/// Stamps `generation` and the checksum into the header of the node in `page`,
+/// ready to be written.
+pub(crate) fn seal(page: &mut [u8], generation: u64) {
+    page[20..28].copy_from_slice(&generation.to_le_bytes());
+    let crc = crc32c::crc32c(&page[4..]);
+    page[..4].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Whether `page`, as read from disk, holds an intact node: its checksum matches,
+/// and its layout stays within the page.
+pub(crate) fn verify(page: &[u8]) -> bool {
+    let crc = u32::from_le_bytes(page[..4].try_into().unwrap());
+    if page[4] != FORMAT_SLOTTED || crc32c::crc32c(&page[4..]) != crc {
+        return false;
+    }
+    let node = Node::new(page);
+    node.count > 0 && node.heap_at <= node.used() && node.used() <= page.len()
+}
+
+/// Points entry `i` of the internal node in `page` at `frame`.
+pub(crate) fn set_child_frame(page: &mut [u8], i: usize, frame: FrameId) {
+    let (at, _) = Node::new(page).value_span(i);
+    page[at..at + 4].copy_from_slice(&frame.to_le_bytes());
 }
 
 /// A sorted run of entries to build nodes from.
@@ -232,6 +269,16 @@ impl<'a> Node<'a> {
     /// The child an internal node's entry `i` refers to.
     pub(crate) fn child(&self, i: usize) -> FrameId {
         child_frame(self.value(i))
+    }
+
+    /// The page of the child an internal node's entry `i` refers to.
+    pub(crate) fn child_page(&self, i: usize) -> u64 {
+        child_page(self.value(i))
+    }
+
+    /// The generation that wrote this node, once it has been sealed.
+    pub(crate) fn generation(&self) -> u64 {
+        u64::from_le_bytes(self.page[20..28].try_into().unwrap())
     }
 
     /// Appends entry `i`'s key to `out`.
@@ -455,6 +502,28 @@ mod tests {
     }
 
     #[test]
+    fn sealed_pages_verify_and_damage_is_detected() {
+        let mut buf = EntryBuf::default();
+        buf.push(b"key", b"value");
+        let mut page = vec![0; 4096];
+        build(&mut page, 0, &buf, 0, 1);
+        seal(&mut page, 42);
+        assert!(verify(&page));
+        assert_eq!(Node::new(&page).generation(), 42);
+        for at in [0, 5, 100, 4095] {
+            let mut damaged = page.clone();
+            damaged[at] ^= 1;
+            assert!(!verify(&damaged), "damage at byte {at} went unnoticed");
+        }
+    }
+
+    #[test]
+    fn child_refs_round_trip() {
+        let r = child_ref(7, u64::MAX - 1);
+        assert_eq!((child_frame(&r), child_page(&r)), (7, u64::MAX - 1));
+    }
+
+    #[test]
     fn max_entries_fit_four_to_a_node() {
         for page_size in [256, 4096, 65536] {
             let max = max_entry(page_size);
@@ -467,7 +536,7 @@ mod tests {
             // Four internal entries with maximal keys.
             let mut internal = BTreeMap::new();
             for b in 0..4u8 {
-                internal.insert(vec![b; max], child_ref(7));
+                internal.insert(vec![b; max], child_ref(7, 9));
             }
             let mut buf = EntryBuf::default();
             for (k, v) in &internal {

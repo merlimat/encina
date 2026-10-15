@@ -29,17 +29,12 @@ Early development. [DESIGN.md](DESIGN.md) covers the design and the milestones:
 
 - [x] **M1, in-memory tree:** the node format, batched writes, `get` with five
   comparisons, range iterators, and range deletes.
-- [ ] **M2, persistence and caching:** atomic durable commits, recovery, the leaf
+- [x] **M2, persistence and caching:** atomic durable commits, recovery, the leaf
   cache, and direct I/O.
 - [ ] **M3, performance:** group commit, a dense node format, and benchmarks against
   RocksDB.
 
-Until M2 adds `Db::open`, the store lives only in memory and can't be opened from
-outside the crate.
-
 ## Example
-
-The API as it will look once `Db::open` lands:
 
 ```rust
 use encina::{Comparison, Db, Options, WriteBatch};

@@ -23,6 +23,15 @@ pub enum Error {
     EntryTooLarge { size: usize, max: usize },
     /// The options are invalid.
     InvalidOptions(&'static str),
+    /// The file is not a store this version of encina can open.
+    InvalidFile(&'static str),
+    /// A page failed its checksum, or doesn't hold the node expected there.
+    Corruption { page: u64 },
+    /// An I/O error.
+    Io(std::io::Error),
+    /// An earlier I/O error left it unknown whether a write reached the disk. The
+    /// store rejects further writes; reopen it to recover.
+    Failed,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -34,8 +43,25 @@ impl fmt::Display for Error {
                 write!(f, "entry of {size} bytes exceeds the maximum of {max}")
             }
             Error::InvalidOptions(reason) => write!(f, "invalid options: {reason}"),
+            Error::InvalidFile(reason) => write!(f, "invalid store file: {reason}"),
+            Error::Corruption { page } => write!(f, "page {page} is corrupt"),
+            Error::Io(e) => write!(f, "I/O error: {e}"),
+            Error::Failed => write!(f, "an earlier I/O error left the store failed; reopen it"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}

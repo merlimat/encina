@@ -17,11 +17,17 @@
 //! See `DESIGN.md` for the design.
 
 mod batch;
+mod cache;
 mod db;
 mod error;
+mod meta;
 mod node;
 mod options;
 mod pool;
+#[cfg(test)]
+mod sim;
+mod space;
+mod storage;
 mod tree;
 
 #[cfg(test)]
