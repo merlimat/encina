@@ -400,6 +400,28 @@ fn bookkeeper_workload() {
     }
 }
 
+/// The benchmark's load, scaled down: each batch appends 100 entries to each of 100
+/// ledgers, which close every 10 batches. Rebuilt leaves leave small pieces behind,
+/// which merge with their neighbors before they are built.
+#[test]
+fn writes_build_no_node_they_discard() {
+    let store = Store::new(Options::default());
+    let mut batch = WriteBatch::new();
+    for b in 0..20 {
+        batch.clear();
+        for slot in 0..100 {
+            let ledger = b / 10 * 100 + slot;
+            for entry in b % 10 * 100..(b % 10 + 1) * 100 {
+                batch.put(&entry_key(ledger, entry), &location(ledger, entry));
+            }
+        }
+        now(store.db.write(&mut batch)).unwrap();
+        let freed = store.db.tree().pages.space.freed;
+        assert_eq!(freed, 0, "batch {b} built {freed} pages it freed again");
+        store.db.tree().check();
+    }
+}
+
 #[test]
 fn comparisons_at_the_edges() {
     use Comparison::{Ceiling, Equal, Floor, Higher, Lower};
