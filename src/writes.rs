@@ -16,7 +16,8 @@
 //! no write waiting commits its batch alone. Writes that arrive while a commit
 //! runs join the next group: each appends its batch to the group's, in the order
 //! they arrive. Once the commit ends, whichever of them runs first commits the
-//! whole group, and the others get its outcome.
+//! whole group, and the others get its outcome. No write depends on another being
+//! polled, except on the one committing.
 
 use std::mem;
 use std::task::{Context, Poll, Waker};
@@ -33,8 +34,10 @@ pub(crate) const GROUP_SIZE: usize = 64 << 20;
 pub(crate) enum Turn {
     /// It commits its own batch, alone.
     Alone,
-    /// It commits the current group, which holds its batch, from this slot.
-    Lead(usize),
+    /// It commits the current group: from this slot if the group holds its batch.
+    /// Otherwise the group lost the write committing it, and this write takes over
+    /// before its own turn.
+    Lead(Option<usize>),
     /// Another write committed its group, with this outcome.
     Done(Result<()>),
 }
@@ -43,8 +46,8 @@ pub(crate) enum Turn {
 enum State {
     /// There is no current group.
     Idle,
-    /// The current group waits for one of its writes to commit it: the write that
-    /// was committing it went away before writing anything.
+    /// The current group waits for a write to commit it: the one that was went
+    /// away before writing anything.
     Waiting,
     /// A write is building the group's new version. A write that leaves the group
     /// takes its batch with it.
@@ -137,19 +140,23 @@ impl Writes {
             self.members[s].ops = self.next.append(batch);
             self.next_writes += 1;
         }
-        let first = match self.state {
-            State::Idle => self.next_group,
-            _ => self.next_group - 1,
-        };
-        if !self.busy && self.members[s].group == Some(first) {
-            if self.state == State::Idle {
+        // With no commit running, the current group, if any, waits for a write to
+        // take it over; otherwise the next group becomes current.
+        if !self.busy && self.members[s].group.is_some() {
+            let own = if self.state == State::Idle {
                 self.seal();
-            }
+                true
+            } else {
+                self.members[s].group == Some(self.next_group - 1)
+            };
             self.state = State::Building;
             self.busy = true;
             self.changed = false;
+            if !own {
+                return Poll::Ready(Turn::Lead(None));
+            }
             *slot = None;
-            return Poll::Ready(Turn::Lead(s));
+            return Poll::Ready(Turn::Lead(Some(s)));
         }
         let waker = &mut self.members[s].waker;
         if !waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
@@ -173,30 +180,33 @@ impl Writes {
         self.state = State::Committing;
     }
 
-    /// Ends the commit of the current group, which the write in `slot` led: the
-    /// group's other writes get `result`.
-    pub(crate) fn deliver(&mut self, slot: usize, result: &Result<()>) {
+    /// Ends the commit of the current group, led from `slot` if the leader was in
+    /// the group: the group's other writes get `result`.
+    pub(crate) fn deliver(&mut self, slot: Option<usize>, result: &Result<()>) {
         let group = Some(self.next_group - 1);
         for (i, member) in self.members.iter_mut().enumerate() {
-            if i != slot && member.group == group {
+            if Some(i) != slot && member.group == group {
                 member.result = Some(match result {
                     Ok(()) => Ok(()),
                     Err(e) => Err(e.duplicate()),
                 });
             }
         }
-        self.free_slot(slot);
+        if let Some(slot) = slot {
+            self.free_slot(slot);
+        }
         self.current.clear();
         self.current_writes = 0;
         self.state = State::Idle;
         self.wake_all();
     }
 
-    /// Takes the batch of the write in `slot`, which went away while building the
-    /// current group, out of the group. Another of the group's writes commits the
-    /// rest.
-    pub(crate) fn abandon(&mut self, slot: usize) {
-        self.leave(slot);
+    /// Leaves the current group to another write: the one building it, from `slot`
+    /// if it was in the group, went away, and takes its batch along.
+    pub(crate) fn abandon(&mut self, slot: Option<usize>) {
+        if let Some(slot) = slot {
+            self.leave(slot);
+        }
         if self.state == State::Building {
             self.state = State::Waiting;
         }

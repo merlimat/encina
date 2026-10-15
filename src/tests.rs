@@ -2215,6 +2215,39 @@ fn a_write_dropped_while_leading_its_group_leaves_it_to_the_others() {
 }
 
 #[test]
+fn a_write_of_the_next_group_takes_over_a_group_left_without_its_leader() {
+    let (store, mut model, queued) = cold_group();
+    let start = generation(&store.db);
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let db = store.db.clone();
+    let mut writes = hold_group_building(&store, &mut model, &mut batches, &db);
+    // Two writes queue up for the next group, then the leader goes.
+    let later = [vec![put_op(1900, 5)], vec![put_op(1950, 6)]];
+    let mut later_batches: Vec<_> = later.iter().map(|ops| batch_of(ops)).collect();
+    let mut later_writes = start_writes(&store.db, &mut later_batches);
+    drop(writes.remove(0));
+    // Without waiting for the rest of the group, a later write takes it over, and
+    // goes too while it waits for the group's leaves.
+    let ops = store.disk.ops();
+    assert!(poll(later_writes[0].as_mut()).is_pending());
+    assert!(store.disk.ops() > ops, "it didn't read the group's leaves");
+    drop(later_writes.remove(0));
+    // The other takes over, then commits its own group.
+    store.disk.release();
+    now(later_writes.remove(0)).unwrap();
+    assert_eq!(generation(&store.db), start + 3);
+    for write in writes {
+        now(write).unwrap();
+    }
+    assert!(!store.db.has_failed());
+    for ops in [&queued[1], &queued[2], &later[1]] {
+        apply(&mut model, ops);
+    }
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+#[test]
 fn a_group_whose_writes_all_went_away_is_dropped() {
     let (store, mut model, queued) = cold_group();
     let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();

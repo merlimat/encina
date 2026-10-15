@@ -214,20 +214,26 @@ impl Db {
         // Wait for the commit in progress, if any. Then this write commits, alone
         // or with the writes that queued alongside it, or another of them does.
         let mut queued = Queued { inner, slot: None };
-        let leader = match poll_fn(|cx| queued.poll(cx, batch)).await {
-            Turn::Alone => None,
-            Turn::Lead(slot) => Some(slot),
-            Turn::Done(result) => return result,
-        };
-        let mut guard = WriteGuard {
-            inner,
-            stage: Stage::Building,
-            leader,
-            delivered: false,
-        };
-        let result = commit(inner, &mut guard, batch).await;
-        guard.deliver(&result);
-        result
+        loop {
+            let (group, slot) = match poll_fn(|cx| queued.poll(cx, batch)).await {
+                Turn::Alone => (false, None),
+                Turn::Lead(slot) => (true, slot),
+                Turn::Done(result) => return result,
+            };
+            let mut guard = WriteGuard {
+                inner,
+                stage: Stage::Building,
+                group,
+                slot,
+                delivered: false,
+            };
+            let result = commit(inner, &mut guard, batch).await;
+            guard.deliver(&result);
+            // A write that took over a group without its batch waits for its own.
+            if !group || slot.is_some() {
+                return result;
+            }
+        }
     }
 
     /// Finds the entry matching `key` under `cmp` and calls `f` with its key and
@@ -643,7 +649,7 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
     if inner.failed.get() {
         return Err(Error::Failed);
     }
-    let group = guard.leader.is_some();
+    let group = guard.group;
     loop {
         // Load the leaves the batch changes, keeping them in the cache.
         {
@@ -974,8 +980,10 @@ enum Stage {
 struct WriteGuard<'a> {
     inner: &'a Inner,
     stage: Stage,
-    /// Its slot among the writes, if it commits a group of them.
-    leader: Option<usize>,
+    /// Whether it commits a group of writes, and its slot among them, if the group
+    /// holds its batch.
+    group: bool,
+    slot: Option<usize>,
     /// Whether the group's writes have their outcome.
     delivered: bool,
 }
@@ -983,8 +991,8 @@ struct WriteGuard<'a> {
 impl WriteGuard<'_> {
     /// Gives the other writes in the group `result`, the first time.
     fn deliver(&mut self, result: &Result<()>) {
-        if let Some(slot) = self.leader.filter(|_| !self.delivered) {
-            self.inner.writes.borrow_mut().deliver(slot, result);
+        if self.group && !self.delivered {
+            self.inner.writes.borrow_mut().deliver(self.slot, result);
         }
         self.delivered = true;
     }
@@ -1022,12 +1030,12 @@ impl Drop for WriteGuard<'_> {
             return;
         };
         // Dropped before the group's writes had their outcome.
-        if let Some(slot) = self.leader.filter(|_| !self.delivered) {
+        if self.group && !self.delivered {
             if self.stage == Stage::Building {
                 // Nothing was written: the others go ahead without this write.
-                writes.abandon(slot);
+                writes.abandon(self.slot);
             } else {
-                writes.deliver(slot, &Err(Error::Failed));
+                writes.deliver(self.slot, &Err(Error::Failed));
             }
         }
         writes.release();
