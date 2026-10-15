@@ -461,7 +461,7 @@ impl ReadOnlyDb {
     }
 
     /// As [`Db::range`], in the version this view reads.
-    pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter {
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter {
         self.db.range(range)
     }
 
