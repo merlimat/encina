@@ -510,6 +510,166 @@ fn deleting_everything_empties_the_tree() {
     assert!(scan(&store.db, ALL).is_empty());
 }
 
+/// A store of 2000 keys on 256-byte pages, whose root is three levels above the
+/// leaves.
+fn deep_store() -> (Store, Model) {
+    let store = Store::new(Options::new().page_size(256));
+    let puts: Vec<_> = (0..2000u32)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![i as u8; 8]))
+        .collect();
+    write(&store.db, &puts);
+    let mut model = Model::new();
+    apply(&mut model, &puts);
+    assert_eq!(store.db.tree().current().root.unwrap().level, 3);
+    (store, model)
+}
+
+/// A node on the way down to a key: its page, the keys of its subtree, `lo..hi`
+/// (`hi` is `None` along the right edge), and how many children it has, if any.
+struct Subtree {
+    page: u64,
+    lo: Vec<u8>,
+    hi: Option<Vec<u8>>,
+    children: usize,
+}
+
+/// The nodes from the root of the current version down to the leaf where `key`
+/// belongs.
+fn path_to(db: &Db, key: &[u8]) -> Vec<Subtree> {
+    let tree = db.tree();
+    let root = tree.current().root.unwrap();
+    let mut path = vec![Subtree {
+        page: root.page,
+        lo: Vec::new(),
+        hi: None,
+        children: 0,
+    }];
+    let mut frame = root.frame;
+    for _ in 0..root.level {
+        let node = tree.node(frame);
+        let n = node.count();
+        let key_at = |i| {
+            let mut key = Vec::new();
+            node.key_into(i, &mut key);
+            key
+        };
+        // The last child whose smallest key is at most `key`.
+        let i = (1..n).filter(|&i| node.cmp_key(i, key).is_le()).count();
+        let parent = path.last_mut().unwrap();
+        parent.children = n;
+        let hi = if i + 1 < n {
+            Some(key_at(i + 1))
+        } else {
+            parent.hi.clone()
+        };
+        path.push(Subtree {
+            page: node.child_page(i),
+            lo: key_at(i),
+            hi,
+            children: 0,
+        });
+        frame = node.child(i);
+    }
+    path
+}
+
+/// Writes `ops`, which delete every key outside the subtree of the node at
+/// `page`, `level` levels above the leaves, and checks that this node becomes the
+/// root as it is: the commit writes no node, and the pages of the old version
+/// that the new one doesn't use are free again. Then checks the store, before
+/// and after reopening it.
+fn collapse_onto(store: &mut Store, model: &mut Model, ops: &[Op], (page, level): (u64, u8)) {
+    let before = store.db.tree().pages();
+    let disk_ops = store.disk.ops();
+    write(&store.db, ops);
+    apply(model, ops);
+    let root = store.db.tree().current().root.unwrap();
+    assert_eq!((root.page, root.level), (page, level));
+    // A sync, the meta page and a sync.
+    assert_eq!(store.disk.ops() - disk_ops, 3, "the commit wrote nodes");
+    let tree = store.db.tree();
+    let after = tree.pages();
+    for page in &before {
+        let used = tree.pages.space.is_used(*page);
+        assert_eq!(used, after.contains(page), "page {page}");
+    }
+    drop(tree);
+    store.db.check();
+    assert_eq!(scan(&store.db, ALL), expected_scan(model, ALL));
+    store.reopen();
+    store.db.check();
+    assert_eq!(scan(&store.db, ALL), expected_scan(model, ALL));
+}
+
+#[test]
+fn deleting_all_but_a_subtree_makes_its_node_the_root() {
+    // The subtrees holding a key one, two and three levels below the root. The
+    // root collapses onto the node of each, which the new version keeps as it is.
+    for depth in 1..=3 {
+        let (mut store, mut model) = deep_store();
+        let path = path_to(&store.db, &1100u32.to_be_bytes());
+        let node = &path[depth];
+        let ops = [
+            Op::DeleteRange(Vec::new(), node.lo.clone()),
+            Op::DeleteRange(node.hi.clone().unwrap(), vec![0xff; 5]),
+        ];
+        let level = 3 - depth as u8;
+        collapse_onto(&mut store, &mut model, &ops, (node.page, level));
+    }
+}
+
+#[test]
+fn a_root_collapses_through_a_node_left_with_one_child() {
+    let (mut store, mut model) = deep_store();
+    let path = path_to(&store.db, &1100u32.to_be_bytes());
+    let (top, leaf) = (&path[1], &path[3]);
+    // Deleting all but one leaf under a child of the root leaves the leaf's
+    // parent with one child, and alone under its own parent, which merges into a
+    // neighbor: the tree keeps a node with one child.
+    let ops = [
+        Op::DeleteRange(top.lo.clone(), leaf.lo.clone()),
+        Op::DeleteRange(leaf.hi.clone().unwrap(), top.hi.clone().unwrap()),
+    ];
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    store.db.check();
+    let path = path_to(&store.db, &leaf.lo);
+    assert_eq!((path.len(), path[2].children), (4, 1));
+    // Deleting everything else collapses the root onto the leaf, through that
+    // node, which the new version drops as it is.
+    let ops = [
+        Op::DeleteRange(Vec::new(), leaf.lo.clone()),
+        Op::DeleteRange(leaf.hi.clone().unwrap(), vec![0xff; 5]),
+    ];
+    collapse_onto(&mut store, &mut model, &ops, (leaf.page, 0));
+}
+
+#[test]
+fn a_batch_of_empty_ranges_changes_nothing() {
+    let store = Store::new(Options::new().page_size(256));
+    let key = |i: u32| i.to_be_bytes().to_vec();
+    let puts: Vec<_> = (0..300).map(|i| Op::Put(key(i), vec![1; 8])).collect();
+    write(&store.db, &puts);
+    let mut model = Model::new();
+    apply(&mut model, &puts);
+    let generation = store.db.tree().current().generation;
+    let disk_ops = store.disk.ops();
+    // Ranges that end at or before their start hold no keys: a batch of them, like
+    // an empty batch, commits nothing.
+    write(
+        &store.db,
+        &[
+            Op::DeleteRange(key(200), key(100)),
+            Op::DeleteRange(key(50), key(50)),
+        ],
+    );
+    now(store.db.write(&mut WriteBatch::new())).unwrap();
+    assert_eq!(store.db.tree().current().generation, generation);
+    assert_eq!(store.disk.ops(), disk_ops);
+    store.db.check();
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+}
+
 #[test]
 fn reopening_with_a_cold_cache_reads_everything_back() {
     let mut store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
