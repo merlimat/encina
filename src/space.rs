@@ -60,9 +60,12 @@ pub(crate) struct Space {
     lowest_free: u64,
     /// The run each [`Life`] allocates from, while a write is in progress.
     runs: [Run; 2],
-    /// Pages the write in progress allocated and freed again, as when two nodes
-    /// merge: holes in its runs, which its next short-lived pages fill.
+    /// Pages the write in progress allocated and freed again: holes in its runs,
+    /// which its next short-lived pages fill.
     holes: Vec<u64>,
+    /// How many pages the write in progress freed again.
+    #[cfg(test)]
+    pub(crate) freed: usize,
     /// Pages that published versions replaced, with the generation that replaced
     /// them, oldest first.
     dropped: VecDeque<(u64, u64)>,
@@ -80,6 +83,8 @@ impl Space {
             lowest_free: 0,
             runs: [Run::default(); 2],
             holes: Vec::new(),
+            #[cfg(test)]
+            freed: 0,
             dropped: VecDeque::new(),
             readers: Vec::new(),
         }
@@ -106,6 +111,10 @@ impl Space {
     pub(crate) fn restart(&mut self) {
         self.runs = [Run::default(); 2];
         self.holes.clear();
+        #[cfg(test)]
+        {
+            self.freed = 0;
+        }
     }
 
     /// A free page, which becomes used: for a short-lived page, a hole the write
@@ -195,6 +204,10 @@ impl Space {
     pub(crate) fn free(&mut self, page: u64) {
         self.unmark(page);
         self.holes.push(page);
+        #[cfg(test)]
+        {
+            self.freed += 1;
+        }
     }
 
     fn unmark(&mut self, page: u64) {
