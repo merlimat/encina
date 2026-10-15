@@ -38,13 +38,12 @@ The costs to accept:
 
 - **Write amplification is per touched leaf.** Copy-on-write means every commit
   (each `write()`, or each group of them, §6) rewrites each leaf that received at
-  least one key. Touched
-  leaves ≤ min(new entries, active ledgers *A*), so a commit writes at most about
-  `max(new entry bytes, A × page size)` plus internal nodes. With *A* = 10,000 and
-  4 KiB pages, that is at most 40 MiB per commit, however few entries each ledger
-  got. Against the entry data written in the same interval (a write-cache flush is
-  hundreds of MB), that is a few percent. **Big batches are the operating point**;
-  small, frequent writes are not.
+  least one key. Touched leaves ≤ min(new entries, active ledgers *A*), so a
+  commit writes at most about `max(new entry bytes, A × page size)` plus internal
+  nodes. With *A* = 10,000 and 4 KiB pages, that is at most 40 MiB per commit,
+  however few entries each ledger got. Against the entry data written in the same
+  interval (a write-cache flush is hundreds of MB), that is a few percent. **Big
+  batches are the operating point**; small, frequent writes are not.
 - **Random inserts are the worst case**, since every key touches a different leaf.
   That is not this workload.
 - **Copy-on-write scatters leaves on disk**, so long scans are not physically
@@ -695,7 +694,8 @@ complete without suspending.
 - **Allocation tests:** a counting global allocator asserts that `get` and
   iteration over cached pages, `get` and iteration that miss the cache (reading
   ahead included), and `write` with a reused batch, alone or in a group, all on
-  the simulated disk, perform no allocations. On a real disk, compio adds one per I/O operation.
+  the simulated disk, perform no allocations. On a real disk, compio adds one per
+  I/O operation.
 - **Sanitizers:** CI runs every test under AddressSanitizer, std included, so a
   use of freed memory or a leak fails the run even where the test's own checks
   pass, real files' io_uring path included. One test drops a store while the
