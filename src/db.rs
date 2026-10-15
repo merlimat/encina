@@ -96,6 +96,11 @@ impl Db {
     ///
     /// A new store takes its page size from `opts`; an existing one keeps the page
     /// size it was created with.
+    ///
+    /// A store has one owner at a time: this fails with [`Error::Locked`] while
+    /// another `Db`, in this process or another, has it open. That `Db` lets go
+    /// once it, its clones and its iterators are closed or dropped, and any I/O it
+    /// started has finished.
     pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
         opts.validate()?;
         let (storage, len) = Storage::open(path.as_ref()).await?;
