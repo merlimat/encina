@@ -1,8 +1,9 @@
 # encina — design
 
 > Status: M1 and M2 are implemented: the tree, persistence and the leaf cache.
-> M3, performance, is under way (§12): concurrent misses share one read,
-> iterators read ahead (§8), and nodes whose entries allow it are dense (§5).
+> M3, performance, is under way (§12): writes that queue up share commits (§6),
+> concurrent misses share one read, iterators read ahead (§8), and nodes whose
+> entries allow it are dense (§5).
 
 encina is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. Its first
@@ -36,7 +37,8 @@ The B+tree is the right call for this workload.
 The costs to accept:
 
 - **Write amplification is per touched leaf.** Copy-on-write means every commit
-  (each `write()`) rewrites each leaf that received at least one key. Touched
+  (each `write()`, or each group of them, §6) rewrites each leaf that received at
+  least one key. Touched
   leaves ≤ min(new entries, active ledgers *A*), so a commit writes at most about
   `max(new entry bytes, A × page size)` plus internal nodes. With *A* = 10,000 and
   4 KiB pages, that is at most 40 MiB per commit, however few entries each ledger
@@ -53,10 +55,10 @@ The costs to accept:
 
 | Topic | Decision |
 |---|---|
-| Durability | Each `write()` is an atomic, durable commit: when it returns, the batch is on disk, and readers see it from that moment on. There is no separate flush and no internal WAL: after a crash the store opens at the last completed write, and the caller's journal replays anything newer. |
+| Durability | Each `write()` is atomic and durable: when it returns, the batch is on disk, and readers see it from that moment on. Writes that queue up behind a commit share the next one (§6). There is no separate flush and no internal WAL: after a crash the store opens at the last completed write, and the caller's journal replays anything newer. |
 | Threading | One `!Send` instance per compio thread, no locks or atomics, except in wakers, which Rust requires to be `Send` and `Sync` (§8). Scale by sharding (for example, by ledger id) above the library. |
 | Memory | Bounded from day one and managed entirely by encina: internal nodes stay resident, and leaves live in encina's own leaf cache with a budget, read on demand (§8). No reliance on the OS page cache or `mmap`: the data file is opened for direct I/O (§9). |
-| Allocation | No heap allocation on the data path. Page frames in the leaf cache are the only exception (§8); write batches, cursors and reader bookkeeping reuse their memory. compio itself allocates once per I/O operation, so cache misses and commits are not allocation-free (§9). |
+| Allocation | No heap allocation on the data path. Page frames in the leaf cache are the only exception (§8); write batches, the batches that groups of writes share, cursors and reader bookkeeping reuse their memory. compio itself allocates once per I/O operation, so cache misses and commits are not allocation-free (§9). |
 | Keys and values | Arbitrary byte strings. Two node formats: slotted, which handles any lengths, and dense, for nodes whose keys share one length and whose values share another, chosen per node when it is built (§5). |
 
 ## 4. Architecture
@@ -95,8 +97,8 @@ write(batch) ─► new version ─► write new pages ─► fsync ─► meta 
   only while that write is in progress, and get their page as they are built. Path
   copying means the parent of a dirty node is always dirty, so the commit finds
   every dirty node by descending through dirty nodes only.
-- **Single writer.** Writes are serialized by an async lock, held for the whole
-  write, including its commit. Reads never take it.
+- **One commit at a time.** Writes that arrive while a commit runs queue up, and
+  the next commit takes them all (§6). Reads never wait for writes.
 
 ## 5. Keys, values and node formats
 
@@ -200,8 +202,8 @@ doesn't allocate. The operations are applied in order and atomically.
 
 Readers keep running while a write waits for the disk. The merge itself doesn't
 yield yet: it is CPU work bounded by the batch, and yielding inside it is planned
-for M3. Doing so is safe: readers keep using the old root until the swap, and the
-lock keeps other writers out.
+for M3. Doing so is safe: readers keep using the old root until the swap, and only
+one commit runs at a time.
 
 **Split policy.** A rebuilt leaf that overflows splits right after each run of
 inserted keys that fills at least a quarter page (the per-ledger append case): the
@@ -212,6 +214,41 @@ get leaves of their own, and whatever follows the last split point is split even
 by bytes. There is no strict 50% minimum fill: a rebuilt node below ~25% merges with
 a neighbor, if the neighbor is in memory. A level's new nodes are only built once
 its merges are decided, so a write builds no node that a merge then replaces.
+
+### Group commit
+
+One commit runs at a time. A write that finds none running, and no write waiting,
+commits its own batch as above. Writes that arrive while a commit runs queue up for
+the next one: each checks its entries' sizes, then appends its batch to the batch
+of the next group, which the store keeps. Once the commit ends, whichever write of
+the group runs first commits the whole group: it normalizes the group's batch,
+which applies the batches in order exactly as if they had been written one after
+another, then plans, merges and commits once. A group of N writes costs one merge,
+one round of page writes and two `sync_data` calls instead of N of each, plus a
+copy of each batch. The other writes return the group's outcome once it is
+published.
+
+- **Order.** Batches apply in the order their writes queued, each atomically: a
+  group commits whole, or not at all.
+- **Size.** A group takes batches until they hold 64 MiB, counting operations and
+  their keys and values. A write that doesn't fit waits for the next group, unless
+  its batch would be the group's first. The store keeps two group batches, the one
+  committing and the one filling, and reuses their memory, so once warmed up,
+  queueing allocates nothing.
+- **Errors.** A batch with an entry too large is rejected before it queues,
+  alone. Any other error fails every write in the group: before the commit, it
+  leaves the store unchanged; during it, the store fails (§7).
+- **Cancellation.** The group holds a copy of each batch, never a reference to a
+  caller's. Dropping a write withdraws its batch while the write waits, and while
+  its group is being built: the write building it then starts over without that
+  batch, since leaves the batch's ranges covered may now be needed. Once the group
+  writes pages, its batches commit together, whichever of its writes are dropped.
+  Dropping the write committing them then fails the store, as it does for a single
+  write, and its group's other writes return `Error::Failed`. If the write
+  building a group is dropped before it writes anything, another write takes the
+  group over: one of the group's, or one queued for the next group, which then
+  commits its own next. So no write depends on another being polled, except the
+  one committing.
 
 ### `delete_range(start..end)`
 
@@ -241,7 +278,8 @@ nothing.
 
 ### Commit protocol
 
-Every `write()` ends with a commit that makes its batch durable in one atomic step.
+Every `write()` ends with a commit, its own or its group's (§6), that makes its
+batch durable in one atomic step.
 
 1. Seal the new version's dirty nodes: stamp the generation and the checksum. Each
    already has its page, so they can be written in any order.
@@ -252,7 +290,7 @@ Every `write()` ends with a commit that makes its batch durable in one atomic st
 3. Write the meta page into slot `(gen + 1) % 2`, then `sync_data`. The commit is
    durable.
 4. Publish the new root. The written leaves become evictable, and the pages this
-   write dropped become reusable, subject to §8.
+   write dropped become reusable, subject to §8. The group's other writes return.
 5. If an eighth of the file or more lies past the high-water mark that the meta
    page recorded, cut the file there (`set_len`). Only that meta page, which is
    durable, still matters, and no version a reader holds uses a page past the
@@ -273,10 +311,11 @@ the rest of that I/O has finished, the batch is dropped, its pages return to the
 free set, and `write()` returns the error, leaving the store as it was. If a
 `sync_data` or the meta page write fails, what reached the disk is unknown, so the
 instance enters a failed state: reads keep serving the last published version,
-writes return `Error::Failed`, and the store must be reopened. Dropping a `write()`
-future is harmless until it starts writing pages; after that, it also puts the
-instance in the failed state, even while it only cuts the file: a cut still in
-flight could cut what a later write adds.
+writes return `Error::Failed`, and the store must be reopened. Every write in a
+group gets the error. Dropping the `write()` future that is committing is harmless
+until it starts writing pages; after that, it also puts the instance in the failed
+state, even while it only cuts the file: a cut still in flight could cut what a
+later write adds. Dropping any other write is harmless (§6).
 
 ### File layout (format v1)
 
@@ -504,8 +543,9 @@ pub struct Db { /* Rc<Inner> */ }
 impl Db {
     pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db>;
     /// Applies `batch` atomically and durably: once this returns `Ok`, the batch is
-    /// on disk and visible to reads. Fails with `Error::EntryTooLarge`, applying
-    /// nothing, if an entry is too large (§5).
+    /// on disk and visible to reads. Writes that queue up behind a commit share the
+    /// next one (§6). Fails with `Error::EntryTooLarge`, applying nothing, if an
+    /// entry is too large (§5).
     pub async fn write(&self, batch: &mut WriteBatch) -> Result<()>;
     /// Finds the entry matching `key` under `cmp` and calls `f` with its key and
     /// value, returning whatever `f` returns. The slices are only valid inside `f`,
@@ -599,11 +639,13 @@ complete without suspending.
   Each failure scenario first runs once to count its I/O operations, then reruns
   once per operation with an error injected there, and once more with a crash. One
   scenario reads leaves back through a tiny cache; another moves pages out of
-  mostly free windows and cuts the file. After each run, a store left usable
-  must pass the invariant checker, one left failed must reject writes, and
-  reopening must yield the state after the last successful write (or after the
-  failed one, when the failure hit a commit). Tests also fail each read of an open
-  in turn: that open fails with `Error::Io`, and the next one works.
+  mostly free windows and cuts the file; a third writes in groups, so that
+  failures hit groups before and during their commits. After each run, a store
+  left usable must pass the invariant checker, one left failed must reject writes,
+  and reopening must yield the state after the last successful write (or after the
+  failed one, or its whole group, when the failure hit a commit). Tests also fail
+  each read of an open in turn: that open fails with `Error::Io`, and the next one
+  works.
   This enumerates every failure point instead of sampling them; the scenario's
   reads include scans, so failures hit reads ahead too. CI measures coverage on
   every pull request (`cargo llvm-cov`), posts the totals as a status, and lists
@@ -616,8 +658,22 @@ complete without suspending.
   again, that a read survives as long as some reader holds it, that a failed read
   reaches the reader that claims it, and that a cancelled read's frame is only
   reused once the read finishes. They also hold a write's leaf read while a second
-  write waits for the write lock: when the first then fails its commit, the second
-  gets `Error::Failed`.
+  write queues up: when the first then fails its commit, the second gets
+  `Error::Failed`.
+- **Group commit:** the simulated disk can also hold syncs and cuts, so that writes
+  queue up behind a commit. Tests check that a group commits once, applying its
+  batches in order, a later batch's puts and ranges overriding an earlier one's;
+  that a batch with an entry too large is rejected alone; that an error before the
+  commit fails the whole group and leaves the store as it was, and one during it
+  fails the store, leaving all of the group or none after reopening; and that a
+  group holds what fits. They drop writes at every stage: while queued or waiting
+  for room, which withdraws them; while their group is built, which makes the
+  write building it start over, with a leaf it hadn't needed before; the write
+  building, whose group another write takes over, one queued for the next group
+  included; while the group commits, which commits them anyway; and the write
+  committing, while it syncs or cuts the file. The model-based property tests also
+  write groups, dropping some of their writes, and a test on a real file checks
+  that eight concurrent writes take two commits.
 - **Damage:** a flipped bit in a leaf fails the reads that need it, and one in an
   internal node fails the open, both with `Error::Corruption`, as does a child
   reference past the end of the file or to a page already used. A flipped bit in
@@ -638,8 +694,8 @@ complete without suspending.
   its page write is in flight leaves the store failed until it reopens.
 - **Allocation tests:** a counting global allocator asserts that `get` and
   iteration over cached pages, `get` and iteration that miss the cache (reading
-  ahead included), and `write` with a reused batch, all on the simulated disk,
-  perform no allocations. On a real disk, compio adds one per I/O operation.
+  ahead included), and `write` with a reused batch, alone or in a group, all on
+  the simulated disk, perform no allocations. On a real disk, compio adds one per I/O operation.
 - **Sanitizers:** CI runs every test under AddressSanitizer, std included, so a
   use of freed memory or a leak fails the run even where the test's own checks
   pass, real files' io_uring path included. One test drops a store while the
@@ -659,7 +715,7 @@ complete without suspending.
    at the end of `write()`, open and recovery, free bitmap, leaf cache with budget
    and eviction, snapshot-aware page reuse, failure-path tests.
 3. **M3, performance:** group commit (writes that queue up during a commit share
-   the next one), the dense node format (done, §5), yielding inside
+   the next one, done, §6), the dense node format (done, §5), yielding inside
    large merges, writing large batches' new leaves early, one shared read for
    concurrent misses and reading ahead in iterators (done, §8), coverage measured
    in CI (done, §11), and benchmarks against RocksDB.
