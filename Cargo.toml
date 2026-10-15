@@ -1,6 +1,8 @@
 [package]
 name = "encina"
-version = "0.1.0"
+# The release workflow publishes the version its tag names. See
+# .github/workflows/release.yml.
+version = "0.0.0-dev"
 edition = "2024"
 rust-version = "1.99"
 description = "Embedded ordered key-value store built on the compio runtime"

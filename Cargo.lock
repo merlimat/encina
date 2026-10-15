@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "encina"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "compio",
  "crc32c",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "encina-cli"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "clap",
  "compio",

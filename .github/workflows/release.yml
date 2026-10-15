@@ -1,0 +1,32 @@
+name: Release
+
+# Pushing a tag like v0.1.0 publishes encina and encina-cli at version 0.1.0. The
+# tag sets the version: the manifests keep 0.0.0-dev.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Set the version from the tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sed -i "s/\"0\.0\.0-dev\"/\"$version\"/" Cargo.toml cli/Cargo.toml
+          # Both crates must now carry the tag's version, or nothing is published.
+          cargo metadata --no-deps --format-version 1 |
+            jq -e --arg v "$version" 'all(.packages[]; .version == $v)'
+      # encina first, then encina-cli, which depends on it.
+      - run: cargo publish --workspace --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

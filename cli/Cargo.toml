@@ -1,13 +1,14 @@
 # The encina command. See README.md.
 [package]
 name = "encina-cli"
-version = "0.1.0"
+version = "0.0.0-dev"
 edition = "2024"
 rust-version = "1.99"
 description = "Puts, gets and scans the entries of an encina store"
 license = "Apache-2.0"
 repository = "https://github.com/merlimat/encina"
-publish = false
+keywords = ["database", "key-value", "cli"]
+categories = ["command-line-utilities", "database"]
 
 [[bin]]
 name = "encina"
@@ -18,7 +19,8 @@ doc = false
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 compio = "0.19.2"
-encina = { path = ".." }
+# The release workflow sets this version along with the crates' own.
+encina = { path = "..", version = "0.0.0-dev" }
 
 [dev-dependencies]
 compio = { version = "0.19.2", features = ["macros"] }
