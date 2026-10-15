@@ -23,7 +23,7 @@ use std::path::Path;
 use std::pin::pin;
 use std::rc::Rc;
 use std::slice;
-use std::task::{Context, Poll, Waker, ready};
+use std::task::{Context, Poll, ready};
 
 use crate::batch::WriteBatch;
 use crate::cache::Cache;
@@ -36,6 +36,7 @@ use crate::reads::{Claim, Reads};
 use crate::space::Space;
 use crate::storage::{PageRead, Storage};
 use crate::tree::{Cursor, Find, Pages, Root, Tree, Version};
+use crate::writes::{Turn, Writes};
 
 /// How many reads or writes a write or an open keeps in flight, and how many
 /// leaves an iterator reads ahead.
@@ -78,7 +79,8 @@ struct Inner {
     /// Leaf reads in flight, which readers needing the same page share.
     reads: RefCell<Reads>,
     storage: Storage,
-    writer: WriteLock,
+    /// The writes committing or waiting to, which share commits.
+    writes: RefCell<Writes>,
     /// Set when an I/O error left it unknown whether a write reached the disk.
     failed: Cell<bool>,
     /// Pages the file may hold: it has grown to this length at most.
@@ -171,7 +173,7 @@ impl Db {
             tree: RefCell::new(Tree::new(pages, page_size, root, meta.generation)),
             reads: RefCell::new(Reads::default()),
             storage,
-            writer: WriteLock::default(),
+            writes: RefCell::new(Writes::new()),
             failed: Cell::new(false),
             file_end: Cell::new(len.div_ceil(page_size as u64).max(meta::META_PAGES)),
             read_only,
@@ -188,73 +190,50 @@ impl Db {
     /// Applies `batch` atomically and durably: once this returns `Ok`, the batch is
     /// on disk and visible to reads.
     ///
+    /// Writes that arrive while another commits share the next commit: their
+    /// batches apply in the order the writes arrived, each atomically, and one
+    /// commit makes them all durable.
+    ///
     /// Fails with [`Error::EntryTooLarge`], applying nothing, if a put's key plus
     /// value exceeds [`Options::max_entry_size`]. An I/O error before the commit
     /// also leaves the store unchanged. One during the commit leaves it unknown
     /// whether the batch is durable, and makes this and later writes fail with
-    /// [`Error::Failed`] until the store is reopened; dropping the future
-    /// mid-commit does the same. The batch is left as it was, ready to be cleared
-    /// and reused.
+    /// [`Error::Failed`] until the store is reopened. Writes that share a commit
+    /// share its outcome.
+    ///
+    /// Dropping the future withdraws the batch while it waits, and until its
+    /// commit starts writing pages. After that, the batch commits with the rest,
+    /// and if this write was the one committing them, the store fails as above.
+    /// The batch is left as it was, ready to be cleared and reused.
     pub async fn write(&self, batch: &mut WriteBatch) -> Result<()> {
         let inner = &*self.inner;
         if inner.failed.get() {
             return Err(Error::Failed);
         }
-        batch.prepare(inner.max_entry)?;
-        let _writer = inner.writer.lock().await;
-        if inner.failed.get() {
-            return Err(Error::Failed);
-        }
-        let mut guard = WriteGuard {
-            inner,
-            stage: Stage::Building,
-        };
-
-        // Load the leaves the batch changes, keeping them in the cache.
-        inner.tree.borrow_mut().plan(batch);
-        let touched = inner.tree.borrow().touched.len();
-        for start in (0..touched).step_by(IO_WINDOW) {
-            let loads: [_; IO_WINDOW] = array::from_fn(|i| {
-                let page = inner.tree.borrow().touched.get(start + i).copied();
-                page.map(|page| load_leaf(inner, page))
-            });
-            let mut error = None;
-            for loaded in join(loads).await.into_iter().flatten() {
-                match loaded {
-                    Ok(frame) => inner.tree.borrow_mut().pinned.push(frame),
-                    Err(e) => error = error.or(Some(e)),
-                }
-            }
-            if let Some(e) = error {
-                return Err(e);
+        batch.check(inner.max_entry)?;
+        // Wait for the commit in progress, if any. Then this write commits, alone
+        // or with the writes that queued alongside it, or another of them does.
+        let mut queued = Queued { inner, slot: None };
+        loop {
+            let (group, slot) = match poll_fn(|cx| queued.poll(cx, batch)).await {
+                Turn::Alone => (false, None),
+                Turn::Lead(slot) => (true, slot),
+                Turn::Done(result) => return result,
+            };
+            let mut guard = WriteGuard {
+                inner,
+                stage: Stage::Building,
+                group,
+                slot,
+                delivered: false,
+            };
+            let result = commit(inner, &mut guard, batch).await;
+            guard.deliver(&result);
+            // A write that took over a group without its batch waits for its own.
+            if !group || slot.is_some() {
+                return result;
             }
         }
-
-        // Build the new version.
-        if !inner.tree.borrow_mut().apply(batch) {
-            return Ok(());
-        }
-        let generation = inner.tree.borrow().current().generation + 1;
-        inner.tree.borrow_mut().seal_pending(generation);
-
-        // Commit: write the new nodes, sync, then switch the meta page and sync.
-        let meta = inner.tree.borrow().pending_meta(generation);
-        inner
-            .file_end
-            .set(inner.file_end.get().max(meta.high_water));
-        guard.stage = Stage::Writing;
-        let written = write_dirty(inner).await;
-        guard.stage = Stage::Building;
-        written?;
-        guard.stage = Stage::Committing;
-        inner.storage.sync().await?;
-        write_meta(inner, &meta).await?;
-        inner.storage.sync().await?;
-        inner.tree.borrow_mut().publish(generation);
-        guard.stage = Stage::Cutting;
-        shrink(inner, meta.high_water).await;
-        guard.stage = Stage::Done;
-        Ok(())
     }
 
     /// Finds the entry matching `key` under `cmp` and calls `f` with its key and
@@ -415,12 +394,19 @@ impl Db {
         self.inner.failed.get()
     }
 
-    /// Checks the tree, and that no read is held: only valid while no reader or
-    /// write is in progress.
+    /// Sets the memory the batches of a group of writes may take.
+    #[cfg(test)]
+    pub(crate) fn set_group_limit(&self, limit: usize) {
+        self.inner.writes.borrow_mut().set_limit(limit);
+    }
+
+    /// Checks the tree, and that no read is held and no write waits: only valid
+    /// while no reader or write is in progress.
     #[cfg(test)]
     pub(crate) fn check(&self) {
         self.tree().check();
         assert!(self.inner.reads.borrow().is_idle(), "reads still held");
+        assert!(self.inner.writes.borrow().is_idle(), "writes still waiting");
     }
 }
 
@@ -657,6 +643,109 @@ async fn load_internal(storage: &Storage, pages: &mut Pages, meta: &Meta) -> Res
     }))
 }
 
+/// Commits the batch of a write that commits alone, or the group of writes that
+/// `guard` leads.
+async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatch) -> Result<()> {
+    if inner.failed.get() {
+        return Err(Error::Failed);
+    }
+    let group = guard.group;
+    loop {
+        // Load the leaves the batch changes, keeping them in the cache.
+        {
+            let mut writes = inner.writes.borrow_mut();
+            let batch = if group { writes.group() } else { &mut *batch };
+            batch.prepare();
+            inner.tree.borrow_mut().plan(batch);
+        }
+        let touched = inner.tree.borrow().touched.len();
+        for start in (0..touched).step_by(IO_WINDOW) {
+            let loads: [_; IO_WINDOW] = array::from_fn(|i| {
+                let page = inner.tree.borrow().touched.get(start + i).copied();
+                page.map(|page| load_leaf(inner, page))
+            });
+            let mut error = None;
+            for loaded in join(loads).await.into_iter().flatten() {
+                match loaded {
+                    Ok(frame) => inner.tree.borrow_mut().pinned.push(frame),
+                    Err(e) => error = error.or(Some(e)),
+                }
+            }
+            if let Some(e) = error {
+                return Err(e);
+            }
+        }
+        // A write that left the group meanwhile took its batch along: start over.
+        if !inner.writes.borrow_mut().take_changed() {
+            break;
+        }
+        inner.tree.borrow_mut().unpin_touched();
+    }
+
+    // Build the new version. From here on, the group's writes can't leave it.
+    let changed = {
+        let mut writes = inner.writes.borrow_mut();
+        let batch = if group { writes.group() } else { &mut *batch };
+        let changed = inner.tree.borrow_mut().apply(batch);
+        if group {
+            writes.committing();
+        }
+        changed
+    };
+    if !changed {
+        return Ok(());
+    }
+    let generation = inner.tree.borrow().current().generation + 1;
+    inner.tree.borrow_mut().seal_pending(generation);
+
+    // Commit: write the new nodes, sync, then switch the meta page and sync.
+    let meta = inner.tree.borrow().pending_meta(generation);
+    inner
+        .file_end
+        .set(inner.file_end.get().max(meta.high_water));
+    guard.stage = Stage::Writing;
+    let written = write_dirty(inner).await;
+    guard.stage = Stage::Building;
+    written?;
+    guard.stage = Stage::Committing;
+    inner.storage.sync().await?;
+    write_meta(inner, &meta).await?;
+    inner.storage.sync().await?;
+    inner.tree.borrow_mut().publish(generation);
+    // The batches are durable and visible: their writes can return.
+    guard.deliver(&Ok(()));
+    guard.stage = Stage::Cutting;
+    shrink(inner, meta.high_water).await;
+    guard.stage = Stage::Done;
+    Ok(())
+}
+
+/// A write waiting for its turn to commit, with the slot it holds among the
+/// writes waiting, which it lets go of when dropped.
+struct Queued<'a> {
+    inner: &'a Inner,
+    slot: Option<usize>,
+}
+
+impl Queued<'_> {
+    fn poll(&mut self, cx: &mut Context<'_>, batch: &WriteBatch) -> Poll<Turn> {
+        self.inner
+            .writes
+            .borrow_mut()
+            .poll(&mut self.slot, batch, cx)
+    }
+}
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot
+            && let Some(mut writes) = for_drop(&self.inner.writes)
+        {
+            writes.leave(slot);
+        }
+    }
+}
+
 /// Pins the frame holding a leaf page, reading the page in if it isn't cached. A
 /// read of the page already in flight is waited for, not repeated.
 async fn load_leaf(inner: &Inner, page: u64) -> Result<FrameId> {
@@ -887,9 +976,26 @@ enum Stage {
     Done,
 }
 
+/// A write committing, alone or for a group of writes.
 struct WriteGuard<'a> {
     inner: &'a Inner,
     stage: Stage,
+    /// Whether it commits a group of writes, and its slot among them, if the group
+    /// holds its batch.
+    group: bool,
+    slot: Option<usize>,
+    /// Whether the group's writes have their outcome.
+    delivered: bool,
+}
+
+impl WriteGuard<'_> {
+    /// Gives the other writes in the group `result`, the first time.
+    fn deliver(&mut self, result: &Result<()>) {
+        if self.group && !self.delivered {
+            self.inner.writes.borrow_mut().deliver(self.slot, result);
+        }
+        self.delivered = true;
+    }
 }
 
 /// Borrows the tree or the reads for a destructor. While a panic unwinds, they may
@@ -904,7 +1010,9 @@ fn for_drop<T>(cell: &RefCell<T>) -> Option<RefMut<'_, T>> {
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
-        let Some(mut tree) = for_drop(&self.inner.tree) else {
+        let (Some(mut tree), Some(mut writes)) =
+            (for_drop(&self.inner.tree), for_drop(&self.inner.writes))
+        else {
             return;
         };
         match self.stage {
@@ -921,6 +1029,16 @@ impl Drop for WriteGuard<'_> {
             }
             Stage::Cutting => self.inner.failed.set(true),
         }
+        // Dropped before the group's writes had their outcome.
+        if self.group && !self.delivered {
+            if self.stage == Stage::Building {
+                // Nothing was written: the others go ahead without this write.
+                writes.abandon(self.slot);
+            } else {
+                writes.deliver(self.slot, &Err(Error::Failed));
+            }
+        }
+        writes.release();
     }
 }
 
@@ -1253,41 +1371,6 @@ impl Ahead {
             if let Some(slot) = read {
                 self.push(page, slot);
             }
-        }
-    }
-}
-
-/// Lets one write run at a time.
-#[derive(Default)]
-struct WriteLock {
-    locked: Cell<bool>,
-    waiters: RefCell<Vec<Waker>>,
-}
-
-impl WriteLock {
-    async fn lock(&self) -> WriteLockGuard<'_> {
-        poll_fn(|cx| {
-            if self.locked.replace(true) {
-                self.waiters.borrow_mut().push(cx.waker().clone());
-                Poll::Pending
-            } else {
-                Poll::Ready(())
-            }
-        })
-        .await;
-        WriteLockGuard(self)
-    }
-}
-
-struct WriteLockGuard<'a>(&'a WriteLock);
-
-impl Drop for WriteLockGuard<'_> {
-    fn drop(&mut self) {
-        self.0.locked.set(false);
-        // Wake every waiter, in case some of their futures are gone: one gets the lock.
-        let waiters = mem::take(&mut *self.0.waiters.borrow_mut());
-        for waker in waiters {
-            waker.wake();
         }
     }
 }

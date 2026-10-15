@@ -96,6 +96,7 @@ mod sim;
 mod space;
 mod storage;
 mod tree;
+mod writes;
 
 #[cfg(test)]
 mod alloc_tests;

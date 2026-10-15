@@ -15,9 +15,10 @@
 //! A simulated disk for tests. It can fail any single operation, or crash during
 //! one: then only what was synced survives, plus whichever pages written since
 //! happen to have landed, with the write in progress torn. It can also hold leaf
-//! reads in flight until a test releases them.
+//! reads in flight, or syncs and cuts, until a test releases them.
 
 use std::cell::RefCell;
+use std::future::poll_fn;
 use std::io;
 use std::rc::Rc;
 use std::slice;
@@ -56,7 +57,9 @@ struct Disk {
     /// While holding, reads numbered `released` or later wait for a release.
     holding: bool,
     released: u64,
-    /// Reads waiting for a release.
+    /// While holding syncs and cuts, how many more may start before the rest wait.
+    syncs_allowed: Option<u64>,
+    /// Reads, syncs and cuts waiting for a release.
     waiting: Vec<Waker>,
     /// The buffers of held reads that were cancelled, with their operation
     /// numbers. Like a kernel, the disk keeps them until the read finishes.
@@ -188,6 +191,48 @@ impl SimDisk {
         disk.finish_held();
     }
 
+    /// Makes syncs and cuts wait before they start, until released.
+    pub(crate) fn hold_syncs(&self) {
+        self.0.borrow_mut().syncs_allowed = Some(0);
+    }
+
+    /// Lets the next `n` syncs or cuts held start, and keeps holding the rest.
+    pub(crate) fn allow_syncs(&self, n: u64) {
+        let mut disk = self.0.borrow_mut();
+        disk.syncs_allowed = disk.syncs_allowed.map(|allowed| allowed + n);
+        for waker in disk.waiting.drain(..) {
+            waker.wake();
+        }
+    }
+
+    /// Lets every sync and cut start, and stops holding them.
+    pub(crate) fn release_syncs(&self) {
+        let mut disk = self.0.borrow_mut();
+        disk.syncs_allowed = None;
+        for waker in disk.waiting.drain(..) {
+            waker.wake();
+        }
+    }
+
+    /// Waits while syncs and cuts are held.
+    async fn unheld(&self) {
+        poll_fn(|cx| {
+            let mut disk = self.0.borrow_mut();
+            match disk.syncs_allowed {
+                Some(0) => {
+                    disk.waiting.push(cx.waker().clone());
+                    Poll::Pending
+                }
+                Some(allowed) => {
+                    disk.syncs_allowed = Some(allowed - 1);
+                    Poll::Ready(())
+                }
+                None => Poll::Ready(()),
+            }
+        })
+        .await;
+    }
+
     /// Starts a leaf read: returns its operation number and outcome.
     fn start_read(&self) -> (u64, io::Result<()>) {
         let op = self.ops();
@@ -245,13 +290,15 @@ impl SimDisk {
     }
 
     /// Cuts the disk at `len` bytes. Until a sync, a crash may undo it.
-    pub(crate) fn set_len(&self, len: u64) -> io::Result<()> {
+    pub(crate) async fn set_len(&self, len: u64) -> io::Result<()> {
+        self.unheld().await;
         self.begin(None)?;
         self.0.borrow_mut().current.resize(len as usize, 0);
         Ok(())
     }
 
-    pub(crate) fn sync(&self) -> io::Result<()> {
+    pub(crate) async fn sync(&self) -> io::Result<()> {
+        self.unheld().await;
         self.begin(None)?;
         let mut disk = self.0.borrow_mut();
         let Disk {

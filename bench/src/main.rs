@@ -19,10 +19,16 @@
 //! A run benchmarks one engine, in a process of its own so that the CPU time, disk
 //! traffic and memory it reports are that engine's alone. See README.md.
 
+use std::cell::RefCell;
 use std::fs;
+use std::future::{Future, poll_fn};
 use std::hint::black_box;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process;
+use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use encina::Comparison;
@@ -36,6 +42,7 @@ Creates the store at DIR/encina or DIR/rocksdb, which must not exist yet.
   --entries N    entries each batch appends to each ledger (100)
   --batches N    batches to write (100)
   --rollover N   batches after which the ledgers close and new ones open (10)
+  --writers N    writers, each appending to its share of the ledgers (1)
   --reads N      lookups in each get and floor phase (1000000)
   --cache-mb N   memory for cached pages or blocks, in MiB (512)";
 
@@ -55,9 +62,9 @@ fn main() {
     });
 }
 
-async fn run(cfg: &Config, mut store: impl Store) {
+async fn run(cfg: &Config, store: impl Store) {
     println!(
-        "{}: {} entries in {} batches of {} ledgers x {} entries, new ledgers every {} batches, {} MiB cache",
+        "{}: {} entries in {} batches of {} ledgers x {} entries, new ledgers every {} batches, {} MiB cache{}",
         cfg.engine.name(),
         cfg.batches * cfg.ledgers * cfg.entries,
         cfg.batches,
@@ -65,6 +72,10 @@ async fn run(cfg: &Config, mut store: impl Store) {
         cfg.entries,
         cfg.rollover,
         cfg.cache >> 20,
+        match cfg.writers {
+            1 => String::new(),
+            n => format!(", {n} writers"),
+        },
     );
     println!(
         "{:<7} {:>11} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>9} {:>9} {:>9}",
@@ -82,32 +93,62 @@ async fn run(cfg: &Config, mut store: impl Store) {
         "size MiB",
     );
     let mut rng = Rng(0x5eed);
-    load(cfg, &mut store).await;
+    load(cfg, &store).await;
     settle(&store).await;
     read(cfg, &store, 0, &mut rng).await;
-    if let Some(first) = delete(cfg, &mut store).await {
+    if let Some(first) = delete(cfg, &store).await {
         read(cfg, &store, first, &mut rng).await;
     }
     println!("peak memory: {:.1} MiB", mib(peak_rss()));
 }
 
 /// Writes the batches, committing each durably. Each appends to every open ledger,
-/// in key order, as BookKeeper's flushes of its write cache do.
-async fn load(cfg: &Config, store: &mut impl Store) {
-    let mut meter = Meter::start(cfg.batches);
-    for batch in 0..cfg.batches {
-        let start = Instant::now();
-        let first = cfg.first_entry(batch);
-        for slot in 0..cfg.ledgers {
-            let ledger = cfg.ledger(batch, slot);
-            for i in 0..cfg.entries {
-                store.put(&key(ledger, first + i), &value(cfg.seq(batch, slot, i)));
+/// in key order, as BookKeeper's flushes of its write cache do. With several
+/// writers, each writes its share of every batch, as a batch of its own, at the
+/// same time as the others.
+async fn load(cfg: &Config, store: &impl Store) {
+    let meter = RefCell::new(Meter::start(cfg.batches * cfg.writers));
+    let writers = (0..cfg.writers).map(|w| {
+        let mut writer = store.writer();
+        let meter = &meter;
+        async move {
+            for batch in 0..cfg.batches {
+                let start = Instant::now();
+                let first = cfg.first_entry(batch);
+                for slot in cfg.slots(w) {
+                    let ledger = cfg.ledger(batch, slot);
+                    for i in 0..cfg.entries {
+                        writer.put(&key(ledger, first + i), &value(cfg.seq(batch, slot, i)));
+                    }
+                }
+                writer.commit().await;
+                meter.borrow_mut().record(start);
             }
         }
-        store.commit().await;
-        meter.record(start);
-    }
-    meter.finish("load", cfg.batches * cfg.ledgers * cfg.entries, store);
+    });
+    join_all(writers.collect()).await;
+    let count = cfg.batches * cfg.ledgers * cfg.entries;
+    meter.into_inner().finish("load", count, store);
+}
+
+/// Runs `futures` together on this task, until they all finish.
+async fn join_all<F: Future<Output = ()>>(futures: Vec<F>) {
+    let mut futures: Vec<Option<Pin<Box<F>>>> =
+        futures.into_iter().map(|f| Some(Box::pin(f))).collect();
+    poll_fn(|cx| {
+        for slot in &mut futures {
+            if let Some(future) = slot
+                && future.as_mut().poll(cx).is_ready()
+            {
+                *slot = None;
+            }
+        }
+        match futures.iter().all(Option::is_none) {
+            true => Poll::Ready(()),
+            false => Poll::Pending,
+        }
+    })
+    .await;
 }
 
 /// Waits for the work the load left in the background, RocksDB's compactions, so
@@ -176,18 +217,19 @@ async fn floor(cfg: &Config, store: &impl Store, first: u64, rng: &mut Rng) {
 /// Deletes the older half of the ledgers, a range per ledger, in one commit.
 /// Returns the first batch whose entries remain, or `None` if there are too few
 /// ledgers to delete any.
-async fn delete(cfg: &Config, store: &mut impl Store) -> Option<u64> {
+async fn delete(cfg: &Config, store: &impl Store) -> Option<u64> {
     let generations = cfg.batches.div_ceil(cfg.rollover) / 2;
     if generations == 0 {
         return None;
     }
     let ledgers = generations * cfg.ledgers;
+    let mut writer = store.writer();
     let mut meter = Meter::start(1);
     let start = Instant::now();
     for ledger in 0..ledgers {
-        store.delete_range(&key(ledger, 0), &key(ledger + 1, 0));
+        writer.delete_range(&key(ledger, 0), &key(ledger + 1, 0));
     }
-    store.commit().await;
+    writer.commit().await;
     meter.record(start);
     meter.finish("delete", ledgers, store);
     Some(generations * cfg.rollover)
@@ -218,6 +260,7 @@ struct Config {
     entries: u64,
     batches: u64,
     rollover: u64,
+    writers: u64,
     reads: u64,
     cache: usize,
 }
@@ -232,6 +275,7 @@ impl Config {
             entries: 100,
             batches: 100,
             rollover: 10,
+            writers: 1,
             reads: 1_000_000,
             cache: 512 << 20,
         };
@@ -253,6 +297,7 @@ impl Config {
                 "--entries" => cfg.entries = number(&value),
                 "--batches" => cfg.batches = number(&value),
                 "--rollover" => cfg.rollover = number(&value),
+                "--writers" => cfg.writers = number(&value),
                 "--reads" => cfg.reads = number(&value),
                 "--cache-mb" => cfg.cache = (number(&value) as usize) << 20,
                 _ => fail(USAGE),
@@ -261,7 +306,15 @@ impl Config {
         let (Some(engine), Some(dir)) = (engine, dir) else {
             fail(USAGE)
         };
+        if cfg.writers > cfg.ledgers {
+            fail("--writers may not exceed --ledgers");
+        }
         Config { engine, dir, ..cfg }
+    }
+
+    /// The slots of the ledgers that writer `w` appends to.
+    fn slots(&self, w: u64) -> Range<u64> {
+        w * self.ledgers / self.writers..(w + 1) * self.ledgers / self.writers
     }
 
     /// The ledger that batch `batch` appends to in slot `slot`.
@@ -336,14 +389,10 @@ fn unpair(bytes: &[u8]) -> (u64, u64) {
 
 /// What the benchmark does with a store.
 trait Store {
-    /// Adds a put to the next commit.
-    fn put(&mut self, key: &[u8], value: &[u8]);
+    type Writer: Writer;
 
-    /// Adds the deletion of the keys in `start..end` to the next commit.
-    fn delete_range(&mut self, start: &[u8], end: &[u8]);
-
-    /// Applies what was added since the last commit, atomically and durably.
-    async fn commit(&mut self);
+    /// A writer, with a batch of its own.
+    fn writer(&self) -> Self::Writer;
 
     /// Waits for the store's background work to finish.
     async fn settle(&self);
@@ -361,9 +410,20 @@ trait Store {
     fn size(&self) -> u64;
 }
 
+/// Writes to a store, a batch at a time.
+trait Writer {
+    /// Adds a put to the next commit.
+    fn put(&mut self, key: &[u8], value: &[u8]);
+
+    /// Adds the deletion of the keys in `start..end` to the next commit.
+    fn delete_range(&mut self, start: &[u8], end: &[u8]);
+
+    /// Applies what was added since the last commit, atomically and durably.
+    async fn commit(&mut self);
+}
+
 struct Encina {
     db: encina::Db,
-    batch: encina::WriteBatch,
     path: PathBuf,
 }
 
@@ -372,13 +432,17 @@ impl Encina {
         let options = encina::Options::new().cache_size(cache);
         Encina {
             db: encina::Db::open(path, options).await.expect("open encina"),
-            batch: encina::WriteBatch::new(),
             path: path.to_owned(),
         }
     }
 }
 
-impl Store for Encina {
+struct EncinaWriter {
+    db: encina::Db,
+    batch: encina::WriteBatch,
+}
+
+impl Writer for EncinaWriter {
     fn put(&mut self, key: &[u8], value: &[u8]) {
         self.batch.put(key, value);
     }
@@ -390,6 +454,17 @@ impl Store for Encina {
     async fn commit(&mut self) {
         self.db.write(&mut self.batch).await.expect("write");
         self.batch.clear();
+    }
+}
+
+impl Store for Encina {
+    type Writer = EncinaWriter;
+
+    fn writer(&self) -> EncinaWriter {
+        EncinaWriter {
+            db: self.db.clone(),
+            batch: encina::WriteBatch::new(),
+        }
     }
 
     /// encina does no work in the background.
@@ -422,9 +497,7 @@ impl Store for Encina {
 }
 
 struct Rocks {
-    db: rocksdb::DB,
-    batch: rocksdb::WriteBatch,
-    sync: rocksdb::WriteOptions,
+    db: Arc<rocksdb::DB>,
     path: PathBuf,
 }
 
@@ -457,18 +530,19 @@ impl Rocks {
         options.set_use_direct_reads(true);
         options.set_use_direct_io_for_flush_and_compaction(true);
 
-        let mut sync = rocksdb::WriteOptions::default();
-        sync.set_sync(true);
         Rocks {
-            db: rocksdb::DB::open(&options, path).expect("open RocksDB"),
-            batch: rocksdb::WriteBatch::default(),
-            sync,
+            db: Arc::new(rocksdb::DB::open(&options, path).expect("open RocksDB")),
             path: path.to_owned(),
         }
     }
 }
 
-impl Store for Rocks {
+struct RocksWriter {
+    db: Arc<rocksdb::DB>,
+    batch: rocksdb::WriteBatch,
+}
+
+impl Writer for RocksWriter {
     fn put(&mut self, key: &[u8], value: &[u8]) {
         self.batch.put(key, value);
     }
@@ -477,9 +551,28 @@ impl Store for Rocks {
         self.batch.delete_range(start, end);
     }
 
+    /// Commits on a thread of its own, since RocksDB blocks: writers that commit
+    /// at the same time then share RocksDB's group commit.
     async fn commit(&mut self) {
         let batch = std::mem::take(&mut self.batch);
-        self.db.write_opt(batch, &self.sync).expect("write");
+        let db = self.db.clone();
+        let write = compio::runtime::spawn_blocking(move || {
+            let mut sync = rocksdb::WriteOptions::default();
+            sync.set_sync(true);
+            db.write_opt(batch, &sync).expect("write");
+        });
+        write.await.expect("the write's thread failed");
+    }
+}
+
+impl Store for Rocks {
+    type Writer = RocksWriter;
+
+    fn writer(&self) -> RocksWriter {
+        RocksWriter {
+            db: self.db.clone(),
+            batch: rocksdb::WriteBatch::default(),
+        }
     }
 
     async fn settle(&self) {

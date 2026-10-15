@@ -38,8 +38,8 @@ Early development. [DESIGN.md](DESIGN.md) covers the design and the milestones:
   comparisons, range iterators, and range deletes.
 - [x] **M2, persistence and caching:** atomic durable commits, recovery, the leaf
   cache, and direct I/O.
-- [ ] **M3, performance:** group commit, a dense node format, and benchmarks against
-  RocksDB.
+- [ ] **M3, performance:** group commit and a dense node format (both done), and
+  benchmarks against RocksDB.
 
 ## Example
 
@@ -107,6 +107,22 @@ compresses its blocks with LZ4, which takes its files from 291 MiB to 110 MiB. e
 doesn't compress, but its dense nodes store what their keys and their values share
 once, so an entry takes about 5 bytes: its pages in use take 87 MiB, and the file's
 other 29 MiB is free pages that later writes reuse.
+
+With `--writers N`, N writers append to their own shares of the ledgers at the same
+time, each committing a batch of its own. In both engines, writes that queue up
+behind a commit share the next one. With 4 or 16 writers, the load runs about as
+fast as with one. With 10 entries per ledger in each batch instead of 100, there
+are ten times as many commits, and the load runs at a third of the rate. Single
+runs of the version that added group commit, with the 512 MiB cache:
+
+| Load with concurrent writers | encina | RocksDB |
+|---|---:|---:|
+| 4 writers, entries/s | 8.84M | 6.29M |
+| 4 writers, p99 batch commit | 20.6 ms | 33.7 ms |
+| 16 writers, entries/s | 8.16M | 5.44M |
+| 16 writers, p99 batch commit | 20.9 ms | 26.1 ms |
+| 8 writers, 1,000 batches of 10 entries per ledger, entries/s | 2.90M | 2.38M |
+| 8 writers, 1,000 batches of 10 entries per ledger, p99 batch commit | 5.7 ms | 6.7 ms |
 
 ## Command-line tool
 

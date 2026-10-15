@@ -18,9 +18,10 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::pin::pin;
 
 use crate::sim::SimDisk;
-use crate::tests::now;
+use crate::tests::{now, poll};
 use crate::{Comparison, Db, Options, WriteBatch};
 
 struct CountingAllocator;
@@ -87,8 +88,12 @@ fn value(i: u64, round: u8) -> [u8; 16] {
 const ENTRIES: u64 = 20_000;
 
 fn fill(batch: &mut WriteBatch, round: u8) {
+    fill_from(batch, 0, round);
+}
+
+fn fill_from(batch: &mut WriteBatch, first: u64, round: u8) {
     batch.clear();
-    for i in 0..ENTRIES {
+    for i in first..first + ENTRIES {
         batch.put(&key(i), &value(i, round));
     }
 }
@@ -163,4 +168,51 @@ fn misses_do_not_allocate() {
     assert_eq!(allocations(scan_all), 0, "scans allocated");
     let leaves = db.tree().leaves().len() as u64;
     assert!(disk.ops() - ops > leaves, "the reads hit the cache");
+}
+
+#[test]
+fn group_commits_do_not_allocate() {
+    let disk = SimDisk::new();
+    let db = now(Db::open_sim(disk.clone(), Options::default())).unwrap();
+    let mut batches: [WriteBatch; 4] = Default::default();
+    let fill_all = |batches: &mut [WriteBatch; 4], round: u8| {
+        for (i, batch) in batches.iter_mut().enumerate() {
+            fill_from(batch, i as u64 * ENTRIES, round);
+        }
+    };
+    // The first write waits for its sync, and the others queue up behind it and
+    // commit together.
+    let write_group = |batches: &mut [WriteBatch; 4]| {
+        let [a, b, c, d] = batches;
+        let start = db.tree().current().generation;
+        disk.hold_syncs();
+        let mut a = pin!(db.write(a));
+        let mut b = pin!(db.write(b));
+        let mut c = pin!(db.write(c));
+        let mut d = pin!(db.write(d));
+        assert!(poll(a.as_mut()).is_pending());
+        assert!(poll(b.as_mut()).is_pending());
+        assert!(poll(c.as_mut()).is_pending());
+        assert!(poll(d.as_mut()).is_pending());
+        disk.release_syncs();
+        for write in [a, b, c, d] {
+            now(write).unwrap();
+        }
+        assert_eq!(db.tree().current().generation, start + 2);
+    };
+    // The first groups grow the frame pool, the scratch space, the groups'
+    // batches, the table of writes waiting, and the page lists of write requests:
+    // commits send more requests at once as the pages they free split up the free
+    // space.
+    for round in 0..10 {
+        fill_all(&mut batches, round);
+        write_group(&mut batches);
+    }
+    fill_all(&mut batches, 10);
+    assert_eq!(
+        allocations(|| write_group(&mut batches)),
+        0,
+        "group commit allocated"
+    );
+    db.check();
 }

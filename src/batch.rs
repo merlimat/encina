@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::mem;
+
 use crate::error::{Error, Result};
 
 /// A group of writes that [`Db::write`](crate::Db::write) applies atomically.
@@ -44,6 +46,8 @@ enum Kind {
     Put,
     Delete,
     DeleteRange,
+    /// An operation of a write that left the group whose batch holds it.
+    Withdrawn,
 }
 
 impl WriteBatch {
@@ -129,11 +133,9 @@ impl WriteBatch {
         &self.ranges
     }
 
-    /// Checks entry sizes and reduces the batch to an equivalent set of ranges to
-    /// remove first and puts and deletes to apply after, at most one per key.
-    pub(crate) fn prepare(&mut self, max_entry: usize) -> Result<()> {
-        let (bytes, ops) = (&self.bytes, &self.ops);
-        for op in ops {
+    /// Checks that no put's key plus value exceeds `max_entry` bytes.
+    pub(crate) fn check(&self, max_entry: usize) -> Result<()> {
+        for op in &self.ops {
             let size = (op.a_len + op.b_len) as usize;
             if op.kind == Kind::Put && size > max_entry {
                 return Err(Error::EntryTooLarge {
@@ -142,6 +144,43 @@ impl WriteBatch {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// The memory its operations take.
+    pub(crate) fn size(&self) -> usize {
+        self.bytes.len() + self.ops.len() * mem::size_of::<Op>()
+    }
+
+    /// Adds the operations of `other` after its own, and returns the range of
+    /// their indexes.
+    pub(crate) fn append(&mut self, other: &WriteBatch) -> (u32, u32) {
+        assert!(
+            self.bytes.len() + other.bytes.len() <= u32::MAX as usize,
+            "write batch larger than 4 GiB"
+        );
+        let shift = self.bytes.len() as u32;
+        let first = self.ops.len() as u32;
+        self.bytes.extend_from_slice(&other.bytes);
+        self.ops.extend(other.ops.iter().map(|op| Op {
+            a: op.a + shift,
+            b: op.b + shift,
+            ..*op
+        }));
+        (first, self.ops.len() as u32)
+    }
+
+    /// Takes the operations with indexes in `start..end` out of the batch.
+    pub(crate) fn withdraw(&mut self, (start, end): (u32, u32)) {
+        for op in &mut self.ops[start as usize..end as usize] {
+            op.kind = Kind::Withdrawn;
+        }
+    }
+
+    /// Reduces the batch to an equivalent set of ranges to remove first and puts
+    /// and deletes to apply after, at most one per key.
+    pub(crate) fn prepare(&mut self) {
+        let (bytes, ops) = (&self.bytes, &self.ops);
         let a = |i: u32| {
             let op = &ops[i as usize];
             slice(bytes, op.a, op.a_len)
@@ -160,7 +199,7 @@ impl WriteBatch {
 
         self.points.clear();
         self.points
-            .extend((0..n).filter(|&i| ops[i as usize].kind != Kind::DeleteRange));
+            .extend((0..n).filter(|&i| matches!(ops[i as usize].kind, Kind::Put | Kind::Delete)));
         self.points
             .sort_unstable_by(|&x, &y| a(x).cmp(a(y)).then(x.cmp(&y)));
         // The last operation on a key wins, unless a range added after it covers the
@@ -194,7 +233,6 @@ impl WriteBatch {
             }
             self.ranges.push((r, r));
         }
-        Ok(())
     }
 }
 
@@ -225,7 +263,7 @@ mod tests {
         batch.delete(b"b");
         batch.put(b"a", b"2");
         batch.delete(b"c");
-        batch.prepare(100).unwrap();
+        batch.prepare();
         assert_eq!(
             points(&batch),
             vec![
@@ -243,7 +281,7 @@ mod tests {
         batch.put(b"b", b"before");
         batch.delete_range(b"a", b"c");
         batch.put(b"b", b"after");
-        batch.prepare(100).unwrap();
+        batch.prepare();
         // "a" was put before the range removed it; "b" was put again after.
         assert_eq!(
             points(&batch),
@@ -261,7 +299,7 @@ mod tests {
         batch.delete_range(b"d", b"e");
         batch.delete_range(b"z", b"y");
         batch.delete_range(b"n", b"o");
-        batch.prepare(100).unwrap();
+        batch.prepare();
         assert_eq!(
             ranges(&batch),
             vec![
@@ -272,15 +310,63 @@ mod tests {
     }
 
     #[test]
+    fn appended_batches_apply_in_order() {
+        let mut first = WriteBatch::new();
+        first.put(b"a", b"1");
+        first.put(b"b", b"1");
+        first.put(b"d", b"1");
+        let mut second = WriteBatch::new();
+        second.delete_range(b"a", b"c");
+        second.put(b"b", b"2");
+        let mut third = WriteBatch::new();
+        third.put(b"d", b"3");
+        third.delete_range(b"x", b"z");
+        let mut group = WriteBatch::new();
+        assert_eq!(group.append(&first), (0, 3));
+        assert_eq!(group.append(&second), (3, 5));
+        assert_eq!(group.append(&third), (5, 7));
+        assert_eq!(group.size(), first.size() + second.size() + third.size());
+        group.prepare();
+        // The second batch's range removes the first's "a" and "b", then puts "b"
+        // back; the third's put of "d" replaces the first's.
+        assert_eq!(
+            points(&group),
+            vec![
+                (b"b".to_vec(), Some(b"2".to_vec())),
+                (b"d".to_vec(), Some(b"3".to_vec()))
+            ]
+        );
+        assert_eq!(
+            ranges(&group),
+            vec![
+                (b"a".to_vec(), b"c".to_vec()),
+                (b"x".to_vec(), b"z".to_vec())
+            ]
+        );
+        // Without the second batch, the first's puts stand.
+        group.withdraw((3, 5));
+        group.prepare();
+        assert_eq!(
+            points(&group),
+            vec![
+                (b"a".to_vec(), Some(b"1".to_vec())),
+                (b"b".to_vec(), Some(b"1".to_vec())),
+                (b"d".to_vec(), Some(b"3".to_vec()))
+            ]
+        );
+        assert_eq!(ranges(&group), vec![(b"x".to_vec(), b"z".to_vec())]);
+    }
+
+    #[test]
     fn oversized_entries_are_rejected() {
         let mut batch = WriteBatch::new();
         batch.put(b"key", &[0; 10]);
         assert!(matches!(
-            batch.prepare(12),
+            batch.check(12),
             Err(Error::EntryTooLarge { size: 13, max: 12 })
         ));
         batch.clear();
         batch.put(b"key", &[0; 9]);
-        batch.prepare(12).unwrap();
+        batch.check(12).unwrap();
     }
 }
