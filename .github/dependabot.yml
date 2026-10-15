@@ -1,0 +1,47 @@
+# Weekly version updates. In each entry, minor and patch bumps share one pull
+# request and major bumps get one each. For a crate below 1.0, Dependabot
+# follows Cargo and counts 0.19 -> 0.20 as a major bump.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # compio is pre-1.0 and an upgrade usually needs code changes, so its
+      # crates get a pull request of their own.
+      compio:
+        patterns: [compio, compio-*]
+      crates:
+        update-types: [minor, patch]
+        exclude-patterns: [compio, compio-*]
+
+  # bench/ and experiments/leaf-layouts/ are workspaces of their own, each with
+  # its own Cargo.lock.
+  - package-ecosystem: cargo
+    directory: /bench
+    schedule:
+      interval: weekly
+    groups:
+      compio:
+        patterns: [compio, compio-*]
+      crates:
+        update-types: [minor, patch]
+        exclude-patterns: [compio, compio-*]
+
+  - package-ecosystem: cargo
+    directory: /experiments/leaf-layouts
+    schedule:
+      interval: weekly
+    groups:
+      crates:
+        update-types: [minor, patch]
+
+  # Covers every workflow in .github/workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        update-types: [minor, patch]
