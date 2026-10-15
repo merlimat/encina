@@ -112,17 +112,17 @@ With `--writers N`, N writers append to their own shares of the ledgers at the s
 time, each committing a batch of its own. In both engines, writes that queue up
 behind a commit share the next one. With 4 or 16 writers, the load runs about as
 fast as with one. With 10 entries per ledger in each batch instead of 100, there
-are ten times as many commits, and the load runs at a third of the rate. Measured
-at the commit that added group commit, with the 512 MiB cache:
+are ten times as many commits, and the load runs at a third of the rate. Single
+runs of the version that added group commit, with the 512 MiB cache:
 
 | Load with concurrent writers | encina | RocksDB |
 |---|---:|---:|
-| 4 writers, entries/s | 6.35M | 6.83M |
-| 4 writers, p99 batch commit | 23.7 ms | 17.4 ms |
-| 16 writers, entries/s | 6.14M | 5.21M |
-| 16 writers, p99 batch commit | 22.3 ms | 27.8 ms |
-| 8 writers, 1,000 batches of 10 entries per ledger, entries/s | 2.09M | 2.34M |
-| 8 writers, 1,000 batches of 10 entries per ledger, p99 batch commit | 8.7 ms | 6.7 ms |
+| 4 writers, entries/s | 8.84M | 6.29M |
+| 4 writers, p99 batch commit | 20.6 ms | 33.7 ms |
+| 16 writers, entries/s | 8.16M | 5.44M |
+| 16 writers, p99 batch commit | 20.9 ms | 26.1 ms |
+| 8 writers, 1,000 batches of 10 entries per ledger, entries/s | 2.90M | 2.38M |
+| 8 writers, 1,000 batches of 10 entries per ledger, p99 batch commit | 5.7 ms | 6.7 ms |
 
 ## Command-line tool
 
