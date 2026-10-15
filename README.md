@@ -75,37 +75,38 @@ location index: 10 million 16-byte keys mapped to 16-byte values, appended in 10
 durable batches, then scanned, looked up at random, and half deleted by range. Both
 engines bypass the OS page cache and get the same cache size. The machine is an Ubuntu
 26.04 VM with 6 aarch64 vCPUs and ext4 on virtio, under UTM on an Apple M5 Pro. Each
-figure is from a single run at commit 7a0e12b, and repeat runs on this VM vary by up to
-40%.
+figure is from a single run of the version that added dense nodes, and repeat runs on
+this VM vary by up to 40%.
 
 | 512 MiB cache: the store fits in memory | encina | RocksDB |
 |---|---:|---:|
-| Load, entries/s | 6.41M | 6.26M |
-| Load, p99 batch commit | 22.2 ms | 18.8 ms |
-| Load, CPU seconds | 1.0 | 2.6, then 1.1 compacting |
-| Load, MiB written | 706 | 493, then 102 compacting |
-| Scan, entries/s | 37.4M | 12.4M |
-| Get, lookups/s | 1.36M | 375K |
-| Floor, lookups/s | 2.68M | 316K |
-| Delete half the ledgers, one commit | 1.7 ms | 3.9 ms |
-| Size on disk, MiB | 347 | 110 |
-| Peak memory, MiB | 335 | 355 |
+| Load, entries/s | 9.88M | 6.65M |
+| Load, p99 batch commit | 17.9 ms | 18.5 ms |
+| Load, CPU seconds | 0.7 | 2.6, then 1.0 compacting |
+| Load, MiB written | 425 | 493, then 102 compacting |
+| Scan, entries/s | 47.4M | 11.9M |
+| Get, lookups/s | 1.73M | 446K |
+| Floor, lookups/s | 3.13M | 322K |
+| Delete half the ledgers, one commit | 1.4 ms | 7.5 ms |
+| Size on disk, MiB | 116 | 110 |
+| Peak memory, MiB | 125 | 349 |
 
 With `--cache-mb 64 --reads 200000`, reads go to disk:
 
 | 64 MiB cache | encina | RocksDB |
 |---|---:|---:|
-| Load, entries/s | 6.34M | 6.37M |
-| Scan, entries/s | 14.5M | 17.3M |
-| Get, lookups/s | 21.1K | 9.75K |
-| Get, KiB read per lookup | 3 | 19 |
-| Floor, lookups/s | 312K | 14.9K |
-| Peak memory, MiB | 89 | 184 |
+| Load, entries/s | 9.87M | 6.31M |
+| Scan, entries/s | 36.3M | 16.2M |
+| Get, lookups/s | 67.7K | 11.5K |
+| Get, KiB read per lookup | 0.9 | 19 |
+| Floor, lookups/s | 899K | 15.3K |
+| Peak memory, MiB | 87 | 183 |
 
 Floor finds a ledger's last entry: the largest key at or below a given one. RocksDB
 compresses its blocks with LZ4, which takes its files from 291 MiB to 110 MiB. encina
-doesn't compress: its pages in use take 285 MiB, and the file's other 62 MiB is free
-pages that later writes reuse.
+doesn't compress, but its dense nodes store what their keys and their values share
+once, so an entry takes about 5 bytes: its pages in use take 87 MiB, and the file's
+other 29 MiB is free pages that later writes reuse.
 
 ## Command-line tool
 
