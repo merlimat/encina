@@ -26,7 +26,7 @@ use proptest::prelude::*;
 
 use crate::pool::Holds;
 use crate::sim::{Fault, SimDisk};
-use crate::{Comparison, Db, Error, Options, WriteBatch};
+use crate::{Comparison, Db, Error, Options, ReadOnlyDb, WriteBatch};
 
 /// Runs a future that must finish without waiting, as everything does on the
 /// simulated disk.
@@ -563,6 +563,126 @@ fn damaged_pages_are_reported() {
     store.disk.flip(root * 256 + 100);
     let opened = now(Db::open_sim(store.disk.restart(), store.opts.clone()));
     assert!(matches!(opened, Err(Error::Corruption { page }) if page == root));
+}
+
+/// Puts keys `0..n`, each with value `round`.
+fn round_of(n: u32, round: u8) -> Vec<Op> {
+    (0..n)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![round; 8]))
+        .collect()
+}
+
+fn view_get(view: &ReadOnlyDb, key: &[u8], cmp: Comparison) -> crate::Result<Option<Entry>> {
+    now(view.get(key, cmp, |k, v| (k.to_vec(), v.to_vec())))
+}
+
+fn view_scan(view: &ReadOnlyDb) -> crate::Result<Vec<Entry>> {
+    let mut iter = view.range(..);
+    let mut entries = Vec::new();
+    while let Some((k, v)) = now(iter.next())? {
+        entries.push((k.to_vec(), v.to_vec()));
+    }
+    Ok(entries)
+}
+
+/// Checks that a read of a read-only view found `expected`, or, if `may_be_stale`,
+/// failed with `Error::Stale`. Returns whether it failed.
+fn is_stale<T: PartialEq + std::fmt::Debug>(
+    found: crate::Result<T>,
+    expected: T,
+    may_be_stale: bool,
+) -> bool {
+    match found {
+        Ok(found) => {
+            assert_eq!(found, expected);
+            false
+        }
+        Err(Error::Stale) if may_be_stale => true,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[test]
+fn a_read_only_view_reads_its_version_until_it_is_overwritten() {
+    // Small caches, so that the view reads its leaves from the disk.
+    let opts = Options::new().page_size(256).cache_size(16 * 256);
+    let store = Store::new(opts.clone());
+    let mut model = Model::new();
+    let ops = round_of(300, 0);
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    let view = now(ReadOnlyDb::open_sim(store.disk.clone(), opts.clone())).unwrap();
+    let mut stale = 0;
+    for round in 1..10 {
+        // Every round replaces every leaf. The owner reuses the pages a write
+        // replaces from its next write on, so the first leaves the view intact.
+        write(&store.db, &round_of(300, round));
+        let may_be_stale = round > 1;
+        stale += usize::from(is_stale(
+            view_scan(&view),
+            expected_scan(&model, ALL),
+            may_be_stale,
+        ));
+        for i in (0..320u32).step_by(7) {
+            let key = i.to_be_bytes();
+            for cmp in COMPARISONS {
+                let found = view_get(&view, &key, cmp);
+                let expected = expected(&model, &key, cmp);
+                stale += usize::from(is_stale(found, expected, may_be_stale));
+            }
+        }
+    }
+    assert!(stale > 0, "the owner never overwrote the view's version");
+    // A new view reads the current version.
+    let view = now(ReadOnlyDb::open_sim(store.disk.clone(), opts)).unwrap();
+    assert_eq!(view_scan(&view).unwrap(), scan(&store.db, ALL));
+}
+
+#[test]
+fn a_read_only_view_of_a_quiet_store_reports_damage() {
+    let opts = Options::new().page_size(256).cache_size(16 * 256);
+    let store = Store::new(opts.clone());
+    write(&store.db, &round_of(300, 0));
+    let (root, leaf) = {
+        let tree = store.db.tree();
+        let root = tree.current().root.unwrap();
+        assert!(root.level > 0);
+        (
+            root.page,
+            tree.descend_first(root, &mut crate::tree::Cursor::new()),
+        )
+    };
+    // The owner has written nothing since the view opened: the page is corrupt.
+    store.disk.flip(leaf * 256 + 100);
+    let view = now(ReadOnlyDb::open_sim(store.disk.clone(), opts.clone())).unwrap();
+    assert!(matches!(view_scan(&view), Err(Error::Corruption { page }) if page == leaf));
+    store.disk.flip(root * 256 + 100);
+    let opened = now(ReadOnlyDb::open_sim(store.disk.clone(), opts)).map(drop);
+    assert!(matches!(opened, Err(Error::Corruption { page }) if page == root));
+}
+
+/// Opening a store reads three meta pages before its tree: the start of slot 0,
+/// then both slots.
+const RECOVER_OPS: u64 = 3;
+
+#[test]
+fn a_read_only_view_overwritten_while_it_opens_is_stale() {
+    let opts = Options::new().page_size(256);
+    let store = Store::new(opts.clone());
+    for round in 0..2 {
+        write(&store.db, &round_of(300, round));
+    }
+    // The view finds this version in the meta, then the owner's later writes,
+    // which reuse its root page, where it reads the tree.
+    let root = store.db.tree().current().root.unwrap().page;
+    let disk = store.disk.restart();
+    for round in 2..4 {
+        write(&store.db, &round_of(300, round));
+    }
+    assert!(store.db.tree().pages().contains(&root));
+    disk.overwrite_at(RECOVER_OPS, &store.disk);
+    let opened = now(ReadOnlyDb::open_sim(disk, opts)).map(drop);
+    assert!(matches!(opened, Err(Error::Stale)), "{opened:?}");
 }
 
 /// Batches that build a few levels on 256-byte pages, then rewrite and delete
@@ -1373,6 +1493,68 @@ async fn a_file_store_has_one_owner_at_a_time() {
     assert_eq!(found.await.unwrap(), Some(b"value".to_vec()));
     drop(db);
     Db::open(&path, Options::default()).await.unwrap();
+}
+
+#[compio::test]
+async fn a_read_only_view_opens_beside_the_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let mut batch = WriteBatch::new();
+    batch.put(b"key", b"value");
+    db.write(&mut batch).await.unwrap();
+
+    // The view takes no lock, and leaves the owner's in place.
+    let view = ReadOnlyDb::open(&path, Options::default()).await.unwrap();
+    let second = Db::open(&path, Options::default()).await.map(drop);
+    assert!(matches!(second, Err(Error::Locked)), "{second:?}");
+
+    // It reads the version it opened, not later writes.
+    batch.clear();
+    batch.put(b"later", b"value");
+    db.write(&mut batch).await.unwrap();
+    let get = |key: &'static [u8]| view.get(key, Comparison::Equal, |_, v| v.to_vec());
+    assert_eq!(get(b"key").await.unwrap(), Some(b"value".to_vec()));
+    assert_eq!(get(b"later").await.unwrap(), None);
+
+    // Nor does it keep another owner out.
+    db.close().await.unwrap();
+    Db::open(&path, Options::default()).await.unwrap();
+    view.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[compio::test]
+async fn a_read_only_view_never_writes() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::{fs, io};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+
+    // It doesn't create a store.
+    let opened = ReadOnlyDb::open(&path, Options::default()).await.map(drop);
+    assert!(
+        matches!(&opened, Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound),
+        "{opened:?}"
+    );
+    assert!(!path.exists());
+    fs::write(&path, b"").unwrap();
+    let opened = ReadOnlyDb::open(&path, Options::default()).await.map(drop);
+    assert!(matches!(opened, Err(Error::InvalidFile(_))), "{opened:?}");
+    assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    fs::remove_file(&path).unwrap();
+
+    // It opens a store it may only read.
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let mut batch = WriteBatch::new();
+    batch.put(b"key", b"value");
+    db.write(&mut batch).await.unwrap();
+    db.close().await.unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+    let view = ReadOnlyDb::open(&path, Options::default()).await.unwrap();
+    let found = view.get(b"key", Comparison::Equal, |_, v| v.to_vec());
+    assert_eq!(found.await.unwrap(), Some(b"value".to_vec()));
+    view.close().await.unwrap();
 }
 
 #[cfg(unix)]

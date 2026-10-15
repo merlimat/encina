@@ -61,6 +61,9 @@ struct Disk {
     /// The buffers of held reads that were cancelled, with their operation
     /// numbers. Like a kernel, the disk keeps them until the read finishes.
     cancelled: Vec<(u64, FrameBuf)>,
+    /// What the disk holds from an operation number on, as if another process
+    /// wrote it meanwhile.
+    overwrite: Option<(u64, Vec<u8>)>,
 }
 
 impl SimDisk {
@@ -96,6 +99,12 @@ impl SimDisk {
         self.0.borrow_mut().fault = Some((op, fault));
     }
 
+    /// Makes the disk hold what `other` holds now from operation number `op` on.
+    pub(crate) fn overwrite_at(&self, op: u64, other: &SimDisk) {
+        let image = other.0.borrow().current.clone();
+        self.0.borrow_mut().overwrite = Some((op, image));
+    }
+
     /// The disk as a restarted machine finds it: after a crash, what the crash
     /// left; otherwise everything written.
     pub(crate) fn restart(&self) -> Rc<SimDisk> {
@@ -118,6 +127,11 @@ impl SimDisk {
         }
         let op = disk.ops;
         disk.ops += 1;
+        if disk.overwrite.as_ref().is_some_and(|&(at, _)| at == op) {
+            let (_, image) = disk.overwrite.take().unwrap();
+            disk.durable.clone_from(&image);
+            disk.current = image;
+        }
         match disk.fault {
             Some((at, fault)) if at == op => {
                 if fault == Fault::Crash {

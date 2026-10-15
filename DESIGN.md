@@ -447,6 +447,19 @@ same 282 MiB.
   corrupting the store. A `flock` lock belongs to the open file rather than to the
   process, so it also stops a second open from another thread of the same process,
   the likely mistake with one instance per thread.
+- **Read-only views.** A `ReadOnlyDb` opens the file read-only and takes no lock,
+  so it can read a store that a `Db` owns, in this process or another. It reads
+  the version that was current when it opened, with a cache of its own. The owner
+  doesn't know about it, so it reuses that version's pages from its second write
+  after the view opens. Every leaf read checks that the page holds a leaf no newer
+  than the current generation, so a reused page is never taken for the one the
+  tree points to. When a view's page fails its checks, the view rereads both meta
+  slots: if the owner has committed since, the error is `Error::Stale`, and a new
+  view reads the current version; otherwise it is `Error::Corruption`. A corrupt
+  page reported as stale is reported as corrupt by the next view, if that view
+  still uses it. Opening a view checks the internal nodes it loads the same way.
+  Views suit inspection and tooling: one that should keep up with a busy owner has
+  to be reopened, since nothing holds back the owner's page reuse for it.
 - All file I/O goes through compio 0.19: `read_at` / `write_at` on `&File`, with
   frames as the owned buffers, `sync_data`, and `set_len` to cut the file. A commit
   writes each run of pages with `write_vectored_at`, whose buffers are the frames
@@ -511,6 +524,25 @@ impl Db {
     pub async fn close(self) -> Result<()>;
 }
 
+/// A read-only view of a store, as of when it opened, which takes no lock (§9).
+#[derive(Clone)]
+pub struct ReadOnlyDb { /* Db */ }
+
+impl ReadOnlyDb {
+    /// Fails with `Error::Stale` if the owner overwrote the version meanwhile.
+    pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<ReadOnlyDb>;
+    /// As `Db::get` and `Db::range`. Once the owner overwrites pages they need,
+    /// they fail with `Error::Stale`.
+    pub async fn get<R>(
+        &self,
+        key: &[u8],
+        cmp: Comparison,
+        f: impl FnOnce(&[u8], &[u8]) -> R,
+    ) -> Result<Option<R>>;
+    pub fn range(&self, range: impl RangeBounds<[u8]>) -> Iter;
+    pub async fn close(self) -> Result<()>;
+}
+
 pub enum Comparison { Equal, Floor, Ceiling, Lower, Higher }
 
 impl Iter {
@@ -560,9 +592,10 @@ complete without suspending.
   reopening must yield the state after the last successful write (or after the
   failed one, when the failure hit a commit).
   This enumerates every failure point instead of sampling them; the scenario's
-  reads include scans, so failures hit reads ahead too. Measuring coverage of
-  error-handling branches in CI (`cargo llvm-cov`), where an uncovered failure path
-  needs a test or a written reason, is planned for M3.
+  reads include scans, so failures hit reads ahead too. CI measures coverage on
+  every pull request (`cargo llvm-cov`), posts the totals as a status, and lists
+  the lines and regions no test runs, such as the error branch of a `?`. An
+  uncovered failure path needs a test or a written reason.
 - **Reads in flight:** the simulated disk can also hold leaf reads until a test
   releases them, and keeps the buffer of a held read that is cancelled, as a kernel
   would. Tests use it to check that concurrent misses share one read, that an
@@ -572,9 +605,17 @@ complete without suspending.
   reused once the read finishes.
 - **Damage:** a flipped bit in a leaf fails the reads that need it, and one in an
   internal node fails the open, both with `Error::Corruption`.
+- **Read-only views:** a view on the owner's simulated disk returns exactly its
+  version while the owner rewrites every leaf, until its reads fail with
+  `Error::Stale`, and never with other entries. Damage in a store the owner hasn't
+  written since is still `Error::Corruption`. The simulated disk can also take
+  another disk's contents at a given operation, as if the owner wrote meanwhile:
+  a view whose internal nodes are overwritten that way while it opens fails with
+  `Error::Stale`.
 - **Real files** cover what the simulated disk doesn't model: reopening, the lock
-  that keeps out a second open, and syncing the directory of a new store, including
-  a directory that can't be synced.
+  that keeps out a second open, syncing the directory of a new store, including
+  a directory that can't be synced, and a read-only view, which opens beside the
+  owner, creates nothing, and opens a file it may only read.
 - **Allocation tests:** a counting global allocator asserts that `get` and
   iteration over cached pages, `get` and iteration that miss the cache (reading
   ahead included), and `write` with a reused batch, all on the simulated disk,
@@ -596,7 +637,7 @@ complete without suspending.
    the next one), the dense node format if benchmarks justify it, yielding inside
    large merges, writing large batches' new leaves early, one shared read for
    concurrent misses and reading ahead in iterators (done, §8), coverage measured
-   in CI, and benchmarks against RocksDB.
+   in CI (done, §11), and benchmarks against RocksDB.
 
 ## Non-goals (for now)
 

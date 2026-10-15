@@ -50,13 +50,21 @@ impl Storage {
     /// Fails with [`Error::Locked`](crate::Error::Locked) if another open of the
     /// file holds the lock, in this process or another.
     pub(crate) async fn open(path: &Path) -> Result<(Storage, u64)> {
-        let file = open_uncached(path).await?;
+        let file = open_uncached(path, true).await?;
         lock(&file)?;
         let len = file.metadata().await?.len();
         if len == 0 {
             // A new file's name is durable only once its directory is synced.
             sync_dir(path).await?;
         }
+        Ok((Storage::File(file), len))
+    }
+
+    /// Opens the existing file at `path` for reading only, without locking it.
+    /// Returns it with its length.
+    pub(crate) async fn open_read_only(path: &Path) -> Result<(Storage, u64)> {
+        let file = open_uncached(path, false).await?;
+        let len = file.metadata().await?.len();
         Ok((Storage::File(file), len))
     }
 
@@ -219,10 +227,10 @@ fn debug_assert_blocks(buf: &FrameBuf, offset: u64) {
 
 /// Opens a file for I/O that bypasses the OS page cache, which would otherwise keep
 /// a second copy of every page: `O_DIRECT` on Linux, where the file system supports
-/// it, and `F_NOCACHE` on macOS.
-async fn open_uncached(path: &Path) -> io::Result<File> {
+/// it, and `F_NOCACHE` on macOS. A writable open creates the file if needed.
+async fn open_uncached(path: &Path, writable: bool) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
+    options.read(true).write(writable).create(writable);
     #[cfg(target_os = "linux")]
     {
         let mut direct = options.clone();
