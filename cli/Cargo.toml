@@ -1,0 +1,25 @@
+# The encina command. See README.md.
+[package]
+name = "encina-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Puts, gets and scans the entries of an encina store"
+license = "Apache-2.0"
+repository = "https://github.com/merlimat/encina"
+publish = false
+
+[[bin]]
+name = "encina"
+path = "src/main.rs"
+# Its docs would take the place of the library's, which has the same name.
+doc = false
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+compio = "0.19.2"
+encina = { path = ".." }
+
+[dev-dependencies]
+compio = { version = "0.19.2", features = ["macros"] }
+tempfile = "3"
