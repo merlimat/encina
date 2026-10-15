@@ -17,8 +17,40 @@
 //! A bitmap tracks which pages are in use. Nothing about it is stored: opening a
 //! store marks the pages its tree reaches. A page that a write replaces stays in
 //! use until no reader of an older version, which might still read it, is left.
+//!
+//! A write takes its pages in order from runs of free pages, so that its commit
+//! writes each run with one request. Free stretches shorter than [`MIN_RUN`] are
+//! skipped, and the file grows instead: they wait until the pages around them are
+//! freed too. Pages likely to be replaced soon and pages likely to stay take
+//! separate runs, so that the pages replaced together are freed together, as
+//! runs again.
 
 use std::collections::VecDeque;
+
+/// The shortest stretch of free pages, short of the end of the file, that a
+/// write allocates from: 64 KiB with 4 KiB pages.
+const MIN_RUN: u64 = 16;
+
+/// How many pages a run at the end of the file spans. Bounding it lets both
+/// [`Life`]s grow the file, each in runs of its own.
+const CHUNK: u64 = 256;
+
+/// How long a page a write allocates is likely to stay in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Life {
+    /// Likely replaced by one of the next writes: internal nodes, and leaves
+    /// that may take more keys.
+    Short = 0,
+    /// Likely to stay: full leaves that a run of appends left behind.
+    Long = 1,
+}
+
+/// A run of free pages that allocation takes pages from, in order: `next..end`.
+#[derive(Clone, Copy, Default)]
+struct Run {
+    next: u64,
+    end: u64,
+}
 
 pub(crate) struct Space {
     used: Vec<u64>,
@@ -26,6 +58,11 @@ pub(crate) struct Space {
     high_water: u64,
     /// No page below this one is free.
     lowest_free: u64,
+    /// The run each [`Life`] allocates from, while a write is in progress.
+    runs: [Run; 2],
+    /// Pages the write in progress allocated and freed again, as when two nodes
+    /// merge: holes in its runs, which its next short-lived pages fill.
+    holes: Vec<u64>,
     /// Pages that published versions replaced, with the generation that replaced
     /// them, oldest first.
     dropped: VecDeque<(u64, u64)>,
@@ -41,6 +78,8 @@ impl Space {
             used: vec![0; high_water.div_ceil(64) as usize],
             high_water,
             lowest_free: 0,
+            runs: [Run::default(); 2],
+            holes: Vec::new(),
             dropped: VecDeque::new(),
             readers: Vec::new(),
         }
@@ -62,30 +101,103 @@ impl Space {
         self.used[(page / 64) as usize] |= 1 << (page % 64);
     }
 
-    /// The lowest free page, which becomes used.
-    pub(crate) fn alloc(&mut self) -> u64 {
-        let mut word = (self.lowest_free / 64) as usize;
-        while word < self.used.len() && self.used[word] == u64::MAX {
-            word += 1;
+    /// Makes the next allocation start over from the lowest free page: each write
+    /// starts with this, so that it reuses what earlier writes freed.
+    pub(crate) fn restart(&mut self) {
+        self.runs = [Run::default(); 2];
+        self.holes.clear();
+    }
+
+    /// A free page, which becomes used: for a short-lived page, a hole the write
+    /// left if any, or else the next free page of the run for `life`. When that
+    /// run is used up, the next stretch of at least [`MIN_RUN`] free pages takes
+    /// over, or else the end of the file.
+    pub(crate) fn alloc(&mut self, life: Life) -> u64 {
+        // A run can take in holes, and a hole can be taken while in a run: both
+        // ways skip the pages the other took.
+        if life == Life::Short {
+            while let Some(page) = self.holes.pop() {
+                if !self.is_used(page) {
+                    self.mark_used(page);
+                    return page;
+                }
+            }
         }
-        let page = if word < self.used.len() {
-            word as u64 * 64 + u64::from(self.used[word].trailing_ones())
-        } else {
-            self.high_water
-        };
+        let (i, other) = (life as usize, self.runs[1 - life as usize]);
+        let run = self.runs[i];
+        let mut page = run.end;
+        if run.next < run.end {
+            page = self.next_free(run.next);
+        }
+        if page >= run.end {
+            let (next, end) = self.find_run(run.end, other);
+            (page, self.runs[i].end) = (next, end);
+        }
+        self.runs[i].next = page + 1;
         if page >= self.high_water {
-            // Extend the file by one page.
             self.high_water = page + 1;
             self.used.resize(self.high_water.div_ceil(64) as usize, 0);
         }
         self.mark_used(page);
-        self.lowest_free = page + 1;
         page
+    }
+
+    /// The first stretch of free pages at or after `from`, outside the `other`
+    /// run, that is at least [`MIN_RUN`] long or reaches the end of the file,
+    /// where it takes [`CHUNK`] pages.
+    fn find_run(&mut self, from: u64, other: Run) -> (u64, u64) {
+        let mut start = self.next_free(from.max(self.lowest_free));
+        if from <= self.lowest_free {
+            self.lowest_free = start;
+        }
+        loop {
+            if (other.next..other.end).contains(&start) {
+                start = self.next_free(other.end);
+                continue;
+            }
+            let mut end = self.next_used(start).unwrap_or(start + CHUNK);
+            if other.next < other.end && other.next > start {
+                end = end.min(other.next);
+            }
+            if end - start >= MIN_RUN || end > self.high_water {
+                return (start, end);
+            }
+            start = self.next_free(end);
+        }
+    }
+
+    /// The first free page at or after `page`. Every page from the high-water
+    /// mark up is free.
+    fn next_free(&self, page: u64) -> u64 {
+        self.find(page, false).unwrap_or(page.max(self.high_water))
+    }
+
+    /// The first used page at or after `page`, if any.
+    fn next_used(&self, page: u64) -> Option<u64> {
+        self.find(page, true)
+    }
+
+    /// The first page at or after `page`, below the high-water mark, that is used
+    /// or free.
+    fn find(&self, page: u64, used: bool) -> Option<u64> {
+        let flip = if used { 0 } else { u64::MAX };
+        let mut word = (page / 64) as usize;
+        let mut bits = (self.used.get(word)? ^ flip) & (u64::MAX << (page % 64));
+        while bits == 0 {
+            word += 1;
+            bits = self.used.get(word)? ^ flip;
+        }
+        Some(word as u64 * 64 + u64::from(bits.trailing_zeros())).filter(|&p| p < self.high_water)
     }
 
     /// Frees a page now. Only for pages no reader can reach and no durable
     /// version uses: those a write allocated but didn't commit.
     pub(crate) fn free(&mut self, page: u64) {
+        self.unmark(page);
+        self.holes.push(page);
+    }
+
+    fn unmark(&mut self, page: u64) {
         debug_assert!(self.is_used(page), "page {page} freed twice");
         self.used[(page / 64) as usize] &= !(1 << (page % 64));
         self.lowest_free = self.lowest_free.min(page);
@@ -119,7 +231,7 @@ impl Space {
                 break;
             }
             self.dropped.pop_front();
-            self.free(page);
+            self.unmark(page);
             freed(page);
         }
     }
@@ -141,19 +253,99 @@ impl Space {
 mod tests {
     use super::*;
 
-    #[test]
-    fn allocates_the_lowest_free_page_and_extends_the_file() {
-        let mut space = Space::new(3);
-        space.mark_used(0);
-        space.mark_used(2);
-        assert_eq!(space.alloc(), 1);
-        assert_eq!(space.alloc(), 3);
-        assert_eq!(space.high_water(), 4);
-        space.free(1);
-        assert_eq!(space.alloc(), 1);
-        for page in 4..200 {
-            assert_eq!(space.alloc(), page);
+    /// Space for `high_water` pages, all used except `free`.
+    fn space_with(high_water: u64, free: impl IntoIterator<Item = u64>) -> Space {
+        let free: Vec<_> = free.into_iter().collect();
+        let mut space = Space::new(high_water);
+        for page in (0..high_water).filter(|page| !free.contains(page)) {
+            space.mark_used(page);
         }
+        space
+    }
+
+    fn alloc_n(space: &mut Space, life: Life, n: u64) -> Vec<u64> {
+        (0..n).map(|_| space.alloc(life)).collect()
+    }
+
+    #[test]
+    fn takes_runs_in_order_and_skips_short_holes() {
+        let run = 30..30 + MIN_RUN;
+        let mut space = space_with(100, (10..10 + MIN_RUN - 1).chain(run.clone()));
+        assert_eq!(
+            alloc_n(&mut space, Life::Short, MIN_RUN),
+            Vec::from_iter(run)
+        );
+        // Then the file grows.
+        assert_eq!(alloc_n(&mut space, Life::Short, 3), [100, 101, 102]);
+        assert_eq!(space.high_water(), 103);
+        // The short hole stays free.
+        assert!(!space.is_used(10));
+    }
+
+    #[test]
+    fn a_short_hole_at_the_end_of_the_file_is_used() {
+        let mut space = space_with(10, 8..10);
+        assert_eq!(alloc_n(&mut space, Life::Short, 4), [8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn each_life_takes_runs_of_its_own() {
+        let mut space = space_with(2, []);
+        assert_eq!(space.alloc(Life::Short), 2);
+        assert_eq!(space.alloc(Life::Long), 2 + CHUNK);
+        assert_eq!(space.alloc(Life::Short), 3);
+        assert_eq!(space.alloc(Life::Long), 3 + CHUNK);
+        // A used-up run at the end of the file moves past the other's.
+        alloc_n(&mut space, Life::Short, CHUNK - 2);
+        assert_eq!(space.alloc(Life::Short), 2 + 2 * CHUNK);
+        // A run takes all of a free stretch: the other life looks further on.
+        let mut space = space_with(1000, (100..100 + 2 * MIN_RUN).chain(500..500 + MIN_RUN));
+        assert_eq!(space.alloc(Life::Short), 100);
+        assert_eq!(space.alloc(Life::Long), 500);
+        assert_eq!(space.alloc(Life::Short), 101);
+    }
+
+    #[test]
+    fn short_lived_pages_fill_the_holes_a_write_leaves() {
+        let mut space = space_with(2, []);
+        assert_eq!(alloc_n(&mut space, Life::Short, 40), Vec::from_iter(2..42));
+        for page in [3, 5, 7] {
+            space.free(page);
+        }
+        let mut filled = alloc_n(&mut space, Life::Short, 3);
+        filled.sort_unstable();
+        assert_eq!(filled, [3, 5, 7]);
+        assert_eq!(space.alloc(Life::Short), 42);
+    }
+
+    #[test]
+    fn a_run_and_the_holes_never_hand_out_a_page_twice() {
+        let mut space = space_with(2, []);
+        alloc_n(&mut space, Life::Short, 40);
+        for page in 10..10 + MIN_RUN + 1 {
+            space.free(page);
+        }
+        // A long-lived run takes the holes in, and a short-lived page takes one
+        // of them back from it.
+        assert_eq!(space.alloc(Life::Long), 10);
+        assert_eq!(space.alloc(Life::Short), 10 + MIN_RUN);
+        let long = alloc_n(&mut space, Life::Long, MIN_RUN - 1);
+        assert_eq!(long, Vec::from_iter(11..10 + MIN_RUN));
+        // The other holes went to the run.
+        assert_eq!(space.alloc(Life::Short), 42);
+    }
+
+    #[test]
+    fn restarting_reuses_what_was_freed() {
+        let mut space = space_with(2, []);
+        let pages = alloc_n(&mut space, Life::Short, MIN_RUN);
+        alloc_n(&mut space, Life::Long, 1);
+        for page in pages {
+            space.free(page);
+        }
+        space.restart();
+        assert_eq!(space.alloc(Life::Long), 2);
+        assert_eq!(space.alloc(Life::Short), 3 + CHUNK);
     }
 
     #[test]
@@ -175,6 +367,6 @@ mod tests {
         space.remove_reader(5);
         space.reclaim(|page| freed.push(page));
         assert_eq!(freed, [7, 8]);
-        assert_eq!(space.alloc(), 7);
+        assert!(!space.is_used(7) && !space.is_used(8));
     }
 }

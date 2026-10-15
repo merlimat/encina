@@ -634,6 +634,106 @@ fn every_single_failure_leaves_a_recoverable_store() {
     }
 }
 
+/// The write requests that writing `pages`, sorted, takes: one per run of adjacent
+/// pages, split where a run outgrows a request.
+fn requests_for(pages: &[u64], max_run: usize) -> u64 {
+    let mut requests = 0;
+    let mut len = 0;
+    for (i, &page) in pages.iter().enumerate() {
+        if i == 0 || page != pages[i - 1] + 1 || len == max_run {
+            requests += 1;
+            len = 0;
+        }
+        len += 1;
+    }
+    requests
+}
+
+#[test]
+fn commits_write_each_run_of_pages_with_one_request() {
+    let store = Store::new(Options::new().page_size(256));
+    let max_run = crate::db::max_run(256);
+    let key = |i: u32| i.to_be_bytes().to_vec();
+    let batches: [Vec<Op>; 4] = [
+        // More pages than one request takes.
+        (0..30_000).map(|i| Op::Put(key(i), vec![1; 8])).collect(),
+        // Scattered updates, into the space the first batch left.
+        (0..30_000)
+            .step_by(37)
+            .map(|i| Op::Put(key(i), vec![2; 8]))
+            .collect(),
+        // Appends, and a range that frees a stretch of pages.
+        (30_000..32_000)
+            .map(|i| Op::Put(key(i), vec![3; 8]))
+            .chain([Op::DeleteRange(key(1_000), key(9_000))])
+            .collect(),
+        // Updates everywhere, which reuse that stretch.
+        (0..32_000)
+            .step_by(5)
+            .map(|i| Op::Put(key(i), vec![4; 8]))
+            .collect(),
+    ];
+    for (n, ops) in batches.iter().enumerate() {
+        let before = store.db.tree().pages();
+        let ops_before = store.disk.ops();
+        write(&store.db, ops);
+        let written: Vec<_> = store
+            .db
+            .tree()
+            .pages()
+            .into_iter()
+            .filter(|page| before.binary_search(page).is_err())
+            .collect();
+        if n == 0 {
+            assert!(written.len() > max_run);
+        }
+        let requests = requests_for(&written, max_run);
+        // The page writes, then a sync, the meta page and a sync.
+        assert_eq!(store.disk.ops() - ops_before, requests + 3, "batch {n}");
+        assert!(
+            4 * requests < written.len() as u64,
+            "batch {n}: {} pages took {requests} requests",
+            written.len()
+        );
+        store.db.tree().check();
+    }
+}
+
+#[test]
+fn a_failed_page_write_leaves_its_pages_to_the_next_write() {
+    // A store whose write fails once, and a twin that takes the same writes.
+    let opts = Options::new().page_size(256);
+    let (mut store, twin) = (Store::new(opts.clone()), Store::new(opts));
+    let mut model = Model::new();
+    let key = |i: u32| i.to_be_bytes().to_vec();
+    for round in 0..6u32 {
+        let ops: Vec<_> = (0..3_000)
+            .map(|i| Op::Put(key(i * 3 + round % 3), vec![round as u8; 8]))
+            .collect();
+        let ops_before = twin.disk.ops();
+        write(&twin.db, &ops);
+        if round == 3 {
+            // The commit's last page write fails, after the others succeeded.
+            let writes = twin.disk.ops() - ops_before - 3;
+            assert!(writes > 1, "the commit takes {writes} page writes");
+            store
+                .disk
+                .inject(store.disk.ops() + writes - 1, Fault::Error);
+            let res = now(store.db.write(&mut batch_of(&ops)));
+            assert!(matches!(res, Err(Error::Io(_))));
+            assert!(!store.db.has_failed());
+            store.db.tree().check();
+        }
+        write(&store.db, &ops);
+        apply(&mut model, &ops);
+        // The retry used the very pages the failed write gave back.
+        assert_eq!(store.db.tree().pages(), twin.db.tree().pages());
+    }
+    store.reopen();
+    store.db.tree().check();
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+}
+
 #[compio::test]
 async fn a_file_store_survives_reopening() {
     let dir = tempfile::tempdir().unwrap();

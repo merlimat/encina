@@ -13,12 +13,13 @@
 // limitations under the License.
 
 //! A simulated disk for tests. It can fail any single operation, or crash during
-//! one: then only what was synced survives, plus whichever unsynced writes happen
-//! to have landed, with the write in progress torn.
+//! one: then only what was synced survives, plus whichever pages written since
+//! happen to have landed, with the write in progress torn.
 
 use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
+use std::slice;
 
 use compio::buf::IoBuf;
 
@@ -41,7 +42,7 @@ struct Disk {
     current: Vec<u8>,
     /// What survives a crash.
     durable: Vec<u8>,
-    /// Writes since the last sync: offset and length.
+    /// Pages written since the last sync: offset and length.
     unsynced: Vec<(usize, usize)>,
     ops: u64,
     fault: Option<(u64, Fault)>,
@@ -89,9 +90,9 @@ impl SimDisk {
         Rc::new(SimDisk(RefCell::new(disk)))
     }
 
-    /// Counts an operation and applies a fault planned for it. `write` is the data
-    /// the operation writes, if any, for tearing.
-    fn begin(&self, write: Option<(usize, &[u8])>) -> io::Result<()> {
+    /// Counts an operation and applies a fault planned for it. `write` is where
+    /// the operation writes and what, if it does, for tearing.
+    fn begin(&self, write: Option<(usize, &[FrameBuf])>) -> io::Result<()> {
         let mut disk = self.0.borrow_mut();
         if disk.crashed.is_some() {
             return Err(io::Error::other("the simulated machine crashed"));
@@ -129,18 +130,32 @@ impl SimDisk {
     }
 
     pub(crate) fn write(&self, buf: FrameBuf, offset: u64) -> (io::Result<()>, FrameBuf) {
-        let (at, data) = (offset as usize, buf.as_init());
-        if let Err(e) = self.begin(Some((at, data))) {
-            return (Err(e), buf);
-        }
+        let res = self.write_pages(slice::from_ref(&buf), offset);
+        (res, buf)
+    }
+
+    /// Writes the pages in `bufs` back to back from `offset`, in one operation.
+    /// Until a sync, each page lands, or not, on its own.
+    pub(crate) fn write_run(
+        &self,
+        bufs: Vec<FrameBuf>,
+        offset: u64,
+    ) -> (io::Result<()>, Vec<FrameBuf>) {
+        let res = self.write_pages(&bufs, offset);
+        (res, bufs)
+    }
+
+    fn write_pages(&self, bufs: &[FrameBuf], offset: u64) -> io::Result<()> {
+        let mut at = offset as usize;
+        self.begin(Some((at, bufs)))?;
         let mut disk = self.0.borrow_mut();
-        if disk.current.len() < at + data.len() {
-            disk.current.resize(at + data.len(), 0);
+        for buf in bufs {
+            let data = buf.as_init();
+            land(&mut disk.current, at, data);
+            disk.unsynced.push((at, data.len()));
+            at += data.len();
         }
-        disk.current[at..at + data.len()].copy_from_slice(data);
-        disk.unsynced.push((at, data.len()));
-        drop(disk);
-        (Ok(()), buf)
+        Ok(())
     }
 
     pub(crate) fn sync(&self) -> io::Result<()> {
@@ -162,16 +177,10 @@ impl SimDisk {
 
 impl Disk {
     /// Records what a crash during operation `op` leaves on disk: what was synced,
-    /// plus a pseudo-random subset of the unsynced writes, plus the first half of
-    /// the write in progress, if any.
-    fn crash(&mut self, op: u64, write: Option<(usize, &[u8])>) {
+    /// plus a pseudo-random subset of the pages written since, plus the first half
+    /// of the write in progress, if any.
+    fn crash(&mut self, op: u64, write: Option<(usize, &[FrameBuf])>) {
         let mut image = self.durable.clone();
-        let land = |image: &mut Vec<u8>, at: usize, data: &[u8]| {
-            if image.len() < at + data.len() {
-                image.resize(at + data.len(), 0);
-            }
-            image[at..at + data.len()].copy_from_slice(data);
-        };
         let mut rng = op.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
         for &(at, len) in &self.unsynced {
             rng ^= rng << 13;
@@ -181,9 +190,25 @@ impl Disk {
                 land(&mut image, at, &self.current[at..at + len]);
             }
         }
-        if let Some((at, data)) = write {
-            land(&mut image, at, &data[..data.len() / 2]);
+        if let Some((mut at, bufs)) = write {
+            let mut left = bufs.iter().map(|b| b.as_init().len()).sum::<usize>() / 2;
+            for buf in bufs.iter().map(FrameBuf::as_init) {
+                if left == 0 {
+                    break;
+                }
+                let landed = left.min(buf.len());
+                land(&mut image, at, &buf[..landed]);
+                (left, at) = (left - landed, at + buf.len());
+            }
         }
         self.crashed = Some(image);
     }
+}
+
+/// Copies `data` into `image` at `at`, growing it if needed.
+fn land(image: &mut Vec<u8>, at: usize, data: &[u8]) {
+    if image.len() < at + data.len() {
+        image.resize(at + data.len(), 0);
+    }
+    image[at..at + data.len()].copy_from_slice(data);
 }
