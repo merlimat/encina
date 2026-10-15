@@ -688,6 +688,30 @@ fn a_read_only_view_of_a_quiet_store_reports_damage() {
     assert!(matches!(opened, Err(Error::Corruption { page }) if page == root));
 }
 
+#[test]
+fn a_read_only_view_is_stale_once_the_owner_cuts_its_pages() {
+    // A small cache, so that the view reads its leaves from the disk.
+    let opts = Options::new().page_size(256).cache_size(16 * 256);
+    let store = Store::new(opts.clone());
+    let batches = moving_scenario();
+    for ops in &batches[..3] {
+        write(&store.db, ops);
+    }
+    let view = now(ReadOnlyDb::open_sim(store.disk.clone(), opts)).unwrap();
+    let leaves = store.db.tree().leaves();
+    // The owner frees the end of the file, and cuts it.
+    for ops in &batches[3..] {
+        write(&store.db, ops);
+    }
+    let end = store.disk.len() / 256;
+    let (_, key) = leaves
+        .iter()
+        .find(|&&(page, _)| page >= end)
+        .expect("a leaf of the view past the end of the file");
+    let found = view_get(&view, key, Comparison::Equal);
+    assert!(matches!(found, Err(Error::Stale)), "{found:?}");
+}
+
 /// Opening a store reads three meta pages before its tree: the start of slot 0,
 /// then both slots.
 const RECOVER_OPS: u64 = 3;
@@ -764,15 +788,27 @@ const CREATE_OPS: u64 = 3;
 fn every_single_failure_leaves_a_recoverable_store() {
     // A small cache, so that writes read leaves back from the disk.
     let opts = Options::new().page_size(256).cache_size(16 * 256);
-    let batches = failure_scenario();
+    check_every_single_failure(&opts, &failure_scenario());
+}
+
+#[test]
+fn every_single_failure_while_moving_or_cutting_leaves_a_recoverable_store() {
+    check_every_single_failure(&Options::new().page_size(256), &moving_scenario());
+}
+
+/// Runs `batches` once per operation they take, with that operation failing, then
+/// once more per operation, with the machine crashing there. Checks that every
+/// time, the store is left usable, or failed, and that it reopens in the state
+/// after the last write that succeeded.
+fn check_every_single_failure(opts: &Options, batches: &[Vec<Op>]) {
     let mut states = vec![Vec::new()];
     let mut model = Model::new();
-    for ops in &batches {
+    for ops in batches {
         apply(&mut model, ops);
         states.push(expected_scan(&model, ALL));
     }
     let clean = SimDisk::new();
-    let (db, done) = try_scenario(&clean, &opts, &batches);
+    let (db, done) = try_scenario(&clean, opts, batches);
     assert_eq!(done, batches.len());
     drop(db);
     let total = clean.ops();
@@ -780,7 +816,7 @@ fn every_single_failure_leaves_a_recoverable_store() {
         for op in 0..total {
             let disk = SimDisk::new();
             disk.inject(op, fault);
-            let (db, done) = try_scenario(&disk, &opts, &batches);
+            let (db, done) = try_scenario(&disk, opts, batches);
             let failed = db.as_ref().is_some_and(Db::has_failed);
             if let Some(db) = &db {
                 if failed {
@@ -811,6 +847,124 @@ fn every_single_failure_leaves_a_recoverable_store() {
             );
         }
     }
+}
+
+/// Batches on 256-byte pages: the first fills windows of 64 pages with leaves, the
+/// second replaces all but one leaf in ten or so, leaving those windows mostly
+/// free, and the third replaces a leaf under each parent, so that the leaves left
+/// behind move. Then the upper half of the keys goes, freeing the end of the file,
+/// which the next write cuts.
+fn moving_scenario() -> Vec<Vec<Op>> {
+    let key = |i: u32| i.to_be_bytes().to_vec();
+    let put = |i: u32, value: u8| Op::Put(key(i), vec![value; 8]);
+    vec![
+        (0..2400).map(|i| put(i, 1)).collect(),
+        (0..2400)
+            .filter(|i| i % 240 >= 30)
+            .map(|i| put(i, 2))
+            .collect(),
+        (0..2400).step_by(50).map(|i| put(i, 3)).collect(),
+        vec![Op::DeleteRange(key(1200), key(2400))],
+        vec![put(0, 4)],
+    ]
+}
+
+/// The windows of 64 pages below the end of the file that hold some pages of the
+/// current version, but few enough for writes to move them.
+fn mostly_free_windows(store: &Store) -> usize {
+    let tree = store.db.tree();
+    let mut used = vec![0u32; tree.pages.space.high_water() as usize / 64];
+    for page in tree.pages().into_iter().chain(0..crate::meta::META_PAGES) {
+        if let Some(n) = used.get_mut(page as usize / 64) {
+            *n += 1;
+        }
+    }
+    let few = 1..=crate::space::MOVE_AT;
+    used.iter().filter(|&&n| few.contains(&n)).count()
+}
+
+#[test]
+fn writes_move_what_they_keep_out_of_mostly_free_windows() {
+    let batches = moving_scenario();
+    // Leaves that aren't cached don't move.
+    for (cache, moves) in [(64 << 20, true), (16 * 256, false)] {
+        let store = Store::new(Options::new().page_size(256).cache_size(cache));
+        let mut model = Model::new();
+        for ops in &batches[..2] {
+            write(&store.db, ops);
+            apply(&mut model, ops);
+        }
+        assert!(mostly_free_windows(&store) > 0);
+        write(&store.db, &batches[2]);
+        apply(&mut model, &batches[2]);
+        assert_eq!(store.db.tree().moves().1 > 0, moves);
+        if moves {
+            assert_eq!(mostly_free_windows(&store), 0);
+        }
+        store.db.tree().check();
+        assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    }
+}
+
+#[test]
+fn writes_move_internal_nodes_too() {
+    let mut store = Store::new(Options::new().page_size(256));
+    let key = |i: u32| i.to_be_bytes().to_vec();
+    let put = |i: u32, value: u8| Op::Put(key(i), vec![value; 8]);
+    let mut model = Model::new();
+    let batches = [
+        // Five levels.
+        (0..12_000).map(|i| put(i, 1)).collect(),
+        // Replaces the nodes above all leaves but the first ones, leaving the
+        // windows of the internal nodes that the first batch wrote mostly free.
+        (1_500..12_000).map(|i| put(i, 2)).collect(),
+        // Its nodes take a run in a window that is mostly free.
+        vec![put(11_999, 3)],
+        // Rebuilds the nodes above the first leaf, which move the internal nodes
+        // they keep out of mostly free windows, one of them with internal children.
+        vec![put(0, 4)],
+    ];
+    for ops in &batches {
+        write(&store.db, ops);
+        apply(&mut model, ops);
+        store.db.tree().check();
+    }
+    assert!(store.db.tree().current().root.unwrap().level >= 3);
+    assert!(store.db.tree().moves().1 > 0);
+    store.reopen();
+    store.db.tree().check();
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+}
+
+#[test]
+fn freeing_the_end_of_the_file_cuts_it() {
+    let mut store = Store::new(Options::new().page_size(256));
+    let batches = moving_scenario();
+    let mut model = Model::new();
+    for ops in &batches[..4] {
+        write(&store.db, ops);
+        apply(&mut model, ops);
+    }
+    let len = store.disk.len();
+    // The next write ends the file at the last page in use.
+    write(&store.db, &batches[4]);
+    apply(&mut model, &batches[4]);
+    let end = store.db.tree().pages.space.high_water() * 256;
+    assert!(end < len * 7 / 8, "{end} of {len} bytes");
+    assert_eq!(store.disk.len(), end);
+    store.reopen();
+    store.db.tree().check();
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    // And grows again from there.
+    let ops: Vec<_> = (5000..7000u32)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![5; 8]))
+        .collect();
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    assert!(store.disk.len() > end);
+    store.reopen();
+    store.db.tree().check();
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
 }
 
 /// The write requests that writing `pages`, sorted, takes: one per run of adjacent
@@ -1505,4 +1659,166 @@ async fn a_new_store_needs_its_directory_synced() {
     batch.put(b"key", b"value");
     db.write(&mut batch).await.unwrap();
     db.close().await.unwrap();
+}
+
+#[compio::test]
+async fn a_file_store_shrinks_once_its_end_is_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+    let len = || std::fs::metadata(&path).unwrap().len();
+    let key = |i: u32| i.to_be_bytes();
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let mut batch = WriteBatch::new();
+    for i in 0..20_000u32 {
+        batch.put(&key(i), &key(i * 2));
+    }
+    db.write(&mut batch).await.unwrap();
+    let full = len();
+    // Deleting the upper keys frees the end of the file, and the next write cuts it.
+    batch.clear();
+    batch.delete_range(&key(5_000), &key(20_000));
+    db.write(&mut batch).await.unwrap();
+    batch.clear();
+    batch.put(&key(0), &key(1));
+    db.write(&mut batch).await.unwrap();
+    assert!(len() < full / 2, "{} of {full} bytes", len());
+    db.close().await.unwrap();
+
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    let mut iter = db.range(..);
+    let mut count = 0u32;
+    while let Some((k, v)) = iter.next().await.unwrap() {
+        let expected = if count == 0 { key(1) } else { key(count * 2) };
+        assert_eq!((k, v), (&key(count)[..], &expected[..]));
+        count += 1;
+    }
+    assert_eq!(count, 5_000);
+    drop(iter);
+    db.close().await.unwrap();
+}
+
+/// xorshift64*: pseudo-random numbers for workloads.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+}
+
+/// What a series of commits cost.
+#[derive(Default)]
+struct Usage {
+    commits: u64,
+    /// Page write requests, and pages written.
+    requests: u64,
+    pages: u64,
+    /// The longest the file got, in pages.
+    peak: u64,
+}
+
+impl Usage {
+    /// Commits `n` batches that `fill` fills on `store`, adding up what they cost.
+    fn commit(&mut self, store: &Store, n: u64, mut fill: impl FnMut(&mut WriteBatch)) {
+        let page_size = store.db.tree().page_size() as u64;
+        let mut batch = WriteBatch::new();
+        for _ in 0..n {
+            batch.clear();
+            fill(&mut batch);
+            let (requests, bytes) = store.disk.written();
+            now(store.db.write(&mut batch)).unwrap();
+            let (requests_after, bytes_after) = store.disk.written();
+            // All but the meta page.
+            self.requests += requests_after - requests - 1;
+            self.pages += (bytes_after - bytes) / page_size - 1;
+            self.commits += 1;
+            self.peak = self.peak.max(store.disk.len() / page_size);
+        }
+    }
+
+    /// Prints what the commits cost, and the file and live pages after them.
+    fn report(&self, name: &str, store: &Store) {
+        let page_size = store.db.tree().page_size() as u64;
+        let live = store.db.tree().pages.space.used_count() as u64;
+        let file = store.disk.len() / page_size;
+        let per_commit = |n: u64| n as f64 / self.commits as f64;
+        println!(
+            "{name:<24} {live:>8} {file:>8} {:>7.2}x {:>7.2}x {:>10.1} {:>10.1}",
+            file as f64 / live as f64,
+            self.peak as f64 / live as f64,
+            per_commit(self.requests),
+            per_commit(self.pages),
+        );
+    }
+}
+
+/// Measures the file's size against the pages in use, and the write requests and
+/// pages written per commit, on the simulated disk with 4 KiB pages and a cache
+/// that holds everything. Run it with
+/// `cargo test --release -- --ignored --nocapture file_size_and_requests`.
+///
+/// - append: the benchmark's load, BookKeeper-shaped (see bench/README.md).
+/// - random: 1M random keys, loaded in batches of 20K, then random updates in
+///   commits of 20K, 1K or 10, two million updates in all. Requests and pages
+///   are per update commit; the peak counts the load too.
+#[test]
+#[ignore]
+fn file_size_and_requests() {
+    let opts = Options::new().cache_size(1 << 30);
+    println!(
+        "{:<24} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
+        "workload", "live", "file", "ratio", "peak", "requests", "pages"
+    );
+
+    let store = Store::new(opts.clone());
+    let mut usage = Usage::default();
+    let (ledgers, entries, rollover) = (1000, 100, 10);
+    let mut n = 0;
+    usage.commit(&store, 100, |batch| {
+        let first = n % rollover * entries;
+        for slot in 0..ledgers {
+            let ledger = n / rollover * ledgers + slot;
+            for entry in first..first + entries {
+                batch.put(&entry_key(ledger, entry), &location(ledger, entry));
+            }
+        }
+        n += 1;
+    });
+    usage.report("append", &store);
+    drop(store);
+
+    for (name, size) in [
+        ("random, 20K per commit", 20_000),
+        ("random, 1K per commit", 1_000),
+        ("random, 10 per commit", 10),
+    ] {
+        let store = Store::new(opts.clone());
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let keys: Vec<_> = (0..1_000_000)
+            .map(|_| entry_key(rng.next(), rng.next()))
+            .collect();
+        let mut chunks = keys.chunks(20_000);
+        let mut load = Usage::default();
+        load.commit(&store, 50, |batch| {
+            for key in chunks.next().unwrap() {
+                batch.put(key, &[0; 16]);
+            }
+        });
+        let mut usage = Usage {
+            peak: load.peak,
+            ..Usage::default()
+        };
+        let mut round = 0u64;
+        usage.commit(&store, 2_000_000 / size, |batch| {
+            round += 1;
+            for _ in 0..size {
+                let key = &keys[(rng.next() % keys.len() as u64) as usize];
+                batch.put(key, &location(round, round));
+            }
+        });
+        usage.report(name, &store);
+    }
 }
