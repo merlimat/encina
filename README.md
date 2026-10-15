@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img src="assets/logo.svg" alt="encina logo" width="160">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/merlimat/encina/main/assets/logo-dark.svg">
+    <img src="https://raw.githubusercontent.com/merlimat/encina/main/assets/logo.svg" alt="encina logo" width="160">
   </picture>
 </p>
 
