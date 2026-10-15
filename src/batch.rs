@@ -47,6 +47,7 @@ enum Kind {
 }
 
 impl WriteBatch {
+    /// Creates an empty batch.
     pub fn new() -> Self {
         Self::default()
     }
@@ -66,7 +67,7 @@ impl WriteBatch {
         self.push(Kind::Delete, key, &[]);
     }
 
-    /// Removes every key in `start..end`.
+    /// Removes every key in `start..end`. If `start >= end`, it removes nothing.
     pub fn delete_range(&mut self, start: &[u8], end: &[u8]) {
         self.push(Kind::DeleteRange, start, end);
     }

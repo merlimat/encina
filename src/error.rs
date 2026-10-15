@@ -20,7 +20,12 @@ use std::fmt;
 pub enum Error {
     /// A put's key plus value exceeds [`Options::max_entry_size`](crate::Options::max_entry_size).
     /// The batch containing it was not applied.
-    EntryTooLarge { size: usize, max: usize },
+    EntryTooLarge {
+        /// The entry's key plus value, in bytes.
+        size: usize,
+        /// The largest key plus value the store accepts, in bytes.
+        max: usize,
+    },
     /// The options are invalid.
     InvalidOptions(&'static str),
     /// The file is not a store this version of encina can open.
@@ -28,7 +33,10 @@ pub enum Error {
     /// Another [`Db`](crate::Db), in this process or another, has the store open.
     Locked,
     /// A page failed its checksum, or doesn't hold the node expected there.
-    Corruption { page: u64 },
+    Corruption {
+        /// The page's number: its offset in the file divided by the page size.
+        page: u64,
+    },
     /// An I/O error.
     Io(std::io::Error),
     /// An earlier I/O error left it unknown whether a write reached the disk. The
@@ -36,6 +44,7 @@ pub enum Error {
     Failed,
 }
 
+/// The result of encina's operations, which fail with an [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl fmt::Display for Error {

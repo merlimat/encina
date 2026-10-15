@@ -58,7 +58,7 @@ db.write(&mut batch).await?;
 // The entry with the largest key at or below "user/9999". `get` lends the key and
 // value to a closure instead of allocating copies.
 let last_user = db
-    .get(b"user/9999", Comparison::Floor, |k, _v| parse_id(k))
+    .get(b"user/9999", Comparison::Floor, |k, _v| String::from_utf8_lossy(k).into_owned())
     .await?;
 
 // A point-in-time scan of every key starting with "user/".
