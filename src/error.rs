@@ -34,6 +34,10 @@ pub enum Error {
     /// An earlier I/O error left it unknown whether a write reached the disk. The
     /// store rejects further writes; reopen it to recover.
     Failed,
+    /// A [`ReadOnlyDb`](crate::ReadOnlyDb) can no longer read its version: the
+    /// store's owner has since overwritten pages of it. Open a new view to read the
+    /// current version.
+    Stale,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -50,6 +54,7 @@ impl fmt::Display for Error {
             Error::Corruption { page } => write!(f, "page {page} is corrupt"),
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::Failed => write!(f, "an earlier I/O error left the store failed; reopen it"),
+            Error::Stale => write!(f, "the version this read-only view reads was overwritten"),
         }
     }
 }
@@ -95,6 +100,10 @@ mod tests {
             (
                 Error::Failed,
                 "an earlier I/O error left the store failed; reopen it",
+            ),
+            (
+                Error::Stale,
+                "the version this read-only view reads was overwritten",
             ),
         ];
         for (e, message) in others {
