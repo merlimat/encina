@@ -2372,7 +2372,8 @@ fn a_group_holds_the_batches_that_fit() {
     let start = generation(&store.db);
     let db = store.db.clone();
     let writes = queue_behind(&store, &first, &mut batches, &db);
-    for write in writes {
+    // The last, which found no room, commits the full group before its own.
+    for write in writes.into_iter().rev() {
         now(write).unwrap();
     }
     assert_eq!(generation(&store.db), start + 3);

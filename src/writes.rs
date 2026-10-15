@@ -140,15 +140,13 @@ impl Writes {
             self.members[s].ops = self.next.append(batch);
             self.next_writes += 1;
         }
-        // With no commit running, the current group, if any, waits for a write to
-        // take it over; otherwise the next group becomes current.
-        if !self.busy && self.members[s].group.is_some() {
-            let own = if self.state == State::Idle {
+        // With no commit running, this write starts one: of the current group, if
+        // one waits for a write to take it over, or else of the next group.
+        if !self.busy {
+            if self.state == State::Idle {
                 self.seal();
-                true
-            } else {
-                self.members[s].group == Some(self.next_group - 1)
-            };
+            }
+            let own = self.members[s].group == Some(self.next_group - 1);
             self.state = State::Building;
             self.busy = true;
             self.changed = false;
