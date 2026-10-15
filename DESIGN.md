@@ -199,7 +199,8 @@ ledger's settled entries then stop being rewritten by later appends, even when o
 leaf holds the tails of several ledgers. Smaller runs, like scattered inserts, don't
 get leaves of their own, and whatever follows the last split point is split evenly
 by bytes. There is no strict 50% minimum fill: a rebuilt node below ~25% merges with
-a neighbor, if the neighbor is in memory.
+a neighbor, if the neighbor is in memory. A level's new nodes are only built once
+its merges are decided, so a write builds no node that a merge then replaces.
 
 ### `delete_range(start..end)`
 
@@ -282,8 +283,8 @@ free stretch of at least 16 pages (64 KiB with 4 KiB pages), then the next one,
 and at the end of the file, 256 pages at a time. Shorter holes are skipped: each
 would cost a request for a page or two, and they become usable once the pages
 around them are freed too. Every write starts over from the lowest free page. The
-pages it frees again before it ends, as when two nodes merge, are holes in its own
-runs, which its next short-lived pages fill (see below).
+pages it frees again before it ends, as when its new root loses more than one
+level, are holes in its own runs, which its next short-lived pages fill (see below).
 
 Pages replaced together should be freed together, as runs again, so a write
 allocates from two runs at once: one for pages likely to be replaced soon
