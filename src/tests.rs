@@ -2332,6 +2332,7 @@ fn a_write_dropped_while_committing_its_group_fails_the_store() {
 
 #[test]
 fn a_write_dropped_while_cutting_the_file_leaves_its_group_committed() {
+    node::slotted_only();
     let (mut store, mut model) = store_of(0);
     let batches = moving_scenario();
     for ops in &batches[..3] {

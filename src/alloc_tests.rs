@@ -201,12 +201,14 @@ fn group_commits_do_not_allocate() {
         assert_eq!(db.tree().current().generation, start + 2);
     };
     // The first groups grow the frame pool, the scratch space, the groups'
-    // batches and the table of writes waiting.
-    for round in 0..3 {
+    // batches, the table of writes waiting, and the page lists of write requests:
+    // commits send more requests at once as the pages they free split up the free
+    // space.
+    for round in 0..10 {
         fill_all(&mut batches, round);
         write_group(&mut batches);
     }
-    fill_all(&mut batches, 3);
+    fill_all(&mut batches, 10);
     assert_eq!(
         allocations(|| write_group(&mut batches)),
         0,
