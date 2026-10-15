@@ -20,3 +20,9 @@ tempfile = "3"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"
+
+# The encina command lives in cli/, so the library doesn't depend on its argument
+# parser. As a default member, cargo builds and tests it from here too.
+[workspace]
+members = ["cli"]
+default-members = [".", "cli"]
