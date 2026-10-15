@@ -80,6 +80,26 @@ impl Storage {
         }
     }
 
+    /// Writes the pages in `bufs` back to back from `offset`, in one request.
+    pub(crate) async fn write_run(
+        &self,
+        bufs: Vec<FrameBuf>,
+        offset: u64,
+    ) -> (io::Result<()>, Vec<FrameBuf>) {
+        match self {
+            Storage::File(file) => {
+                for buf in &bufs {
+                    debug_assert_blocks(buf, offset);
+                }
+                let mut file = file;
+                let BufResult(res, bufs) = file.write_vectored_all_at(bufs, offset).await;
+                (res, bufs)
+            }
+            #[cfg(test)]
+            Storage::Sim(disk) => disk.write_run(bufs, offset),
+        }
+    }
+
     /// Makes every completed write durable.
     pub(crate) async fn sync(&self) -> io::Result<()> {
         match self {

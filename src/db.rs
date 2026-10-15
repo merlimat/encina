@@ -29,13 +29,20 @@ use crate::error::{Error, Result};
 use crate::meta::{self, FORMAT_VERSION, Meta};
 use crate::node::{self, NO_FRAME, Node};
 use crate::options::{MIN_PAGE_SIZE, Options};
-use crate::pool::{FrameId, Holds, Pool};
+use crate::pool::{FrameBuf, FrameId, Holds, Pool};
 use crate::space::Space;
 use crate::storage::Storage;
 use crate::tree::{Cursor, Find, Pages, Root, Tree, Version};
 
-/// How many page reads or writes a write or an open keeps in flight.
+/// How many reads or writes a write or an open keeps in flight.
 const IO_WINDOW: usize = 16;
+
+/// The most bytes one write request carries: a commit writes each run of adjacent
+/// pages with as few requests as this allows.
+const MAX_WRITE: usize = 1 << 20;
+
+/// The most buffers one vectored write takes: `IOV_MAX` on Linux and macOS.
+const MAX_IOVECS: usize = 1024;
 
 /// How [`Db::get`] matches its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +78,8 @@ struct Inner {
     max_entry: usize,
     /// Key buffers for reads and iterators, reused so that reads don't allocate.
     buffers: RefCell<Vec<Vec<u8>>>,
+    /// Buffer lists for the page runs a commit writes, reused likewise.
+    runs: RefCell<Vec<Vec<FrameBuf>>>,
 }
 
 impl Inner {
@@ -135,6 +144,7 @@ impl Db {
             page_size,
             max_entry: opts.max_entry_size(),
             buffers: RefCell::new(Vec::new()),
+            runs: RefCell::new(Vec::new()),
         };
         Ok(Db {
             inner: Rc::new(inner),
@@ -496,31 +506,49 @@ async fn load_leaf(inner: &Inner, page: u64) -> Result<FrameId> {
     Ok(pages.adopt_leaf(frame, page))
 }
 
-/// Writes the pending version's dirty nodes, `IO_WINDOW` at a time. Every write
-/// completes before this returns, even when one fails.
+/// Writes the pending version's dirty nodes: each run of adjacent pages with one
+/// vectored write, up to `MAX_WRITE` bytes, `IO_WINDOW` writes at a time. Every
+/// write completes before this returns, even when one fails.
 async fn write_dirty(inner: &Inner) -> Result<()> {
-    let total = inner.tree.borrow().dirty.len();
+    let total = {
+        let mut tree = inner.tree.borrow_mut();
+        tree.dirty.sort_unstable_by_key(|&(_, page)| page);
+        tree.dirty.len()
+    };
+    let max_run = max_run(inner.page_size);
     let mut error = None;
-    for start in (0..total).step_by(IO_WINDOW) {
+    let mut next = 0;
+    while next < total {
         let writes: [_; IO_WINDOW] = {
             let tree = inner.tree.borrow();
-            array::from_fn(|i| {
-                let &(frame, page) = tree.dirty.get(start + i)?;
-                Some(
-                    inner
-                        .storage
-                        .write(tree.pages.pool.buf(frame), inner.offset(page)),
-                )
+            let mut runs = inner.runs.borrow_mut();
+            array::from_fn(|_| {
+                let &(_, first) = tree.dirty.get(next)?;
+                let mut bufs = runs.pop().unwrap_or_else(|| Vec::with_capacity(max_run));
+                while let Some(&(frame, page)) = tree.dirty.get(next)
+                    && page == first + bufs.len() as u64
+                    && bufs.len() < max_run
+                {
+                    bufs.push(tree.pages.pool.buf(frame));
+                    next += 1;
+                }
+                Some(inner.storage.write_run(bufs, inner.offset(first)))
             })
         };
-        for (res, buf) in join(writes).await.into_iter().flatten() {
-            drop(buf);
+        for (res, mut bufs) in join(writes).await.into_iter().flatten() {
+            bufs.clear();
+            inner.runs.borrow_mut().push(bufs);
             if let Err(e) = res {
                 error = error.or(Some(e));
             }
         }
     }
     error.map_or(Ok(()), |e| Err(e.into()))
+}
+
+/// The most pages one write request carries.
+pub(crate) fn max_run(page_size: usize) -> usize {
+    (MAX_WRITE / page_size).clamp(1, MAX_IOVECS)
 }
 
 /// Writes `meta` to its slot.

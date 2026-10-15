@@ -35,7 +35,7 @@ use crate::cache::Cache;
 use crate::meta::Meta;
 use crate::node::{self, CHILD_REF, Entries, EntryBuf, NO_FRAME, Node};
 use crate::pool::{FrameId, Holds, Pool};
-use crate::space::Space;
+use crate::space::{Life, Space};
 
 /// The deepest tree supported. Every split leaves internal nodes with at least two
 /// children, so real trees stay far shallower.
@@ -75,8 +75,9 @@ impl Pages {
         src: &impl Entries,
         a: usize,
         b: usize,
+        life: Life,
     ) -> (FrameId, u64, usize) {
-        let page = self.space.alloc();
+        let page = self.space.alloc(life);
         let holds = if level == 0 {
             Holds::Leaf
         } else {
@@ -459,6 +460,7 @@ impl Tree {
             return false;
         }
         self.dropped.clear();
+        self.pages.space.restart();
         let (level, outcome) = match self.root {
             Some(root) => {
                 let level = usize::from(root.level);
@@ -761,7 +763,7 @@ impl Tree {
             return Outcome::Replaced;
         }
         if node::size(leaf, 0, n) <= page {
-            emit(pages, out, 0, leaf, 0, n);
+            emit(pages, out, 0, leaf, 0, n, Life::Short);
             return Outcome::Replaced;
         }
         // Split after each run of puts that fills at least a quarter page, as when
@@ -776,7 +778,9 @@ impl Tree {
             }
             while s < end {
                 let e = node::fit(leaf, s, end, page);
-                emit(pages, out, 0, leaf, s, e);
+                // The run's full leaves are likely to stay; appends go on in its last.
+                let life = if e < end { Life::Long } else { Life::Short };
+                emit(pages, out, 0, leaf, s, e, life);
                 s = e;
             }
         }
@@ -901,7 +905,7 @@ impl Tree {
         if node::size(&self.pair, 0, n) > self.page_size {
             return false;
         }
-        let (frame, page, used) = self.pages.build(level as u8, &self.pair, 0, n);
+        let (frame, page, used) = self.pages.build(level as u8, &self.pair, 0, n, Life::Short);
         if level > 0 {
             // The new node becomes another parent of every internal child of the two.
             for i in 0..n {
@@ -996,8 +1000,16 @@ fn split<'o, 'r>(
 }
 
 /// Builds entries `a..b` of `src` into a new node at `level`, appended to `out`.
-fn emit(pages: &mut Pages, out: &mut NodeList, level: u8, src: &impl Entries, a: usize, b: usize) {
-    let (frame, page, used) = pages.build(level, src, a, b);
+fn emit(
+    pages: &mut Pages,
+    out: &mut NodeList,
+    level: u8,
+    src: &impl Entries,
+    a: usize,
+    b: usize,
+    life: Life,
+) {
+    let (frame, page, used) = pages.build(level, src, a, b, life);
     out.push(src.key(a), frame, page, used, true);
 }
 
@@ -1015,11 +1027,11 @@ fn emit_even(
     while s < b {
         let total = node::size(src, s, b);
         if total <= page_size {
-            emit(pages, out, level, src, s, b);
+            emit(pages, out, level, src, s, b, Life::Short);
             return;
         }
         let e = node::fit(src, s, b, total / total.div_ceil(page_size));
-        emit(pages, out, level, src, s, e);
+        emit(pages, out, level, src, s, e, Life::Short);
         s = e;
     }
 }
@@ -1232,6 +1244,29 @@ impl Tree {
             }
         }
         Some(entries.key(0).to_vec())
+    }
+
+    /// The pages of the current version, sorted.
+    pub(crate) fn pages(&self) -> Vec<u64> {
+        let mut pages = Vec::new();
+        let mut stack = Vec::new();
+        if let Some(root) = self.root {
+            pages.push(root.page);
+            if root.level > 0 {
+                stack.push(root.frame);
+            }
+        }
+        while let Some(frame) = stack.pop() {
+            let node = self.node(frame);
+            for i in 0..node.count() {
+                pages.push(node.child_page(i));
+                if node.level() > 1 {
+                    stack.push(node.child(i));
+                }
+            }
+        }
+        pages.sort_unstable();
+        pages
     }
 
     /// Number of cached leaves, and the bytes they use.
