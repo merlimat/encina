@@ -340,17 +340,19 @@ async fn create(storage: &Storage, opts: &Options) -> Result<Meta> {
 
 /// Reads the meta of an existing store: the newer of the two intact slots.
 async fn recover(storage: &Storage, len: u64) -> Result<Meta> {
-    if len < MIN_PAGE_SIZE as u64 {
+    // Probe with the smallest read the storage supports: no page is smaller.
+    let probe = storage.min_read();
+    if len < probe as u64 {
         return Err(Error::InvalidFile("no intact meta page"));
     }
     // Slot 0 gives the page size. If it was torn, look for slot 1 wherever each
     // page size would put it.
-    let mut page_size = read_meta(storage, MIN_PAGE_SIZE, 0)
+    let mut page_size = read_meta(storage, probe, 0)
         .await?
         .map(|m| m.page_size as usize);
-    let mut size = MIN_PAGE_SIZE;
-    while page_size.is_none() && size <= 65536 && (size + MIN_PAGE_SIZE) as u64 <= len {
-        let meta = read_meta(storage, MIN_PAGE_SIZE, size as u64).await?;
+    let mut size = probe;
+    while page_size.is_none() && size <= 65536 && (size + probe) as u64 <= len {
+        let meta = read_meta(storage, probe, size as u64).await?;
         page_size = meta.filter(|m| m.page_size as usize == size).map(|_| size);
         size *= 2;
     }

@@ -25,6 +25,10 @@ use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 
 use crate::pool::FrameBuf;
 
+/// Direct I/O moves whole blocks: buffer, offset and length must all be multiples
+/// of the device's block size, at most 4 KiB.
+const BLOCK: u64 = 4096;
+
 pub(crate) enum Storage {
     File(File),
     #[cfg(test)]
@@ -39,10 +43,21 @@ impl Storage {
         Ok((Storage::File(file), len))
     }
 
+    /// The smallest read it supports: a block for a file, whose direct I/O moves
+    /// whole blocks, or the tiny pages tests use on the simulated disk.
+    pub(crate) fn min_read(&self) -> usize {
+        match self {
+            Storage::File(_) => BLOCK as usize,
+            #[cfg(test)]
+            Storage::Sim(_) => crate::options::MIN_PAGE_SIZE,
+        }
+    }
+
     /// Fills `buf` from `offset`.
     pub(crate) async fn read(&self, buf: FrameBuf, offset: u64) -> (io::Result<()>, FrameBuf) {
         match self {
             Storage::File(file) => {
+                debug_assert_blocks(&buf, offset);
                 let BufResult(res, buf) = file.read_exact_at(buf, offset).await;
                 (res, buf)
             }
@@ -55,6 +70,7 @@ impl Storage {
     pub(crate) async fn write(&self, buf: FrameBuf, offset: u64) -> (io::Result<()>, FrameBuf) {
         match self {
             Storage::File(file) => {
+                debug_assert_blocks(&buf, offset);
                 let mut file = file;
                 let BufResult(res, buf) = file.write_all_at(buf, offset).await;
                 (res, buf)
@@ -72,6 +88,17 @@ impl Storage {
             Storage::Sim(disk) => disk.sync(),
         }
     }
+}
+
+/// Checks that file I/O is block-aligned, as direct I/O requires, even where it
+/// isn't enforced, like on macOS.
+fn debug_assert_blocks(buf: &FrameBuf, offset: u64) {
+    use compio::buf::IoBuf;
+    let (ptr, len) = (buf.as_init().as_ptr() as u64, buf.as_init().len() as u64);
+    debug_assert!(
+        ptr.is_multiple_of(BLOCK) && len.is_multiple_of(BLOCK) && offset.is_multiple_of(BLOCK),
+        "unaligned file I/O: {len} bytes at offset {offset}"
+    );
 }
 
 /// Opens a file for I/O that bypasses the OS page cache, which would otherwise keep
