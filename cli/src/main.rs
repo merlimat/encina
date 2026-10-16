@@ -15,22 +15,26 @@
 //! `encina`: puts, gets and scans the entries of a store from the command line.
 
 use std::error::Error;
+use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use encina::{Comparison, Db, Options, ReadOnlyDb, WriteBatch};
+use encina::{Comparison, Db, Options, PageInfo, ReadOnlyDb, WriteBatch};
 
 /// How many times in a row a read opens a new view of the store, after finding
 /// that the store's owner overwrote the version its view reads.
 const MAX_STALE: u32 = 10;
 
-const AFTER_HELP: &str = r"get and scan open the store read-only, so they work while another process has it
-open for writing. If that process overwrites the version they read, they open the
-store again: get reads the current version, and scan resumes after the last key it
-printed.
+/// The meta pages at the start of a store's file.
+const META_PAGES: usize = 2;
+
+const AFTER_HELP: &str = r"get, scan, stats and pages open the store read-only, so they work while another
+process has it open for writing. If that process overwrites the version they read,
+they open the store again: scan resumes after the last key it printed, and the
+others start over on the current version.
 
 Keys and values are bytes: in an argument, \xNN stands for the byte with hex value
 NN, and \\ for a backslash. Output prints UTF-8 text as is, and escapes backslashes,
@@ -80,6 +84,24 @@ enum Command {
         /// Prints keys and values in the layout of `hexdump -C`
         #[arg(short = 'x', long)]
         hexdump: bool,
+    },
+    /// Prints how many pages the store's file holds, and what they hold
+    ///
+    /// The table counts the nodes at each level of the tree, from the root down to
+    /// the leaves, at level 0: the dense ones among them, their entries (an
+    /// internal node's entries are its children), and how full their pages are.
+    Stats {
+        /// The store's file
+        path: PathBuf,
+    },
+    /// Prints a map of the store's pages, 64 to a line
+    ///
+    /// Each line starts with the number of its first page. M is a meta page, L a
+    /// leaf, D a dense leaf, a digit an internal node at that level, and . a free
+    /// page.
+    Pages {
+        /// The store's file
+        path: PathBuf,
     },
 }
 
@@ -148,6 +170,72 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
             })
             .await?;
         }
+        Command::Stats { path } => {
+            let (page_size, pages) = read_pages(&path).await?;
+            let nodes: Vec<_> = pages
+                .iter()
+                .filter_map(|page| match page {
+                    Page::Node(info) => Some(info),
+                    _ => None,
+                })
+                .collect();
+            let free: Vec<_> = pages
+                .chunk_by(|a, b| matches!(a, Page::Free) == matches!(b, Page::Free))
+                .filter(|stretch| matches!(stretch[0], Page::Free))
+                .map(<[Page]>::len)
+                .collect();
+            writeln!(out, "page size       {page_size:>9}")?;
+            writeln!(out, "file pages      {:>9}", pages.len())?;
+            writeln!(out, "meta pages      {META_PAGES:>9}")?;
+            writeln!(out, "tree pages      {:>9}", nodes.len())?;
+            writeln!(out, "free pages      {:>9}", free.iter().sum::<usize>())?;
+            writeln!(out, "free stretches  {:>9}", free.len())?;
+            writeln!(
+                out,
+                "longest stretch {:>9}",
+                free.iter().max().unwrap_or(&0)
+            )?;
+            if let Some(height) = nodes.iter().map(|info| info.level).max() {
+                writeln!(out, "\nlevel      pages      dense      entries    full")?;
+                for level in (0..=height).rev() {
+                    let (mut count, mut dense, mut entries, mut used) = (0, 0, 0, 0);
+                    for info in nodes.iter().filter(|info| info.level == level) {
+                        count += 1;
+                        dense += usize::from(info.dense);
+                        entries += info.entries;
+                        used += info.used;
+                    }
+                    let full = 100.0 * used as f64 / (count * page_size) as f64;
+                    writeln!(
+                        out,
+                        "{level:>5} {count:>10} {dense:>10} {entries:>12} {full:>6.1}%"
+                    )?;
+                }
+            }
+        }
+        Command::Pages { path } => {
+            let (_, pages) = read_pages(&path).await?;
+            let width = (pages.len() - 1).to_string().len();
+            for (row, line) in pages.chunks(64).enumerate() {
+                write!(out, "{:>width$} ", row * 64)?;
+                for (i, page) in line.iter().enumerate() {
+                    if i % 16 == 0 {
+                        out.write_all(b" ")?;
+                    }
+                    let c = match page {
+                        Page::Meta => 'M',
+                        Page::Free => '.',
+                        Page::Node(info) if info.level > 0 => {
+                            char::from_digit(info.level.into(), 36).unwrap_or('+')
+                        }
+                        Page::Node(info) if info.dense => 'D',
+                        Page::Node(_) => 'L',
+                    };
+                    write!(out, "{c}")?;
+                }
+                writeln!(out)?;
+            }
+        }
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)
@@ -172,6 +260,50 @@ async fn get(path: &Path, key: &[u8]) -> encina::Result<Option<Vec<u8>>> {
             result => return result,
         }
     }
+}
+
+/// What a page of a store's file holds.
+enum Page {
+    Meta,
+    Node(PageInfo),
+    Free,
+}
+
+/// The store's page size, and what each page of its file holds. When the store's
+/// owner overwrites the version the view reads, opens a new view and starts over.
+async fn read_pages(path: &Path) -> Result<(usize, Vec<Page>), Box<dyn Error>> {
+    let mut stale = 0;
+    let (page_size, nodes) = loop {
+        let read = async {
+            let db = ReadOnlyDb::open(path, Options::default()).await?;
+            let mut nodes = Vec::new();
+            db.pages(|info| nodes.push(info)).await?;
+            Ok((db.page_size(), nodes))
+        };
+        match read.await {
+            Err(encina::Error::Stale) if stale < MAX_STALE => stale += 1,
+            result => break result.map_err(|e| at(path, e))?,
+        }
+    };
+    let len = fs::metadata(path)?.len() as usize;
+    let end = nodes
+        .iter()
+        .map(|info| info.page as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut pages: Vec<_> = (0..end.max(len / page_size).max(META_PAGES))
+        .map(|page| {
+            if page < META_PAGES {
+                Page::Meta
+            } else {
+                Page::Free
+            }
+        })
+        .collect();
+    for info in nodes {
+        pages[info.page as usize] = Page::Node(info);
+    }
+    Ok((page_size, pages))
 }
 
 /// Calls `print` on the entries with keys in the range, in key order. When the

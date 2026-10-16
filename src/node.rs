@@ -418,6 +418,10 @@ impl<'a> Node<'a> {
         u32::from_le_bytes(self.page[16..20].try_into().unwrap()) as usize
     }
 
+    pub(crate) fn is_dense(&self) -> bool {
+        self.dense
+    }
+
     /// The bytes the node spends on its entries: all but its header and prefixes. A
     /// node holding these entries and others spends at least as many on them, since
     /// its prefixes can only be shorter, and a slotted node takes more per entry than

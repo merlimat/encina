@@ -142,17 +142,19 @@ encina put data.db user/0001 alice
 encina get data.db user/0001         # alice
 encina scan data.db user/ user0      # one key<TAB>value line per entry
 encina scan -x data.db               # keys and values as hexdump -C shows them
+encina stats data.db                 # pages in use and free, level by level
+encina pages data.db                 # a map of the file's pages, 64 to a line
 ```
 
 `cargo install encina-cli` builds the command and copies it to `~/.cargo/bin`. From a
 checkout, `cargo install --path cli` does the same, and `cargo build --release` at the
 root builds it in place, at `target/release/encina`.
 
-`get` and `scan` open the store read-only, so they work while another process has
-it open. If that process overwrites the version they read, they open the store
-again, and `scan` resumes after the last key it printed. Arguments take `\xNN` for
-any byte and `\\` for a backslash, and output prints UTF-8 text as is and escapes
-other bytes the same way. `encina --help` has the details.
+`get`, `scan`, `stats` and `pages` open the store read-only, so they work while
+another process has it open. If that process overwrites the version they read, they
+open the store again, and `scan` resumes after the last key it printed. Arguments
+take `\xNN` for any byte and `\\` for a backslash, and output prints UTF-8 text as
+is and escapes other bytes the same way. `encina --help` has the details.
 
 ## Building
 

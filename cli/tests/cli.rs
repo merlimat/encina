@@ -146,6 +146,93 @@ async fn reads_while_another_process_writes() {
     assert_eq!(ok(&["get", path, "k"]), "w\n");
 }
 
+/// The value of a line of `encina stats`, by its name.
+fn stat(stats: &str, name: &str) -> usize {
+    let line = stats.lines().find(|line| line.starts_with(name)).unwrap();
+    line[name.len()..].trim().parse().unwrap()
+}
+
+/// The rows of the table of `encina stats`, but for how full the pages are: level,
+/// pages, dense pages and entries.
+fn levels(stats: &str) -> Vec<[usize; 4]> {
+    let table = stats.lines().skip_while(|line| !line.starts_with("level"));
+    table
+        .skip(1)
+        .map(|row| {
+            let cells: Vec<usize> = row
+                .split_whitespace()
+                .take(4)
+                .map(|c| c.parse().unwrap())
+                .collect();
+            cells.try_into().unwrap()
+        })
+        .collect()
+}
+
+#[compio::test]
+async fn stats_and_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.db");
+    let db = Db::open(&path, Options::default()).await.unwrap();
+    for value in [b"v", b"w"] {
+        let mut batch = WriteBatch::new();
+        batch.put(b"k", value);
+        db.write(&mut batch).await.unwrap();
+    }
+    let path_str = path.to_str().unwrap();
+
+    // The second write moved the leaf to a new page, and freed the first. Both
+    // commands read the store while its owner has it open.
+    assert_eq!(ok(&["pages", path_str]), "0  MM.D\n");
+    let stats = ok(&["stats", path_str]);
+    let summary = [
+        ("page size", 4096),
+        ("file pages", 4),
+        ("meta pages", 2),
+        ("tree pages", 1),
+        ("free pages", 1),
+        ("free stretches", 1),
+        ("longest stretch", 1),
+    ];
+    for (name, value) in summary {
+        assert_eq!(stat(&stats, name), value, "{name}");
+    }
+    assert_eq!(levels(&stats), [[0, 1, 1, 1]]);
+
+    // A tree of two levels.
+    let mut batch = WriteBatch::new();
+    for i in 0..20_000 {
+        batch.put(format!("{i:06}").as_bytes(), &[b'v'; 100]);
+    }
+    db.write(&mut batch).await.unwrap();
+    let stats = ok(&["stats", path_str]);
+    let [root, leaves] = levels(&stats)[..] else {
+        panic!("{stats}");
+    };
+    assert_eq!(root[..2], [1, 1]);
+    assert_eq!((leaves[0], leaves[3]), (0, 20_001), "k and the 20,000 keys");
+    assert_eq!(root[3], leaves[1], "the root's entries are the leaves");
+    assert_eq!(stat(&stats, "tree pages"), 1 + leaves[1]);
+    let file = stat(&stats, "file pages");
+    assert_eq!(file, 2 + 1 + leaves[1] + stat(&stats, "free pages"));
+    assert_eq!(file as u64 * 4096, std::fs::metadata(&path).unwrap().len());
+
+    // The map shows the same pages, 64 to a line.
+    let map = ok(&["pages", path_str]);
+    assert_eq!(map.lines().count(), file.div_ceil(64));
+    let shown = |c| {
+        map.lines()
+            .flat_map(|line| line.split_whitespace().skip(1))
+            .flat_map(str::chars)
+            .filter(|&s| s == c)
+            .count()
+    };
+    assert_eq!(shown('M'), 2);
+    assert_eq!(shown('1'), 1);
+    assert_eq!(shown('L') + shown('D'), leaves[1]);
+    db.close().await.unwrap();
+}
+
 /// A scan whose version the store's owner overwrites midway opens a new view, and
 /// resumes after the last key it printed.
 #[compio::test]

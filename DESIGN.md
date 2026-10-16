@@ -592,8 +592,16 @@ impl ReadOnlyDb {
         f: impl FnOnce(&[u8], &[u8]) -> R,
     ) -> Result<Option<R>>;
     pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter;
+    pub fn page_size(&self) -> usize;
+    /// Calls `f` on each node of the tree: the internal nodes, then the leaves in
+    /// key order, which it reads. The `stats` and `pages` commands use it.
+    pub async fn pages(&self, f: impl FnMut(PageInfo)) -> Result<()>;
     pub async fn close(self) -> Result<()>;
 }
+
+/// A node: its page, level, entries (an internal node's are its children), the
+/// bytes it uses, and whether it is dense.
+pub struct PageInfo { pub page: u64, pub level: u8, pub entries: usize, pub used: usize, pub dense: bool }
 
 pub enum Comparison { Equal, Floor, Ceiling, Lower, Higher }
 
