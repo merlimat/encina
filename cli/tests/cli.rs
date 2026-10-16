@@ -50,6 +50,21 @@ fn put_get() {
 }
 
 #[test]
+fn puts_reuse_the_pages_they_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.db");
+    let path = path.to_str().unwrap();
+
+    // Each put moves the key's leaf to a new page and frees the one before, which
+    // the next put takes back: the file holds the meta pages and two leaves.
+    for i in 0..20 {
+        ok(&["put", path, "key", &i.to_string()]);
+        let len = std::fs::metadata(path).unwrap().len();
+        assert!(len <= 4 * 4096, "{len} bytes after {} puts", i + 1);
+    }
+}
+
+#[test]
 fn scan_bounds() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.db");

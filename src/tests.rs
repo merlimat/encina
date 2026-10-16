@@ -1479,6 +1479,24 @@ fn freeing_the_end_of_the_file_cuts_it() {
     assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
 }
 
+#[test]
+fn a_shorter_min_run_reuses_shorter_holes() {
+    // Updating one key moves its leaf to a new page and frees the old one: the
+    // file grows past one free page, unless a run of one may reuse it.
+    let peak = |opts: Options| {
+        let store = Store::new(opts.page_size(256));
+        let mut peak = 0;
+        for i in 0..40u8 {
+            write(&store.db, &[Op::Put(b"key".to_vec(), vec![i])]);
+            peak = peak.max(store.disk.len() / 256);
+        }
+        peak
+    };
+    // The meta pages, a stretch of 16 free pages, and the leaf.
+    assert_eq!(peak(Options::new()), 19);
+    assert_eq!(peak(Options::new().min_run_pages(1)), 4);
+}
+
 /// The write requests that writing `pages`, sorted, takes: one per run of adjacent
 /// pages, split where a run outgrows a request.
 fn requests_for(pages: &[u64], max_run: usize) -> u64 {
