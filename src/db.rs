@@ -30,7 +30,7 @@ use crate::cache::Cache;
 use crate::error::{Error, Result};
 use crate::meta::{self, FORMAT_VERSION, Meta};
 use crate::node::{self, NO_FRAME, Node};
-use crate::options::{MIN_PAGE_SIZE, Options};
+use crate::options::{DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE, Options};
 use crate::pool::{FrameBuf, FrameId, Holds, Pool};
 use crate::reads::{Claim, Reads};
 use crate::space::Space;
@@ -126,8 +126,9 @@ impl Inner {
 impl Db {
     /// Opens the store at `path`, creating it if needed.
     ///
-    /// A new store takes its page size from `opts`; an existing one keeps the page
-    /// size it was created with.
+    /// A new store takes its page size from `opts`, 4 KiB if it sets none. An
+    /// existing one keeps the page size it was created with: this fails with
+    /// [`Error::PageSizeMismatch`] if `opts` sets another.
     ///
     /// A store has one owner at a time: this fails with [`Error::Locked`] while
     /// another `Db`, in this process or another, has it open. That `Db` lets go
@@ -154,7 +155,20 @@ impl Db {
             recover(&storage, len).await?
         };
         let page_size = meta.page_size as usize;
-        let opts = Options { page_size, ..opts };
+        // A view writes nothing, so it reads the store whatever page size `opts` sets.
+        if let Some(options) = opts.page_size
+            && options != page_size
+            && !read_only
+        {
+            return Err(Error::PageSizeMismatch {
+                store: page_size,
+                options,
+            });
+        }
+        let opts = Options {
+            page_size: Some(page_size),
+            ..opts
+        };
         let mut pages = Pages {
             pool: Pool::new(page_size),
             cache: Cache::new(opts.cache_frames()),
@@ -426,7 +440,7 @@ pub struct ReadOnlyDb {
 
 impl ReadOnlyDb {
     /// Opens a view of the existing store at `path`, as of its last write. `opts`
-    /// sets the cache size; the page size comes from the file.
+    /// sets the cache size; the page size comes from the file, whatever `opts` sets.
     ///
     /// Fails with [`Error::Stale`] if the store's owner overwrote that version
     /// while it was being opened: opening again finds a newer one.
@@ -472,15 +486,16 @@ impl ReadOnlyDb {
 
 /// Writes the meta page and the empty second slot of a new store.
 async fn create(storage: &Storage, opts: &Options) -> Result<Meta> {
-    let meta = Meta::empty(opts.page_size);
-    let mut pool = Pool::new(opts.page_size);
+    let page_size = opts.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
+    let meta = Meta::empty(page_size);
+    let mut pool = Pool::new(page_size);
     let frame = pool.alloc(Holds::Loading, 0);
     meta.encode(pool.page_mut(frame));
     let (res, buf) = storage.write(pool.buf(frame), 0).await;
     drop(buf);
     res?;
     pool.page_mut(frame).fill(0);
-    let (res, buf) = storage.write(pool.buf(frame), opts.page_size as u64).await;
+    let (res, buf) = storage.write(pool.buf(frame), page_size as u64).await;
     drop(buf);
     res?;
     storage.sync().await?;

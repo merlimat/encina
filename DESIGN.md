@@ -320,7 +320,8 @@ later write adds. Dropping any other write is harmless (§6).
 ### File layout (format v1)
 
 One file with a fixed page size (default 4 KiB, chosen at creation, a power of two
-from 4 to 64 KiB).
+from 4 to 64 KiB). Opening it for writing with options that set another page size
+fails; a read-only view, which writes nothing, takes the file's.
 
 | Pages | Content |
 |---|---|

@@ -1116,6 +1116,38 @@ fn a_damaged_meta_slot_leaves_the_other() {
     assert_eq!(scan(&db, ALL), first);
 }
 
+#[test]
+fn a_store_keeps_its_page_size() {
+    let store = Store::new(Options::new().page_size(512));
+    write(&store.db, &[Op::Put(b"a".to_vec(), b"1".to_vec())]);
+    let expected = scan(&store.db, ALL);
+    for other in [256, 1024] {
+        let opts = Options::new().page_size(other);
+        let opened = now(Db::open_sim(store.disk.restart(), opts.clone())).map(drop);
+        assert!(
+            matches!(opened, Err(Error::PageSizeMismatch { store: 512, options }) if options == other),
+            "{opened:?}"
+        );
+        // A view writes nothing, so it reads the store anyway.
+        let view = now(ReadOnlyDb::open_sim(store.disk.restart(), opts)).unwrap();
+        assert_eq!(view_scan(&view).unwrap(), expected);
+    }
+    // Options without a page size open the store with its own, and its entry limit.
+    let db = now(Db::open_sim(store.disk.restart(), Options::new())).unwrap();
+    assert_eq!(scan(&db, ALL), expected);
+    let max = node::max_entry(512);
+    let mut batch = WriteBatch::new();
+    batch.put(b"k", &vec![0; max]);
+    let written = now(db.write(&mut batch));
+    assert!(
+        matches!(written, Err(Error::EntryTooLarge { size, max: m }) if size == max + 1 && m == max),
+        "{written:?}"
+    );
+    batch.clear();
+    batch.put(b"k", &vec![0; max - 1]);
+    now(db.write(&mut batch)).unwrap();
+}
+
 /// Batches that build a few levels on 256-byte pages, rewrite and delete parts of
 /// them, then delete everything.
 fn failure_scenario() -> Vec<Vec<Op>> {
@@ -2577,7 +2609,7 @@ async fn a_file_store_survives_reopening() {
     db.close().await.unwrap();
 
     // The page size comes from the file. A small cache sends reads to the disk.
-    let opts = Options::default().page_size(65536).cache_size(16 * 4096);
+    let opts = Options::default().cache_size(16 * 4096);
     let db = Db::open(&path, opts).await.unwrap();
     for i in (0..20_000u32).step_by(97) {
         let found = db
