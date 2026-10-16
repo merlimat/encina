@@ -49,6 +49,35 @@ const MAX_WRITE: usize = 1 << 20;
 /// The most buffers one vectored write takes: `IOV_MAX` on Linux and macOS.
 const MAX_IOVECS: usize = 1024;
 
+/// A node of the tree, as [`ReadOnlyDb::pages`] finds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PageInfo {
+    /// The page the node is on: its offset in the file, in pages.
+    pub page: u64,
+    /// 0 for a leaf, and one more than its children's for an internal node.
+    pub level: u8,
+    /// A leaf's entries, or an internal node's children.
+    pub entries: usize,
+    /// The bytes of the page the node uses, its header included.
+    pub used: usize,
+    /// Whether the node is dense rather than slotted: a node is dense when its
+    /// keys share one length and its values share another.
+    pub dense: bool,
+}
+
+impl PageInfo {
+    fn of(page: u64, node: &Node) -> PageInfo {
+        PageInfo {
+            page,
+            level: node.level(),
+            entries: node.count(),
+            used: node.used(),
+            dense: node.is_dense(),
+        }
+    }
+}
+
 /// How [`Db::get`] matches its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Comparison {
@@ -476,6 +505,56 @@ impl ReadOnlyDb {
     /// As [`Db::range`], in the version this view reads.
     pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter {
         self.db.range(range)
+    }
+
+    /// The store's page size.
+    pub fn page_size(&self) -> usize {
+        self.db.inner.page_size
+    }
+
+    /// Calls `f` on each node of the tree in the version this view reads: the
+    /// internal nodes first, then the leaves in key order. Leaves that aren't
+    /// cached are read one at a time, so this reads most of the file.
+    ///
+    /// The file's other pages are the two meta pages at its start, and free pages.
+    pub async fn pages(&self, mut f: impl FnMut(PageInfo)) -> Result<()> {
+        let inner = &*self.db.inner;
+        // A view never writes: its tree stays as it is while leaves are read.
+        let Some(root) = inner.tree.borrow().current().root else {
+            return Ok(());
+        };
+        let mut stack = Vec::new();
+        if root.level > 0 {
+            stack.push((root.frame, root.page));
+        }
+        while let Some((frame, page)) = stack.pop() {
+            let info = {
+                let tree = inner.tree.borrow();
+                let node = tree.node(frame);
+                if node.level() > 1 {
+                    stack.extend((0..node.count()).map(|i| (node.child(i), node.child_page(i))));
+                }
+                PageInfo::of(page, &node)
+            };
+            f(info);
+        }
+        let mut cur = Cursor::new();
+        let mut leaf = Some(inner.tree.borrow().descend_first(root, &mut cur));
+        while let Some(page) = leaf {
+            let frame = match load_leaf(inner, page).await {
+                Ok(frame) => frame,
+                Err(e) => return Err(inner.explain(e).await),
+            };
+            let info = {
+                let tree = inner.tree.borrow();
+                let info = PageInfo::of(page, &tree.node(frame));
+                tree.pages.pool.unref(frame);
+                leaf = tree.next_leaf(&mut cur, true);
+                info
+            };
+            f(info);
+        }
+        Ok(())
     }
 
     /// Closes the view, once this is its last handle.
