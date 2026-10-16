@@ -104,6 +104,6 @@ mod alloc_tests;
 mod tests;
 
 pub use batch::WriteBatch;
-pub use db::{Comparison, Db, Iter, ReadOnlyDb};
+pub use db::{Comparison, Db, Iter, PageInfo, ReadOnlyDb};
 pub use error::{Error, Result};
 pub use options::Options;

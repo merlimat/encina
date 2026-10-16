@@ -925,6 +925,55 @@ fn a_read_only_view_reads_its_version_until_it_is_overwritten() {
 }
 
 #[test]
+fn a_read_only_view_lists_the_pages_of_its_tree() {
+    let empty = Store::new(Options::new().page_size(256));
+    let view = now(ReadOnlyDb::open_sim(empty.disk.clone(), empty.opts.clone())).unwrap();
+    now(view.pages(|info| panic!("{info:?} in an empty store"))).unwrap();
+
+    let (store, model) = deep_store();
+    // A cache too small for the leaves, so that most are read from the disk.
+    let opts = Options::new().page_size(256).cache_size(16 * 256);
+    let view = now(ReadOnlyDb::open_sim(store.disk.clone(), opts)).unwrap();
+    assert_eq!(view.page_size(), 256);
+    let mut found = Vec::new();
+    now(view.pages(|info| found.push(info))).unwrap();
+    // Every page of the tree once: the internal nodes, then the leaves in key order.
+    let mut pages: Vec<_> = found.iter().map(|info| info.page).collect();
+    pages.sort_unstable();
+    assert_eq!(pages, store.db.tree().pages());
+    let leaves: Vec<_> = found
+        .iter()
+        .skip_while(|info| info.level > 0)
+        .map(|info| info.page)
+        .collect();
+    let in_key_order: Vec<_> = store
+        .db
+        .tree()
+        .leaves()
+        .into_iter()
+        .map(|(page, _)| page)
+        .collect();
+    assert_eq!(leaves, in_key_order);
+    // The leaves hold every key, and the nodes of each level are the children of
+    // the level above.
+    let level = |level| found.iter().filter(move |info| info.level == level);
+    assert_eq!(
+        level(0).map(|info| info.entries).sum::<usize>(),
+        model.len()
+    );
+    for l in 1..=3 {
+        let children = level(l).map(|info| info.entries).sum::<usize>();
+        assert_eq!(children, level(l - 1).count());
+    }
+    assert_eq!(level(3).count(), 1);
+    assert!(
+        found
+            .iter()
+            .all(|info| (1..=256).contains(&info.used) && !info.dense)
+    );
+}
+
+#[test]
 fn a_read_only_view_of_a_quiet_store_reports_damage() {
     let opts = Options::new().page_size(256).cache_size(16 * 256);
     let store = Store::new(opts.clone());
