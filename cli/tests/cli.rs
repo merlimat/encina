@@ -161,6 +161,25 @@ async fn reads_while_another_process_writes() {
     assert_eq!(ok(&["get", path, "k"]), "w\n");
 }
 
+#[compio::test]
+async fn works_on_any_page_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.db");
+    let db = Db::open(&path, Options::default().page_size(16384))
+        .await
+        .unwrap();
+    let mut batch = WriteBatch::new();
+    batch.put(b"k", b"v");
+    db.write(&mut batch).await.unwrap();
+    db.close().await.unwrap();
+    let path = path.to_str().unwrap();
+
+    // The command sets no page size, so it opens the store with its own.
+    ok(&["put", path, "k", "w"]);
+    assert_eq!(ok(&["get", path, "k"]), "w\n");
+    assert_eq!(ok(&["scan", path]), "k\tw\n");
+}
+
 /// The value of a line of `encina stats`, by its name.
 fn stat(stats: &str, name: &str) -> usize {
     let line = stats.lines().find(|line| line.starts_with(name)).unwrap();

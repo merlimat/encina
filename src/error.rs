@@ -29,6 +29,14 @@ pub enum Error {
     },
     /// The options are invalid.
     InvalidOptions(&'static str),
+    /// The options set a page size other than the store's, which keeps the one it
+    /// was created with.
+    PageSizeMismatch {
+        /// The store's page size, in bytes.
+        store: usize,
+        /// The page size the options set, in bytes.
+        options: usize,
+    },
     /// The file is not a store this version of encina can open.
     InvalidFile(&'static str),
     /// Another [`Db`](crate::Db), in this process or another, has the store open.
@@ -61,6 +69,10 @@ impl Error {
                 max: *max,
             },
             Error::InvalidOptions(reason) => Error::InvalidOptions(reason),
+            Error::PageSizeMismatch { store, options } => Error::PageSizeMismatch {
+                store: *store,
+                options: *options,
+            },
             Error::InvalidFile(reason) => Error::InvalidFile(reason),
             Error::Locked => Error::Locked,
             Error::Corruption { page } => Error::Corruption { page: *page },
@@ -81,6 +93,12 @@ impl fmt::Display for Error {
                 write!(f, "entry of {size} bytes exceeds the maximum of {max}")
             }
             Error::InvalidOptions(reason) => write!(f, "invalid options: {reason}"),
+            Error::PageSizeMismatch { store, options } => {
+                write!(
+                    f,
+                    "the store has {store}-byte pages, not the {options} the options set"
+                )
+            }
             Error::InvalidFile(reason) => write!(f, "invalid store file: {reason}"),
             Error::Locked => write!(f, "the store is already open"),
             Error::Corruption { page } => write!(f, "page {page} is corrupt"),
@@ -126,6 +144,13 @@ mod tests {
                 "entry of 2000 bytes exceeds the maximum of 1000",
             ),
             (Error::InvalidOptions("why"), "invalid options: why"),
+            (
+                Error::PageSizeMismatch {
+                    store: 4096,
+                    options: 8192,
+                },
+                "the store has 4096-byte pages, not the 8192 the options set",
+            ),
             (Error::InvalidFile("why"), "invalid store file: why"),
             (Error::Locked, "the store is already open"),
             (Error::Corruption { page: 7 }, "page 7 is corrupt"),
