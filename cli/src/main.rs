@@ -108,7 +108,9 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
     let mut out = BufWriter::new(io::stdout().lock());
     match command {
         Command::Put { path, key, value } => {
-            let db = Db::open(&path, Options::default())
+            // Each put is a write of its own, of a few pages: taking any free page
+            // keeps the file small, at the cost of a request or two.
+            let db = Db::open(&path, Options::default().min_run_pages(1))
                 .await
                 .map_err(|e| at(&path, e))?;
             let mut batch = WriteBatch::new();

@@ -158,7 +158,7 @@ impl Db {
         let mut pages = Pages {
             pool: Pool::new(page_size),
             cache: Cache::new(opts.cache_frames()),
-            space: Space::new(meta.high_water),
+            space: Space::new(meta.high_water, opts.min_run_pages as u64),
         };
         for page in 0..meta::META_PAGES {
             pages.space.mark_used(page);

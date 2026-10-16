@@ -339,9 +339,11 @@ At runtime, a write takes its pages in order from runs of free pages: the first
 free stretch of at least 16 pages (64 KiB with 4 KiB pages), then the next one,
 and at the end of the file, 256 pages at a time. Shorter holes are skipped: each
 would cost a request for a page or two, and they become usable once the pages
-around them are freed too. Every write starts over from the lowest free page. The
-pages it frees again before it ends, as when its new root loses more than one
-level, are holes in its own runs, which its next short-lived pages fill (see below).
+around them are freed too. `Options::min_run_pages` sets the 16: a smaller value
+trades requests for a smaller file. Every write starts over from the lowest free
+page. The pages it frees again before it ends, as when its new root loses more
+than one level, are holes in its own runs, which its next short-lived pages fill
+(see below).
 
 Pages replaced together should be freed together, as runs again, so a write
 allocates from two runs at once: one for pages likely to be replaced soon

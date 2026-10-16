@@ -25,6 +25,7 @@ pub(crate) const MIN_PAGE_SIZE: usize = if cfg!(test) { 256 } else { 4096 };
 #[derive(Clone, Debug)]
 pub struct Options {
     pub(crate) page_size: usize,
+    pub(crate) min_run_pages: usize,
     pub(crate) cache_size: usize,
 }
 
@@ -32,13 +33,14 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             page_size: 4096,
+            min_run_pages: 16,
             cache_size: 64 << 20,
         }
     }
 }
 
 impl Options {
-    /// The default options: 4 KiB pages and a 64 MiB cache.
+    /// The default options: 4 KiB pages, runs of 16 pages, and a 64 MiB cache.
     pub fn new() -> Self {
         Self::default()
     }
@@ -49,6 +51,19 @@ impl Options {
     /// [`max_entry_size`](Self::max_entry_size), a bit under a quarter of a page.
     pub fn page_size(mut self, bytes: usize) -> Self {
         self.page_size = bytes;
+        self
+    }
+
+    /// Sets the shortest stretch of free pages that a write reuses, short of the
+    /// end of the file: 16 by default.
+    ///
+    /// A write takes its pages in order from stretches of free pages, and writes
+    /// each stretch with one request. It skips shorter ones and grows the file
+    /// instead, until the pages around them are freed too. A smaller value keeps
+    /// the file smaller and sends more write requests: 1 reuses every free page.
+    /// Nothing about it is stored, so it can change from one open to the next.
+    pub fn min_run_pages(mut self, pages: usize) -> Self {
+        self.min_run_pages = pages;
         self
     }
 
