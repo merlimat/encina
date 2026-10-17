@@ -216,3 +216,27 @@ fn group_commits_do_not_allocate() {
     );
     db.check();
 }
+
+#[test]
+fn reading_a_value_leaf_allocates_its_buffer_only() {
+    let db = now(Db::open_sim(SimDisk::new(), Options::default())).unwrap();
+    let mut batch = WriteBatch::new();
+    for i in 0..10 {
+        batch.put(&key(i), &[i as u8; 10_000]);
+    }
+    now(db.write(&mut batch)).unwrap();
+    let get = |i| now(db.get(&key(i), Comparison::Equal, |_, v| v.len())).unwrap();
+    assert_eq!(get(0), Some(10_000));
+    assert_eq!(allocations(|| assert_eq!(get(3), Some(10_000))), 1);
+    // An iterator reuses its buffer for the next value leaf no larger.
+    let scan_all = || {
+        let mut iter = db.range(..);
+        let mut n = 0;
+        while now(iter.next()).unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 10);
+    };
+    scan_all();
+    assert_eq!(allocations(scan_all), 1);
+}

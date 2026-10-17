@@ -31,7 +31,7 @@ use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use compio::runtime::Submit;
 
 use crate::error::Result;
-use crate::pool::FrameBuf;
+use crate::pool::{FrameBuf, ValueBuf};
 
 /// Direct I/O moves whole blocks: buffer, offset and length must all be multiples
 /// of the device's block size, at most 4 KiB.
@@ -88,6 +88,23 @@ impl Storage {
             }
             #[cfg(test)]
             Storage::Sim(disk) => disk.read(buf, offset),
+        }
+    }
+
+    /// Fills `buf`, which a value leaf is read into, from `offset`.
+    pub(crate) async fn read_value(
+        &self,
+        buf: ValueBuf,
+        offset: u64,
+    ) -> (io::Result<()>, ValueBuf) {
+        match self {
+            Storage::File(file) => {
+                debug_assert_blocks(&buf, offset);
+                let BufResult(res, buf) = file.read_exact_at(buf, offset).await;
+                (res, buf)
+            }
+            #[cfg(test)]
+            Storage::Sim(disk) => disk.read_value(buf, offset),
         }
     }
 
@@ -216,8 +233,7 @@ impl FileRead {
 
 /// Checks that file I/O is block-aligned, as direct I/O requires, even where it
 /// isn't enforced, like on macOS.
-fn debug_assert_blocks(buf: &FrameBuf, offset: u64) {
-    use compio::buf::IoBuf;
+fn debug_assert_blocks(buf: &impl IoBuf, offset: u64) {
     let (ptr, len) = (buf.as_init().as_ptr() as u64, buf.as_init().len() as u64);
     debug_assert!(
         ptr.is_multiple_of(BLOCK) && len.is_multiple_of(BLOCK) && offset.is_multiple_of(BLOCK),

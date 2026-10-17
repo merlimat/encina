@@ -17,7 +17,7 @@
 //! ```text
 //! offset  size  field
 //!      0     4  checksum (set when the page is written to disk; 0 in memory)
-//!      4     1  format: FORMAT_SLOTTED or FORMAT_DENSE
+//!      4     1  format: FORMAT_SLOTTED, FORMAT_DENSE or FORMAT_VALUE
 //!      5     1  level: 0 for leaves
 //!      6     2  entry count
 //!      8     2  key prefix length
@@ -49,6 +49,13 @@
 //! Internal nodes use the same formats. Their values are child references,
 //! [`CHILD_REF`] bytes: the child's frame, then its page id once it has one. Loading
 //! an internal node rewrites the frames, so its values are always stored whole.
+//!
+//! **Value leaves** hold one entry too large for the other formats, on as many
+//! adjacent pages as it needs: the header, with the key length at offset 8 and the
+//! value length, 4 bytes, at offset 12, then the key, the value, and zeros to the end
+//! of the last page. The checksum covers every page. A value leaf's page id records
+//! its span too (see [`spanned`]), so its parent knows it is one without reading it,
+//! and its key is its parent's key for it.
 
 use std::cmp::Ordering;
 
@@ -60,10 +67,140 @@ const SLOT: usize = 6;
 pub(crate) const CHILD_REF: usize = 12;
 const FORMAT_SLOTTED: u8 = 1;
 const FORMAT_DENSE: u8 = 2;
+const FORMAT_VALUE: u8 = 3;
 
-/// The largest key plus value that pages of `page_size` bytes accept: small enough
-/// that any four such entries, or four child references with keys that long, fit
-/// in one node.
+/// The bits of a page id that hold the page. The bits above hold a value leaf's
+/// span, in pages, and are 0 in every other node's page id.
+const PAGE_BITS: u32 = 40;
+
+/// The page id of a value leaf on pages `page..page + span`.
+pub(crate) fn spanned(page: u64, span: u64) -> u64 {
+    debug_assert!(first_page(page) == page && span > 0 && span < 1 << (64 - PAGE_BITS));
+    page | span << PAGE_BITS
+}
+
+/// The first page of the node with page id `id`.
+pub(crate) fn first_page(id: u64) -> u64 {
+    id & ((1 << PAGE_BITS) - 1)
+}
+
+/// The pages the value leaf with page id `id` spans, or 0 if `id` is another node's.
+pub(crate) fn span(id: u64) -> u64 {
+    id >> PAGE_BITS
+}
+
+/// The pages the node with page id `id` takes.
+pub(crate) fn pages(id: u64) -> u64 {
+    span(id).max(1)
+}
+
+/// Bytes a value leaf holding a key and a value of these lengths takes, short of
+/// the zeros that end its last page.
+pub(crate) fn value_leaf_len(key: usize, value: usize) -> usize {
+    HEADER + key + value
+}
+
+/// The header of a value leaf holding `key` and `value`, written by `generation`,
+/// on pages of `span_len` bytes in all. Its checksum covers them all.
+pub(crate) fn value_header(
+    key: &[u8],
+    value: &[u8],
+    generation: u64,
+    span_len: usize,
+) -> [u8; HEADER] {
+    static ZEROS: [u8; 4096] = [0; 4096];
+    let mut header = [0; HEADER];
+    header[4] = FORMAT_VALUE;
+    header[6..8].copy_from_slice(&1u16.to_le_bytes());
+    header[8..10].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    header[12..16].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    header[20..28].copy_from_slice(&generation.to_le_bytes());
+    let mut crc = crc32c::crc32c(&header[4..]);
+    crc = crc32c::crc32c_append(crc, key);
+    crc = crc32c::crc32c_append(crc, value);
+    let mut zeros = span_len - value_leaf_len(key.len(), value.len());
+    while zeros > 0 {
+        let n = zeros.min(ZEROS.len());
+        crc = crc32c::crc32c_append(crc, &ZEROS[..n]);
+        zeros -= n;
+    }
+    header[..4].copy_from_slice(&crc.to_le_bytes());
+    header
+}
+
+/// Copies bytes `at..at + out.len()` of a value leaf into `out`: its header, then
+/// `key`, then `value`, then zeros.
+pub(crate) fn copy_value_leaf(
+    out: &mut [u8],
+    at: usize,
+    header: &[u8; HEADER],
+    key: &[u8],
+    value: &[u8],
+) {
+    let mut start = 0;
+    for part in [&header[..], key, value] {
+        let end = start + part.len();
+        let (lo, hi) = (start.max(at), end.min(at + out.len()));
+        if lo < hi {
+            out[lo - at..hi - at].copy_from_slice(&part[lo - start..hi - start]);
+        }
+        start = end;
+    }
+    let zeros = start.clamp(at, at + out.len()) - at;
+    out[zeros..].fill(0);
+}
+
+/// Whether `span`, the pages a value leaf spans as read from disk, holds an intact
+/// one: it needs every page of the span, and its checksum matches.
+pub(crate) fn verify_value_leaf(span: &[u8], page_size: usize) -> bool {
+    if span.len() < HEADER || span[4] != FORMAT_VALUE || span[5] != 0 {
+        return false;
+    }
+    let crc = u32::from_le_bytes(span[..4].try_into().unwrap());
+    ValueLeaf::new(span).used().div_ceil(page_size) * page_size == span.len()
+        && crc32c::crc32c(&span[4..]) == crc
+}
+
+/// A value leaf, read from the pages it spans.
+pub(crate) struct ValueLeaf<'a> {
+    bytes: &'a [u8],
+    key_len: usize,
+    value_len: usize,
+}
+
+impl<'a> ValueLeaf<'a> {
+    /// The value leaf in `span`, the pages it spans, which [`verify_value_leaf`]
+    /// accepted.
+    pub(crate) fn new(span: &'a [u8]) -> Self {
+        ValueLeaf {
+            bytes: span,
+            key_len: u16_at(span, 8),
+            value_len: u32::from_le_bytes(span[12..16].try_into().unwrap()) as usize,
+        }
+    }
+
+    pub(crate) fn key(&self) -> &'a [u8] {
+        &self.bytes[HEADER..HEADER + self.key_len]
+    }
+
+    pub(crate) fn value(&self) -> &'a [u8] {
+        &self.bytes[HEADER + self.key_len..][..self.value_len]
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[20..28].try_into().unwrap())
+    }
+
+    /// The bytes it uses, its header included.
+    pub(crate) fn used(&self) -> usize {
+        value_leaf_len(self.key_len, self.value_len)
+    }
+}
+
+/// The largest key plus value that ordinary leaves on pages of `page_size` bytes
+/// hold, and the largest key: small enough that any four such entries, or four
+/// child references with keys that long, fit in one node. Larger entries get value
+/// leaves.
 pub(crate) fn max_entry(page_size: usize) -> usize {
     (page_size - HEADER) / 4 - HEAD - SLOT - CHILD_REF
 }
@@ -1005,6 +1142,43 @@ mod tests {
                 buf.push(k, v);
             }
             assert!(size(&buf, 0, 4, 1) <= page_size);
+        }
+    }
+
+    #[test]
+    fn page_ids_record_value_leaf_spans() {
+        assert_eq!((first_page(9), span(9), pages(9)), (9, 0, 1));
+        let id = spanned(1 << 39, (1 << 24) - 1);
+        assert_eq!((first_page(id), span(id)), (1 << 39, (1 << 24) - 1));
+        assert_eq!((first_page(spanned(9, 1)), pages(spanned(9, 1))), (9, 1));
+    }
+
+    #[test]
+    fn value_leaves_round_trip_page_by_page() {
+        let page_size = 256;
+        for (key_len, value_len) in [(0, 0), (3, 200), (5, 221), (7, 1000)] {
+            let (key, value) = (vec![1; key_len], vec![2; value_len]);
+            let span_len = value_leaf_len(key_len, value_len).div_ceil(page_size) * page_size;
+            let header = value_header(&key, &value, 7, span_len);
+            // Copy it out a page at a time, over pages that held something else.
+            let mut span = vec![0xaa; span_len];
+            for (i, page) in span.chunks_mut(page_size).enumerate() {
+                copy_value_leaf(page, i * page_size, &header, &key, &value);
+            }
+            assert!(verify_value_leaf(&span, page_size));
+            let leaf = ValueLeaf::new(&span);
+            assert_eq!((leaf.key(), leaf.value()), (&key[..], &value[..]));
+            assert_eq!(leaf.generation(), 7);
+            assert_eq!(leaf.used(), HEADER + key_len + value_len);
+            // A flipped bit anywhere, the padding included, fails the checksum.
+            for at in [5, span_len / 2, span_len - 1] {
+                span[at] ^= 1;
+                assert!(!verify_value_leaf(&span, page_size));
+                span[at] ^= 1;
+            }
+            // So does a span with a page too many.
+            span.extend_from_slice(&[0; 256]);
+            assert!(!verify_value_leaf(&span, page_size));
         }
     }
 }
