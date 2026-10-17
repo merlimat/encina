@@ -38,7 +38,7 @@ use crate::Comparison;
 use crate::batch::WriteBatch;
 use crate::cache::Cache;
 use crate::meta::Meta;
-use crate::node::{self, CHILD_REF, Entries, EntryBuf, NO_FRAME, Node};
+use crate::node::{self, CHILD_REF, Entries, EntryBuf, NO_FRAME, Node, ValueLeaf};
 use crate::pool::{FrameId, Holds, Pool};
 use crate::space::{Life, Space};
 
@@ -163,8 +163,8 @@ pub(crate) enum Find {
     NotFound,
     /// The lookup needs this leaf page, which isn't cached.
     Missing(u64),
-    /// Found in the value leaf with this page id, which has to be read. The key
-    /// wasn't copied.
+    /// Found in the value leaf with this page id, too large for the cache to keep,
+    /// which has to be read. The key wasn't copied.
     Value(u64),
 }
 
@@ -251,7 +251,7 @@ impl Tree {
     }
 
     /// Frees the pages replaced by versions no reader needs any more, evicting
-    /// any copies cached.
+    /// any copies cached, value leaves' included.
     fn reclaim(&mut self) {
         let Pages { pool, cache, space } = &mut self.pages;
         space.reclaim(|page| {
@@ -389,7 +389,7 @@ impl Tree {
                     return Find::NotFound;
                 };
                 if node::span(page) > 0 {
-                    return Find::Value(page);
+                    return self.find_value(page, out);
                 }
                 let Some(frame) = self.pages.cached(page) else {
                     return Find::Missing(page);
@@ -403,7 +403,7 @@ impl Tree {
             }
         };
         if frame == NO_FRAME {
-            return Find::Value(page);
+            return self.find_value(page, out);
         }
         let node = self.node(frame);
         node.key_into(at, out);
@@ -415,6 +415,21 @@ impl Tree {
                 Find::Copied(key_len)
             }
         }
+    }
+
+    /// The lookup's match: the entry of the value leaf with page id `page`. Copies
+    /// its key into `out` if the leaf is cached.
+    fn find_value(&mut self, page: u64, out: &mut Vec<u8>) -> Find {
+        if !self.pages.cache.caches(node::span(page)) {
+            return Find::Value(page);
+        }
+        let Some(frame) = self.pages.cached(page) else {
+            return Find::Missing(page);
+        };
+        let leaf = ValueLeaf::new(self.pages.pool.page(frame));
+        out.clear();
+        out.extend_from_slice(leaf.key());
+        Find::Found(leaf.value().as_ptr(), leaf.value().len())
     }
 
     // Writes.
@@ -603,8 +618,7 @@ impl Tree {
             self.release(old.frame);
         }
         for page in self.dropped.drain(..) {
-            let (first, n) = (node::first_page(page), node::pages(page));
-            self.pages.space.drop_pages(generation, first, n);
+            self.pages.space.drop_node(generation, page);
         }
         self.generation = generation;
         self.reclaim();
@@ -1459,12 +1473,17 @@ impl Tree {
             "pages leaked"
         );
         // Frames that cancelled reads left behind wait for the clock hand.
-        let cancelled = (0..pool.len() as FrameId)
+        // The pages each frame takes: a large frame holds a value leaf.
+        let pages = |frame| pool.frame(frame).pages as usize;
+        let cancelled: usize = (0..pool.slots())
+            .map(|i| pool.slot(i))
             .filter(|&f| pool.frame(f).holds == Holds::Loading && pool.refs(f) == 0)
-            .count();
+            .map(pages)
+            .sum();
+        let cached: usize = cache.entries().map(|(_, frame)| pages(frame)).sum();
         assert_eq!(
             pool.in_use(),
-            stats.internal + cache.len() + cancelled,
+            stats.internal + cached + cancelled,
             "frames leaked"
         );
         for (page, frame) in cache.entries() {
@@ -1473,8 +1492,14 @@ impl Tree {
                 (info.holds, info.page, info.dirty),
                 (Holds::Leaf, page, false)
             );
+            assert_eq!(
+                info.pages as u64,
+                node::pages(page),
+                "leaf {page} misframed"
+            );
             assert_eq!(pool.refs(frame), 0, "leaf {page} still pinned");
-            assert!(space.is_used(page), "cached leaf {page} on a free page");
+            let first = node::first_page(page);
+            assert!(space.is_used(first), "cached leaf {page} on a free page");
         }
         assert!(self.pinned.is_empty() && self.dirty.is_empty() && self.pending.is_none());
         assert!(self.values.is_empty());
@@ -1501,8 +1526,12 @@ impl Tree {
         let frame = if level == 0 {
             assert_eq!(frame, NO_FRAME);
             if node::span(page) > 0 {
-                // Its key is its parent's key for it, which the caller checks.
-                assert!(lo.is_some(), "a value leaf at the root");
+                // Its key is its parent's key for it.
+                let lo = lo.expect("a value leaf at the root");
+                if let Some(frame) = self.pages.cached(page) {
+                    let leaf = ValueLeaf::new(self.pages.pool.page(frame));
+                    assert_eq!(leaf.key(), lo, "value leaf under another key");
+                }
                 return None;
             }
             self.pages.cached(page)?

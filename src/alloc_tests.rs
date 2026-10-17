@@ -217,26 +217,56 @@ fn group_commits_do_not_allocate() {
     db.check();
 }
 
-#[test]
-fn reading_a_value_leaf_allocates_its_buffer_only() {
-    let db = now(Db::open_sim(SimDisk::new(), Options::default())).unwrap();
+/// A store holding 10 entries too large for a leaf, of `len` bytes each.
+fn value_leaves(opts: Options, len: usize) -> Db {
+    let db = now(Db::open_sim(SimDisk::new(), opts)).unwrap();
     let mut batch = WriteBatch::new();
     for i in 0..10 {
-        batch.put(&key(i), &[i as u8; 10_000]);
+        batch.put(&key(i), &vec![i as u8; len]);
     }
     now(db.write(&mut batch)).unwrap();
-    let get = |i| now(db.get(&key(i), Comparison::Equal, |_, v| v.len())).unwrap();
-    assert_eq!(get(0), Some(10_000));
-    assert_eq!(allocations(|| assert_eq!(get(3), Some(10_000))), 1);
-    // An iterator reuses its buffer for the next value leaf no larger.
-    let scan_all = || {
-        let mut iter = db.range(..);
-        let mut n = 0;
-        while now(iter.next()).unwrap().is_some() {
-            n += 1;
+    db
+}
+
+fn scan_values(db: &Db, len: usize) {
+    let mut iter = db.range(..);
+    let mut n = 0;
+    while let Some((_, v)) = now(iter.next()).unwrap() {
+        assert_eq!(v.len(), len);
+        n += 1;
+    }
+    assert_eq!(n, 10);
+}
+
+#[test]
+fn cached_value_leaves_are_read_without_allocating() {
+    let db = value_leaves(Options::default(), 10_000);
+    let get_all = || {
+        for i in 0..10 {
+            let found = now(db.get(&key(i), Comparison::Equal, |_, v| v.len())).unwrap();
+            assert_eq!(found, Some(10_000));
         }
-        assert_eq!(n, 10);
     };
-    scan_all();
-    assert_eq!(allocations(scan_all), 1);
+    // The first reads take a large frame for each, which the cache keeps, and the
+    // first iterator its buffers.
+    get_all();
+    scan_values(&db, 10_000);
+    assert_eq!(allocations(get_all), 0, "get allocated");
+    assert_eq!(
+        allocations(|| scan_values(&db, 10_000)),
+        0,
+        "iteration allocated"
+    );
+}
+
+#[test]
+fn reading_a_value_leaf_too_large_to_cache_allocates_its_buffer_only() {
+    // A quarter of a 64 KiB cache is 4 pages, and these values take 5.
+    let db = value_leaves(Options::default().cache_size(64 << 10), 20_000);
+    let get = |i| now(db.get(&key(i), Comparison::Equal, |_, v| v.len())).unwrap();
+    assert_eq!(get(0), Some(20_000));
+    assert_eq!(allocations(|| assert_eq!(get(3), Some(20_000))), 1);
+    // An iterator reuses its buffer for the next value leaf no larger.
+    scan_values(&db, 20_000);
+    assert_eq!(allocations(|| scan_values(&db, 20_000)), 1);
 }

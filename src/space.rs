@@ -32,6 +32,8 @@
 
 use std::collections::VecDeque;
 
+use crate::node;
+
 /// How many pages a run at the end of the file spans. Bounding it lets both
 /// [`Life`]s grow the file, each in runs of its own.
 const CHUNK: u64 = 256;
@@ -75,9 +77,9 @@ pub(crate) struct Space {
     /// How many pages the write in progress freed again.
     #[cfg(test)]
     pub(crate) freed: usize,
-    /// Stretches of pages that published versions replaced, with the generation
-    /// that replaced them, oldest first: generation, first page, and pages.
-    dropped: VecDeque<(u64, u64, u64)>,
+    /// The nodes that published versions replaced, by page id, with the
+    /// generation that replaced them, oldest first.
+    dropped: VecDeque<(u64, u64)>,
     /// The generations of readers that may still read older versions.
     readers: Vec<u64>,
 }
@@ -283,10 +285,10 @@ impl Space {
         self.lowest_free = self.lowest_free.min(page);
     }
 
-    /// Records that the version published as `generation` no longer uses pages
-    /// `page..page + n`.
-    pub(crate) fn drop_pages(&mut self, generation: u64, page: u64, n: u64) {
-        self.dropped.push_back((generation, page, n));
+    /// Records that the version published as `generation` no longer uses the node
+    /// with page id `id`, which takes [`node::pages`] pages.
+    pub(crate) fn drop_node(&mut self, generation: u64, id: u64) {
+        self.dropped.push_back((generation, id));
     }
 
     pub(crate) fn add_reader(&mut self, generation: u64) {
@@ -302,29 +304,31 @@ impl Space {
         self.readers.swap_remove(i);
     }
 
-    /// Frees the dropped pages that no reader can still need, passing each to
-    /// `freed`. A page dropped by generation `g` is needed by readers of earlier
-    /// generations.
+    /// Frees the pages of the dropped nodes that no reader can still need, passing
+    /// each node's page id to `freed`. A node dropped by generation `g` is needed by
+    /// readers of earlier generations.
     pub(crate) fn reclaim(&mut self, mut freed: impl FnMut(u64)) {
         let oldest = self.readers.iter().copied().min().unwrap_or(u64::MAX);
-        while let Some(&(generation, first, n)) = self.dropped.front() {
+        while let Some(&(generation, id)) = self.dropped.front() {
             if generation > oldest {
                 break;
             }
             self.dropped.pop_front();
-            for page in first..first + n {
+            let first = node::first_page(id);
+            for page in first..first + node::pages(id) {
                 self.unmark(page);
-                freed(page);
             }
+            freed(id);
         }
     }
 
     /// Pages dropped but not reclaimed yet.
     #[cfg(test)]
     pub(crate) fn dropped(&self) -> impl Iterator<Item = u64> + '_ {
-        self.dropped
-            .iter()
-            .flat_map(|&(_, first, n)| first..first + n)
+        self.dropped.iter().flat_map(|&(_, id)| {
+            let first = node::first_page(id);
+            first..first + node::pages(id)
+        })
     }
 
     /// Pages in use.
@@ -482,19 +486,20 @@ mod tests {
             space.mark_used(page);
         }
         space.add_reader(4);
-        space.drop_pages(5, 7, 1);
-        space.drop_pages(6, 2, 2);
-        space.drop_pages(6, 8, 1);
+        let value_leaf = node::spanned(2, 2);
+        space.drop_node(5, 7);
+        space.drop_node(6, value_leaf);
+        space.drop_node(6, 8);
         let mut freed = Vec::new();
-        space.reclaim(|page| freed.push(page));
+        space.reclaim(|id| freed.push(id));
         assert!(freed.is_empty());
         space.remove_reader(4);
         space.add_reader(5);
-        space.reclaim(|page| freed.push(page));
+        space.reclaim(|id| freed.push(id));
         assert_eq!(freed, [7]);
         space.remove_reader(5);
-        space.reclaim(|page| freed.push(page));
-        assert_eq!(freed, [7, 2, 3, 8]);
+        space.reclaim(|id| freed.push(id));
+        assert_eq!(freed, [7, value_leaf, 8]);
         assert!([2, 3, 7, 8].iter().all(|&page| !space.is_used(page)));
     }
 

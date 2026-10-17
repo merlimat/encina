@@ -1088,7 +1088,13 @@ fn a_read_only_view_of_value_leaves_is_stale_once_they_are_overwritten() {
     let mut model = Model::new();
     write(&store.db, &round(0));
     apply(&mut model, &round(0));
-    let view = now(ReadOnlyDb::open_sim(store.disk.clone(), opts)).unwrap();
+    // A cache that holds two of the value leaves, so that the view reads the
+    // others from the disk.
+    let view = now(ReadOnlyDb::open_sim(
+        store.disk.clone(),
+        opts.cache_size(16 * 256),
+    ))
+    .unwrap();
     let mut stale = 0;
     for r in 1..6 {
         // The owner reuses the pages of the value leaves a write replaces from its
@@ -1924,7 +1930,9 @@ fn cold_store(n: u32, frames: usize) -> (Store, Model) {
 fn loading_frames(db: &Db) -> (usize, usize) {
     let tree = db.tree();
     let pool = &tree.pages.pool;
-    let loading = (0..pool.len() as u32).filter(|&f| pool.frame(f).holds == Holds::Loading);
+    let loading = (0..pool.slots())
+        .map(|i| pool.slot(i))
+        .filter(|&f| pool.frame(f).holds == Holds::Loading);
     loading.fold((0, 0), |(busy, idle), f| match pool.refs(f) {
         0 => (busy, idle + 1),
         _ => (busy + 1, idle),
@@ -2137,6 +2145,127 @@ fn reading_ahead_stays_within_the_cache_budget() {
     assert_eq!(seen, model.len());
     drop(iter);
     store.db.check();
+}
+
+/// A store on 256-byte pages of `n` entries too large for a leaf, two pages each,
+/// reopened with a cache of `frames` pages, so that none of them is cached.
+fn cold_value_store(n: u32, frames: usize) -> (Store, Model) {
+    let mut store = Store::new(Options::new().page_size(256).cache_size(frames * 256));
+    let puts: Vec<_> = (0..n)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![i as u8; 300]))
+        .collect();
+    write(&store.db, &puts);
+    let mut model = Model::new();
+    apply(&mut model, &puts);
+    store.reopen();
+    (store, model)
+}
+
+#[test]
+fn concurrent_misses_on_a_value_leaf_share_one_read() {
+    let (store, model) = cold_value_store(40, 64);
+    let key = 17u32.to_be_bytes();
+    store.disk.hold();
+    let ops = store.disk.ops();
+    let value = |_: &[u8], v: &[u8]| v.to_vec();
+    let mut a = Box::pin(store.db.get(&key, Comparison::Equal, value));
+    let mut b = pin!(store.db.get(&key, Comparison::Equal, value));
+    let mut c = pin!(store.db.get(&key, Comparison::Equal, value));
+    assert!(poll(a.as_mut()).is_pending());
+    assert!(poll(b.as_mut()).is_pending());
+    assert!(poll(c.as_mut()).is_pending());
+    assert_eq!(
+        store.disk.ops() - ops,
+        1,
+        "a lookup read the value leaf again"
+    );
+    drop(a);
+    store.disk.release();
+    let value = Some(model[&key[..]].clone());
+    for get in [b, c] {
+        assert_eq!(now(get).unwrap(), value);
+    }
+    // The cache keeps it: reading it again reads nothing.
+    let found = now(store.db.get(&key, Comparison::Floor, |_, v| v.to_vec())).unwrap();
+    assert_eq!(found, value);
+    assert_eq!(store.disk.ops() - ops, 1);
+    store.db.check();
+}
+
+#[test]
+fn a_cold_scan_reads_value_leaves_ahead() {
+    let (store, model) = cold_value_store(40, 64);
+    store.disk.hold();
+    let ops = store.disk.ops();
+    let mut iter = store.db.range(..);
+    assert!(poll(pin!(iter.next())).is_pending());
+    // Value leaves take at most a quarter of the 64-page cache: the one the
+    // iterator waits for, and the 7 after it.
+    assert_eq!(store.disk.ops() - ops, 8);
+    assert_eq!(store.db.tree().pages.pool.large_pages(), 16);
+    store.disk.release();
+    assert_eq!(scan_rest(&mut iter), expected_scan(&model, ALL));
+    // Each value leaf was read once, and the cache kept a quarter's worth.
+    assert_eq!(store.disk.ops() - ops, 40);
+    assert!(store.db.tree().pages.pool.large_pages() <= 16);
+    drop(iter);
+    store.db.check();
+}
+
+/// The entries left in `iter`.
+fn scan_rest(iter: &mut crate::Iter) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    while let Some((k, v)) = now(iter.next()).unwrap() {
+        entries.push((k.to_vec(), v.to_vec()));
+    }
+    entries
+}
+
+#[test]
+fn value_leaves_take_at_most_a_quarter_of_the_cache() {
+    let (store, mut model) = cold_value_store(40, 64);
+    for key in model.keys() {
+        assert_eq!(
+            get(&store.db, key, Comparison::Equal).unwrap().1,
+            model[key]
+        );
+        assert!(store.db.tree().pages.pool.large_pages() <= 16);
+    }
+    // One larger than that quarter isn't cached: each read of it reads it.
+    let ops = [Op::Put(vec![1], vec![1; 5000])];
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    for _ in 0..2 {
+        let before = store.disk.ops();
+        assert_eq!(
+            get(&store.db, &[1], Comparison::Equal).unwrap().1,
+            model[&vec![1]]
+        );
+        assert_eq!(store.disk.ops() - before, 1);
+    }
+    check_reads(&store.db, &model);
+}
+
+#[test]
+fn a_cached_value_leaf_leaves_the_cache_with_its_pages() {
+    let store = Store::new(Options::new().page_size(256));
+    let key = b"k".to_vec();
+    let mut pages = Vec::new();
+    for round in 0..4u8 {
+        // Each write frees the pages of the value leaf it replaces, and the next one
+        // reuses them, under the same page id: no copy of the old one may remain.
+        write(&store.db, &[Op::Put(key.clone(), vec![round; 300])]);
+        assert_eq!(
+            get(&store.db, &key, Comparison::Equal),
+            Some((key.clone(), vec![round; 300]))
+        );
+        store.db.check();
+        pages.push(store.db.tree().leaves()[0].0);
+    }
+    assert!(
+        node::span(pages[0]) > 0 && pages[0] == pages[2],
+        "{pages:?}"
+    );
 }
 
 #[test]
