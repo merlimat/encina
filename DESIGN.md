@@ -4,7 +4,8 @@
 > M3, performance, is under way (§12): writes that queue up share commits (§6),
 > concurrent misses share one read, iterators read ahead (§8), nodes whose entries
 > allow it are dense (§5), and bench/ compares encina with RocksDB (§11). Yielding
-> inside large merges and writing large batches' new leaves early remain.
+> inside large merges and writing large batches' new leaves early remain. M4, value
+> leaves, which lift the limit on value sizes, is designed but not implemented (§5).
 
 encina is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. Its first
@@ -109,7 +110,8 @@ An entry (key + value) must fit in a quarter of a page (1 KiB with 4 KiB pages):
 every leaf then holds at least four entries, and there are no overflow pages. This
 limit is part of the public contract. It is documented on `WriteBatch::put` and
 `Options::page_size`, and `write()` rejects a batch containing an oversized entry
-with `Error::EntryTooLarge` before applying any of it.
+with `Error::EntryTooLarge` before applying any of it. Value leaves, planned below,
+lift the limit for values; keys keep it.
 
 ### What generality costs
 
@@ -174,6 +176,108 @@ Reads never allocate. Results reach the caller as borrowed slices. The key is
 rebuilt from prefix and suffix in a buffer owned by the call. The value comes
 straight from the leaf page, except in a dense leaf whose values share a prefix,
 where it is rebuilt in the same buffer, after the key.
+
+### Value leaves (planned)
+
+Not implemented yet (M4, §12). Value leaves lift the limit on value sizes: an entry
+too large for an ordinary leaf gets a leaf of its own, which spans as many adjacent
+pages as it needs. Keys keep the limit, since each leaf's smallest key is also a key
+in its parent, and an internal node must fit four children with keys that long.
+Values are written and read whole, so a value must fit in memory, and a batch holds
+at most 4 GiB, as now.
+
+**Format.** A value leaf holds one entry: a header like any node's, with a format of
+its own, then the key, the value, and zeros to the end of its last page. The
+header's checksum covers every page of the span. An entry goes to a value leaf when
+its key plus value exceeds the limit of ordinary leaves; its key alone may not.
+
+**References.** A reference to a node records its span with its page id. The 8-byte
+page field keeps the page id in its low 40 bits and the pages past the first in its
+high 24, so references keep their size and every other node's reads as before. The
+span then reaches every place that holds a reference: internal nodes, the meta
+page's root (a store whose only entry is large has a value leaf as its root), and
+the pages a write drops. With 4 KiB pages, 40 bits address 4 PiB, and 24 bits give
+spans of up to 64 GiB, more than a batch holds.
+
+**Free space.** The bottom internal level lists each value leaf with its span, so
+the open still builds the free bitmap from internal nodes alone (§7), and
+`delete_range` still drops value leaves without reading them. A dropped value leaf's
+pages become reusable together, subject to §8. A value leaf needs adjacent pages: it
+takes them from the write's run of long-lived pages when what is left of that run
+holds it, and otherwise from the first free stretch long enough, or from the end of
+the file. Value leaves aren't cached, so a write never moves one out of a mostly
+free window (§7).
+
+**Writes.** A write never reads a value leaf. A value leaf's key is its key in the
+parent, so the descent knows which operations reach it: a put or delete of that key
+replaces it, a range that covers the key drops it, and the other operations in its
+child range go to a new leaf beside it, which may then merge with its other neighbor
+like any underfull leaf. When a write rebuilds a leaf, a put too large for it
+becomes a value leaf between the leaves that the entries before and after it fill,
+and the split policy (§6) runs on each side. A value leaf is never underfull and
+never merges with a neighbor. Its parent keeps the reference as it is, so later
+writes never copy the value, while today an entry near the limit is copied each time
+its leaf is rebuilt.
+
+**Commit.** A value leaf is built only as the commit writes it. Direct I/O can't
+write from the batch, whose bytes aren't aligned, and building the whole leaf first
+would double the memory a large value takes. So the commit computes the checksum in
+one pass over the value, then copies the value from the batch into aligned buffers
+one request at a time, and writes its pages like any run (§7): requests of up to
+1 MiB, 16 in flight. The value is then in memory once, in the batch, plus the
+requests in flight. A write that queues behind a commit still copies its batch into
+the group's (§6), values included.
+
+**Reads.** The descent finds a value leaf's key in its parent, so `get` resolves its
+comparison without reading the value leaf. It then reads the span into a buffer it
+allocates, 4 KiB-aligned for direct I/O, checks the checksum and the generation, and
+lends the key and the value to `f`. Like a leaf read, it pins the version while it
+waits. An iterator that reaches a value leaf reads it the same way, into a buffer it
+keeps for the next one and frees when dropped. Reading ahead skips value leaves,
+which have no frames to go to. A read-only view treats a value leaf that fails its
+checks, or reaches past the end of the file, as it treats a leaf: it may be stale
+(§9). Reading a value leaf allocates its buffer, the one allocation on the data path
+besides frames and compio's (§3).
+
+**Not cached, at first.** Value leaves bypass the leaf cache: each read of one goes
+to the disk, and concurrent reads of the same one read it once each. Caching them
+needs buffers of many sizes in a pool built for page frames, and a large value in
+the cache would evict many leaves. Caching value leaves, and reading them ahead, are
+left for later.
+
+**Costs.** A value leaf rounds its entry up to whole pages: an entry just over the
+limit fills a bit more than a quarter of its page, and on average half a page per
+value leaf is padding. A larger page size raises the limit, and keeps more values in
+ordinary leaves. In memory, a value leaf costs its parent one reference, as any leaf
+does. A cold scan over value leaves waits for each one in turn.
+
+**API.** `WriteBatch::put` takes values of any length the batch holds, and keys up
+to the limit. `Error::EntryTooLarge` becomes `Error::KeyTooLarge`, and
+`Options::max_entry_size` becomes `max_key_size`. `get` and `range` don't change:
+values still reach the caller whole, as borrowed slices. `PageInfo` reports each
+node's span, so `encina stats` and `encina pages` can count value leaves apart.
+
+**Alternatives.**
+
+- Overflow pages that leaves point to, as in LMDB and SQLite, pack leaves better.
+  But leaves aren't resident: the open would have to read every leaf to build the
+  free bitmap, and `delete_range` the leaves it drops, unless free space were stored
+  rather than derived (§7).
+- A value log, as in WiscKey, needs garbage collection: the compaction §2 avoids.
+- Chunks of each value as ordinary entries, in a second tree keyed by the encoded
+  key and a chunk number, keep every invariant without a new format. But a read
+  gathers a value from many leaves and copies it, and every write and `delete_range`
+  updates both trees.
+
+**Testing.** Format tests round-trip value leaves and spans in references, with keys
+at the limit. The model-based tests write values on both sides of the limit,
+overwrite small values with large ones and back, cover value leaves with
+`delete_range`, and land every comparison on and beside them; the invariant checker
+counts each span's pages as live or free. The failure tests inject an error at each
+request of a value leaf's write and read, and crash commits that write one. A
+read-only view whose value leaf the owner reuses gets `Error::Stale`. The allocation
+tests keep the paths of §11 allocation-free, and check that reading a value leaf
+allocates its buffer and nothing else.
 
 ## 6. Operations
 
@@ -733,6 +837,8 @@ complete without suspending.
    ([#25](https://github.com/merlimat/encina/issues/25)), one shared read for
    concurrent misses and reading ahead in iterators (done, §8), coverage measured
    in CI (done, §11), and benchmarks against RocksDB (done, §11).
+4. **M4, large values:** value leaves (§5), outside the leaf cache, with values
+   written and read whole. Caching value leaves and reading them ahead come after.
 
 ## Non-goals (for now)
 
@@ -740,5 +846,7 @@ complete without suspending.
 - An internal WAL.
 - Transactions beyond atomic batches.
 - Entries larger than a quarter of a page (no overflow pages). The limit is part of
-  the documented public API (§5).
+  the documented public API (§5). Value leaves (M4) will lift it for values; keys
+  keep it.
+- Values that don't fit in memory: value leaves are written and read whole.
 - Custom comparators: keys compare as bytes.
