@@ -250,6 +250,7 @@ impl Pool {
     pub(crate) fn adopt_buf(&self, id: FrameId) -> FrameBuf {
         FrameBuf {
             _mem: self.mem.clone(),
+            id,
             data: NonNull::new(self.ptr(id)).unwrap(),
             len: self.page_size,
             refs: NonNull::from(self.refs_cell(id)),
@@ -262,12 +263,18 @@ impl Pool {
 /// future that started the operation is gone.
 pub(crate) struct FrameBuf {
     _mem: Rc<Memory>,
+    id: FrameId,
     data: NonNull<u8>,
     len: usize,
     refs: NonNull<Cell<u32>>,
 }
 
 impl FrameBuf {
+    /// The frame it is over.
+    pub(crate) fn id(&self) -> FrameId {
+        self.id
+    }
+
     #[cfg(test)]
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: frame memory is initialized (zeroed when allocated).
@@ -299,6 +306,69 @@ impl SetLen for FrameBuf {
 impl IoBufMut for FrameBuf {
     fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
         // SAFETY: as in `as_init`.
+        unsafe { slice::from_raw_parts_mut(self.data.as_ptr().cast(), self.len) }
+    }
+}
+
+/// A 4 KiB-aligned buffer that a value leaf is read into. Value leaves aren't
+/// cached, so their buffers aren't frames. A buffer can be reused for a value leaf
+/// no larger.
+pub(crate) struct ValueBuf {
+    data: NonNull<u8>,
+    len: usize,
+    cap: usize,
+}
+
+impl ValueBuf {
+    /// A buffer of `len` bytes, `old` if it holds that many.
+    pub(crate) fn new(old: Option<ValueBuf>, len: usize) -> ValueBuf {
+        if let Some(mut buf) = old.filter(|buf| buf.cap >= len) {
+            buf.len = len;
+            return buf;
+        }
+        let cap = len.max(1);
+        let layout = Layout::from_size_align(cap, ALIGN).unwrap();
+        // SAFETY: the layout has a non-zero size.
+        let data = unsafe { alloc::alloc_zeroed(layout) };
+        let data = NonNull::new(data).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        ValueBuf { data, len, cap }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: the memory is initialized (zeroed when allocated), and owned.
+        unsafe { slice::from_raw_parts(self.data.as_ptr(), self.len) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in `bytes`.
+        unsafe { slice::from_raw_parts_mut(self.data.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for ValueBuf {
+    fn drop(&mut self) {
+        let layout = Layout::from_size_align(self.cap, ALIGN).unwrap();
+        // SAFETY: allocated in `new` with this layout.
+        unsafe { alloc::dealloc(self.data.as_ptr(), layout) };
+    }
+}
+
+impl IoBuf for ValueBuf {
+    fn as_init(&self) -> &[u8] {
+        self.bytes()
+    }
+}
+
+impl SetLen for ValueBuf {
+    unsafe fn set_len(&mut self, _len: usize) {
+        // Reads fill the whole buffer, which is initialized anyway.
+    }
+}
+
+impl IoBufMut for ValueBuf {
+    fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
+        // SAFETY: as in `bytes`.
         unsafe { slice::from_raw_parts_mut(self.data.as_ptr().cast(), self.len) }
     }
 }

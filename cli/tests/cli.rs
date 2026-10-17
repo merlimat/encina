@@ -187,15 +187,15 @@ fn stat(stats: &str, name: &str) -> usize {
 }
 
 /// The rows of the table of `encina stats`, but for how full the pages are: level,
-/// pages, dense pages and entries.
-fn levels(stats: &str) -> Vec<[usize; 4]> {
+/// pages, dense nodes, value leaves and entries.
+fn levels(stats: &str) -> Vec<[usize; 5]> {
     let table = stats.lines().skip_while(|line| !line.starts_with("level"));
     table
         .skip(1)
         .map(|row| {
             let cells: Vec<usize> = row
                 .split_whitespace()
-                .take(4)
+                .take(5)
                 .map(|c| c.parse().unwrap())
                 .collect();
             cells.try_into().unwrap()
@@ -231,7 +231,7 @@ async fn stats_and_pages() {
     for (name, value) in summary {
         assert_eq!(stat(&stats, name), value, "{name}");
     }
-    assert_eq!(levels(&stats), [[0, 1, 1, 1]]);
+    assert_eq!(levels(&stats), [[0, 1, 1, 0, 1]]);
 
     // A tree of two levels.
     let mut batch = WriteBatch::new();
@@ -244,8 +244,8 @@ async fn stats_and_pages() {
         panic!("{stats}");
     };
     assert_eq!(root[..2], [1, 1]);
-    assert_eq!((leaves[0], leaves[3]), (0, 20_001), "k and the 20,000 keys");
-    assert_eq!(root[3], leaves[1], "the root's entries are the leaves");
+    assert_eq!((leaves[0], leaves[4]), (0, 20_001), "k and the 20,000 keys");
+    assert_eq!(root[4], leaves[1], "the root's entries are the leaves");
     assert_eq!(stat(&stats, "tree pages"), 1 + leaves[1]);
     let file = stat(&stats, "file pages");
     assert_eq!(file, 2 + 1 + leaves[1] + stat(&stats, "free pages"));
@@ -264,6 +264,22 @@ async fn stats_and_pages() {
     assert_eq!(shown('M'), 2);
     assert_eq!(shown('1'), 1);
     assert_eq!(shown('L') + shown('D'), leaves[1]);
+
+    // An entry too large for a leaf takes three pages of its own.
+    let mut batch = WriteBatch::new();
+    batch.put(b"big", &[b'v'; 10_000]);
+    db.write(&mut batch).await.unwrap();
+    let stats = ok(&["stats", path_str]);
+    let leaves = *levels(&stats).last().unwrap();
+    assert_eq!((leaves[3], leaves[4]), (1, 20_002));
+    let map = ok(&["pages", path_str]);
+    let shown = |c| map.chars().filter(|&s| s == c).count();
+    assert_eq!(shown('V'), 3);
+    assert_eq!(shown('L') + shown('D') + shown('V'), leaves[1]);
+    assert_eq!(
+        ok(&["get", path_str, "big"]),
+        format!("{}\n", "v".repeat(10_000))
+    );
     db.close().await.unwrap();
 }
 

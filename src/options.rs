@@ -56,8 +56,10 @@ impl Options {
     /// store that has another. A [`ReadOnlyDb`](crate::ReadOnlyDb) writes no
     /// pages, so it opens any store with its own.
     ///
-    /// The page size bounds entries: a put's key plus value may not exceed
-    /// [`max_entry_size`](Self::max_entry_size), a bit under a quarter of a page.
+    /// The page size bounds keys: a put's key may not exceed
+    /// [`max_key_size`](Self::max_key_size), a bit under a quarter of a page. An
+    /// entry whose key plus value exceeds that too gets pages of its own, rounded up
+    /// to whole pages, so a larger page size keeps more values in ordinary leaves.
     pub fn page_size(mut self, bytes: usize) -> Self {
         self.page_size = Some(bytes);
         self
@@ -81,17 +83,17 @@ impl Options {
     /// Internal nodes always stay in memory; leaves are cached within what's left,
     /// and evicted roughly least recently used first. A write needs the leaves it changes
     /// and the ones it builds in memory at once, so a large batch can exceed the
-    /// budget until it commits.
+    /// budget until it commits. Entries too large for a leaf aren't cached.
     pub fn cache_size(mut self, bytes: usize) -> Self {
         self.cache_size = bytes;
         self
     }
 
-    /// The largest key plus value a store with these options accepts. Larger
-    /// entries make [`Db::write`](crate::Db::write) reject the whole batch with
-    /// [`Error::EntryTooLarge`]. Without a page size, this is the limit of a new
+    /// The longest key a store with these options accepts. Longer keys make
+    /// [`Db::write`](crate::Db::write) reject the whole batch with
+    /// [`Error::KeyTooLarge`]. Without a page size, this is the limit of a new
     /// store's 4 KiB pages: an existing store's comes from its own page size.
-    pub fn max_entry_size(&self) -> usize {
+    pub fn max_key_size(&self) -> usize {
         node::max_entry(self.page_size.unwrap_or(DEFAULT_PAGE_SIZE))
     }
 

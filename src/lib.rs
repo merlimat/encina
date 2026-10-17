@@ -29,8 +29,9 @@
 //!   runtime thread owns its stores, and a store file has one `Db` at a time. A
 //!   [`ReadOnlyDb`] can read it meanwhile, as of when the view opened.
 //!
-//! Keys sort bytewise, so encode integers big-endian. A key plus its value may not
-//! exceed [`Options::max_entry_size`], a bit under a quarter of the page size.
+//! Keys sort bytewise, so encode integers big-endian. A key may not exceed
+//! [`Options::max_key_size`], a bit under a quarter of the page size. Values may be
+//! any size that fits in memory: an entry too large for a leaf gets pages of its own.
 //!
 //! # Example
 //!

@@ -58,10 +58,11 @@ impl WriteBatch {
 
     /// Sets `key` to `value`.
     ///
-    /// `key.len() + value.len()` may not exceed
-    /// [`Options::max_entry_size`](crate::Options::max_entry_size), a bit under a
-    /// quarter of the page size. Otherwise [`Db::write`](crate::Db::write) rejects
-    /// the whole batch with [`Error::EntryTooLarge`].
+    /// `key` may not exceed [`Options::max_key_size`](crate::Options::max_key_size),
+    /// a bit under a quarter of the page size. Otherwise
+    /// [`Db::write`](crate::Db::write) rejects the whole batch with
+    /// [`Error::KeyTooLarge`]. `value` may have any length, as long as the batch
+    /// stays under 4 GiB. An entry too large for a leaf gets pages of its own.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         self.push(Kind::Put, key, value);
     }
@@ -133,15 +134,12 @@ impl WriteBatch {
         &self.ranges
     }
 
-    /// Checks that no put's key plus value exceeds `max_entry` bytes.
-    pub(crate) fn check(&self, max_entry: usize) -> Result<()> {
+    /// Checks that no put's key exceeds `max_key` bytes.
+    pub(crate) fn check(&self, max_key: usize) -> Result<()> {
         for op in &self.ops {
-            let size = (op.a_len + op.b_len) as usize;
-            if op.kind == Kind::Put && size > max_entry {
-                return Err(Error::EntryTooLarge {
-                    size,
-                    max: max_entry,
-                });
+            let size = op.a_len as usize;
+            if op.kind == Kind::Put && size > max_key {
+                return Err(Error::KeyTooLarge { size, max: max_key });
             }
         }
         Ok(())
@@ -358,15 +356,18 @@ mod tests {
     }
 
     #[test]
-    fn oversized_entries_are_rejected() {
+    fn oversized_keys_are_rejected() {
         let mut batch = WriteBatch::new();
-        batch.put(b"key", &[0; 10]);
+        batch.put(&[0; 13], b"");
         assert!(matches!(
             batch.check(12),
-            Err(Error::EntryTooLarge { size: 13, max: 12 })
+            Err(Error::KeyTooLarge { size: 13, max: 12 })
         ));
+        // Values, and the keys of deletes and ranges, may be longer.
         batch.clear();
-        batch.put(b"key", &[0; 9]);
+        batch.put(&[0; 12], &[0; 100]);
+        batch.delete(&[0; 13]);
+        batch.delete_range(&[0; 13], &[1; 13]);
         batch.check(12).unwrap();
     }
 }

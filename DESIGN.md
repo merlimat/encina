@@ -4,8 +4,9 @@
 > M3, performance, is under way (§12): writes that queue up share commits (§6),
 > concurrent misses share one read, iterators read ahead (§8), nodes whose entries
 > allow it are dense (§5), and bench/ compares encina with RocksDB (§11). Yielding
-> inside large merges and writing large batches' new leaves early remain. M4, value
-> leaves, which lift the limit on value sizes, is designed but not implemented (§5).
+> inside large merges and writing large batches' new leaves early remain. M4 is
+> under way: entries too large for a leaf get value leaves (§5); caching them and
+> reading them ahead remain.
 
 encina is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. Its first
@@ -59,8 +60,8 @@ The costs to accept:
 | Durability | Each `write()` is atomic and durable: when it returns, the batch is on disk, and readers see it from that moment on. Writes that queue up behind a commit share the next one (§6). There is no separate flush and no internal WAL: after a crash the store opens at the last completed write, and the caller's journal replays anything newer. |
 | Threading | One `!Send` instance per compio thread, no locks or atomics, except in wakers, which Rust requires to be `Send` and `Sync` (§8). Scale by sharding (for example, by ledger id) above the library. |
 | Memory | Bounded from day one and managed entirely by encina: internal nodes stay resident, and leaves live in encina's own leaf cache with a budget, read on demand (§8). No reliance on the OS page cache or `mmap`: the data file is opened for direct I/O (§9). |
-| Allocation | No heap allocation on the data path. Page frames in the leaf cache are the only exception (§8); write batches, the batches that groups of writes share, cursors and reader bookkeeping reuse their memory. compio itself allocates once per I/O operation, so cache misses and commits are not allocation-free (§9). |
-| Keys and values | Arbitrary byte strings. Two node formats: slotted, which handles any lengths, and dense, for nodes whose keys share one length and whose values share another, chosen per node when it is built (§5). |
+| Allocation | No heap allocation on the data path. Page frames in the leaf cache are the only exception (§8), besides the buffer a value leaf is read into (§5); write batches, the batches that groups of writes share, cursors and reader bookkeeping reuse their memory. compio itself allocates once per I/O operation, so cache misses and commits are not allocation-free (§9). |
+| Keys and values | Arbitrary byte strings, keys up to a quarter of a page. Two node formats: slotted, which handles any lengths, and dense, for nodes whose keys share one length and whose values share another, chosen per node when it is built. An entry too large for either gets a value leaf of its own (§5). |
 
 ## 4. Architecture
 
@@ -106,12 +107,13 @@ write(batch) ─► new version ─► write new pages ─► fsync ─► meta 
 Keys and values are arbitrary byte strings. Keys are ordered lexicographically, so
 callers encode integers big-endian.
 
-An entry (key + value) must fit in a quarter of a page (1 KiB with 4 KiB pages):
-every leaf then holds at least four entries, and there are no overflow pages. This
-limit is part of the public contract. It is documented on `WriteBatch::put` and
-`Options::page_size`, and `write()` rejects a batch containing an oversized entry
-with `Error::EntryTooLarge` before applying any of it. Value leaves, planned below,
-lift the limit for values; keys keep it.
+A key must fit in a quarter of a page (1 KiB with 4 KiB pages): every internal
+node then holds at least four children. This limit is part of the public contract.
+It is documented on `WriteBatch::put` and `Options::page_size`, and `write()`
+rejects a batch containing an oversized key with `Error::KeyTooLarge` before
+applying any of it. An entry whose key plus value exceeds a quarter of a page gets a
+value leaf of its own (below), so every ordinary leaf holds at least four entries,
+and there are no overflow pages.
 
 ### What generality costs
 
@@ -177,27 +179,27 @@ rebuilt from prefix and suffix in a buffer owned by the call. The value comes
 straight from the leaf page, except in a dense leaf whose values share a prefix,
 where it is rebuilt in the same buffer, after the key.
 
-### Value leaves (planned)
+### Value leaves
 
-Not implemented yet (M4, §12). Value leaves lift the limit on value sizes: an entry
-too large for an ordinary leaf gets a leaf of its own, which spans as many adjacent
-pages as it needs. Keys keep the limit, since each leaf's smallest key is also a key
-in its parent, and an internal node must fit four children with keys that long.
-Values are written and read whole, so a value must fit in memory, and a batch holds
-at most 4 GiB, as now.
+Value leaves lift the limit on value sizes: an entry too large for an ordinary leaf
+gets a leaf of its own, which spans as many adjacent pages as it needs. Keys keep
+the limit, since each leaf's smallest key is also a key in its parent, and an
+internal node must fit four children with keys that long. Values are written and
+read whole, so a value must fit in memory, and a batch holds at most 4 GiB.
 
 **Format.** A value leaf holds one entry: a header like any node's, with a format of
 its own, then the key, the value, and zeros to the end of its last page. The
 header's checksum covers every page of the span. An entry goes to a value leaf when
 its key plus value exceeds the limit of ordinary leaves; its key alone may not.
 
-**References.** A reference to a node records its span with its page id. The 8-byte
-page field keeps the page id in its low 40 bits and the pages past the first in its
-high 24, so references keep their size and every other node's reads as before. The
-span then reaches every place that holds a reference: internal nodes, the meta
-page's root (a store whose only entry is large has a value leaf as its root), and
-the pages a write drops. With 4 KiB pages, 40 bits address 4 PiB, and 24 bits give
-spans of up to 64 GiB, more than a batch holds.
+**References.** A reference to a value leaf records its span with its page id. The
+8-byte page field keeps the page id in its low 40 bits and the span in its high 24,
+which are 0 for every other node, so references keep their size and a parent knows
+a value leaf without reading it. The span then goes wherever the reference goes,
+the pages a write drops included. A value leaf always has a parent: a store whose
+only entry is large keeps an internal node above it, so the meta page's root is
+never one. With 4 KiB pages, 40 bits address 4 PiB, and 24 bits give spans of up to
+64 GiB, more than a batch holds.
 
 **Free space.** The bottom internal level lists each value leaf with its span, so
 the open still builds the free bitmap from internal nodes alone (§7), and
@@ -216,30 +218,31 @@ like any underfull leaf. When a write rebuilds a leaf, a put too large for it
 becomes a value leaf between the leaves that the entries before and after it fill,
 and the split policy (§6) runs on each side. A value leaf is never underfull and
 never merges with a neighbor. Its parent keeps the reference as it is, so later
-writes never copy the value, while today an entry near the limit is copied each time
+writes never copy the value, while an entry in an ordinary leaf is copied each time
 its leaf is rebuilt.
 
 **Commit.** A value leaf is built only as the commit writes it. Direct I/O can't
 write from the batch, whose bytes aren't aligned, and building the whole leaf first
 would double the memory a large value takes. So the commit computes the checksum in
-one pass over the value, then copies the value from the batch into aligned buffers
-one request at a time, and writes its pages like any run (§7): requests of up to
-1 MiB, 16 in flight. The value is then in memory once, in the batch, plus the
-requests in flight. A write that queues behind a commit still copies its batch into
-the group's (§6), values included.
+one pass over the value, then copies the value from the batch into frames one
+request at a time, and writes its pages like any run (§7): requests of up to 1 MiB,
+16 in flight. It frees the frames once they are written. The value is then in
+memory once, in the batch, plus the requests in flight. A write that queues behind a
+commit still copies its batch into the group's (§6), values included.
 
 **Reads.** The descent finds a value leaf's key in its parent, so `get` resolves its
 comparison without reading the value leaf. It then reads the span into a buffer it
 allocates, 4 KiB-aligned for direct I/O, checks the checksum and the generation, and
 lends the key and the value to `f`. Like a leaf read, it pins the version while it
-waits. An iterator that reaches a value leaf reads it the same way, into a buffer it
+waits. An iterator that reaches a value leaf tells from the key in the parent
+whether it is in the range, and only then reads it the same way, into a buffer it
 keeps for the next one and frees when dropped. Reading ahead skips value leaves,
 which have no frames to go to. A read-only view treats a value leaf that fails its
 checks, or reaches past the end of the file, as it treats a leaf: it may be stale
 (§9). Reading a value leaf allocates its buffer, the one allocation on the data path
 besides frames and compio's (§3).
 
-**Not cached, at first.** Value leaves bypass the leaf cache: each read of one goes
+**Not cached, yet.** Value leaves bypass the leaf cache: each read of one goes
 to the disk, and concurrent reads of the same one read it once each. Caching them
 needs buffers of many sizes in a pool built for page frames, and a large value in
 the cache would evict many leaves. Caching value leaves, and reading them ahead, are
@@ -252,10 +255,11 @@ ordinary leaves. In memory, a value leaf costs its parent one reference, as any 
 does. A cold scan over value leaves waits for each one in turn.
 
 **API.** `WriteBatch::put` takes values of any length the batch holds, and keys up
-to the limit. `Error::EntryTooLarge` becomes `Error::KeyTooLarge`, and
-`Options::max_entry_size` becomes `max_key_size`. `get` and `range` don't change:
-values still reach the caller whole, as borrowed slices. `PageInfo` reports each
-node's span, so `encina stats` and `encina pages` can count value leaves apart.
+to the limit, which `Options::max_key_size` reports; `write()` rejects a longer one
+with `Error::KeyTooLarge`. `get` and `range` don't change: values still reach the
+caller whole, as borrowed slices. `PageInfo` says whether a node is a value leaf,
+and how many pages it takes, so `encina stats` and `encina pages` show value leaves
+apart.
 
 **Alternatives.**
 
@@ -269,15 +273,18 @@ node's span, so `encina stats` and `encina pages` can count value leaves apart.
   gathers a value from many leaves and copies it, and every write and `delete_range`
   updates both trees.
 
-**Testing.** Format tests round-trip value leaves and spans in references, with keys
-at the limit. The model-based tests write values on both sides of the limit,
-overwrite small values with large ones and back, cover value leaves with
-`delete_range`, and land every comparison on and beside them; the invariant checker
-counts each span's pages as live or free. The failure tests inject an error at each
-request of a value leaf's write and read, and crash commits that write one. A
-read-only view whose value leaf the owner reuses gets `Error::Stale`. The allocation
-tests keep the paths of §11 allocation-free, and check that reading a value leaf
-allocates its buffer and nothing else.
+**Testing.** Format tests round-trip value leaves a page at a time, and spans in
+page ids. The model-based tests write values on both sides of the limit, alone, in
+groups and during scans, overwrite small values with large ones and back, cover
+value leaves with `delete_range`, and land every comparison on and beside them; the
+invariant checker counts each span's pages as live or free. A store whose value
+leaves are all damaged still takes writes around them, over them and across them,
+which shows that writes don't read them. A value of 17 MiB takes 18 write requests.
+The failure tests inject an error at each operation of a scenario with value leaves,
+one of them larger than a request, and crash there. A read-only view whose value
+leaves the owner reuses gets `Error::Stale`. The allocation tests check that reading
+a value leaf allocates its buffer and nothing else, and that an iterator reuses its
+buffer.
 
 ## 6. Operations
 
@@ -339,7 +346,7 @@ published.
   its batch would be the group's first. The store keeps two group batches, the one
   committing and the one filling, and reuses their memory, so once warmed up,
   queueing allocates nothing.
-- **Errors.** A batch with an entry too large is rejected before it queues,
+- **Errors.** A batch with a key too long is rejected before it queues,
   alone. Any other error fails every write in the group: before the commit, it
   leaves the store unchanged; during it, the store fails (§7).
 - **Cancellation.** The group holds a copy of each batch, never a reference to a
@@ -430,7 +437,7 @@ fails; a read-only view, which writes nothing, takes the file's.
 | Pages | Content |
 |---|---|
 | 0, 1 | Meta slots: checksum, magic, format version, page size, root level, generation, root page, high-water mark. |
-| ≥ 2 | Tree pages, each with a header: crc32c, node format (slotted or dense), level, entry count, generation written. |
+| ≥ 2 | Tree pages, each with a header: crc32c, node format (slotted, dense or value leaf), level, entry count, generation written. A value leaf spans adjacent pages under one header (§5). |
 
 ### Free space is derived, not stored
 
@@ -533,7 +540,8 @@ completed write.
 - **Leaves** live in the cache, keyed by page id in a table sized at open, with CLOCK
   eviction. Only clean, unpinned leaves can be evicted: a write pins the leaves it
   changes and the ones it builds until it publishes, and a reader pins the leaf it
-  is on. Exposing cache numbers is left to a later metrics design.
+  is on. Exposing cache numbers is left to a later metrics design. Value leaves
+  aren't cached: each read of one reads it into a buffer of its own (§5).
 - **Misses** read the page straight into a free frame (direct I/O) and verify the
   checksum. Concurrent misses on the same page share one read, and iterators read
   ahead (below). A frame left behind by a cancelled read is reclaimed by the clock
@@ -651,8 +659,8 @@ impl Db {
     pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db>;
     /// Applies `batch` atomically and durably: once this returns `Ok`, the batch is
     /// on disk and visible to reads. Writes that queue up behind a commit share the
-    /// next one (§6). Fails with `Error::EntryTooLarge`, applying nothing, if an
-    /// entry is too large (§5).
+    /// next one (§6). Fails with `Error::KeyTooLarge`, applying nothing, if a key
+    /// is too long (§5).
     pub async fn write(&self, batch: &mut WriteBatch) -> Result<()>;
     /// Finds the entry matching `key` under `cmp` and calls `f` with its key and
     /// value, returning whatever `f` returns. The slices are only valid inside `f`,
@@ -706,9 +714,12 @@ impl ReadOnlyDb {
     pub async fn close(self) -> Result<()>;
 }
 
-/// A node: its page, level, entries (an internal node's are its children), the
-/// bytes it uses, and whether it is dense.
-pub struct PageInfo { pub page: u64, pub level: u8, pub entries: usize, pub used: usize, pub dense: bool }
+/// A node: its first page, level, entries (an internal node's are its children),
+/// the bytes it uses, whether it is dense or a value leaf, and the pages it takes.
+pub struct PageInfo {
+    pub page: u64, pub level: u8, pub entries: usize, pub used: usize,
+    pub dense: bool, pub value: bool, pub pages: u64,
+}
 
 pub enum Comparison { Equal, Floor, Ceiling, Lower, Higher }
 
@@ -778,7 +789,7 @@ complete without suspending.
 - **Group commit:** the simulated disk can also hold syncs and cuts, so that writes
   queue up behind a commit. Tests check that a group commits once, applying its
   batches in order, a later batch's puts and ranges overriding an earlier one's;
-  that a batch with an entry too large is rejected alone; that an error before the
+  that a batch with a key too long is rejected alone; that an error before the
   commit fails the whole group and leaves the store as it was, and one during it
   fails the store, leaving all of the group or none after reopening; and that a
   group holds what fits. They drop writes at every stage: while queued or waiting
@@ -838,15 +849,15 @@ complete without suspending.
    concurrent misses and reading ahead in iterators (done, §8), coverage measured
    in CI (done, §11), and benchmarks against RocksDB (done, §11).
 4. **M4, large values:** value leaves (§5), outside the leaf cache, with values
-   written and read whole. Caching value leaves and reading them ahead come after.
+   written and read whole (done). Caching value leaves and reading them ahead come
+   after.
 
 ## Non-goals (for now)
 
 - Access to one instance from multiple threads.
 - An internal WAL.
 - Transactions beyond atomic batches.
-- Entries larger than a quarter of a page (no overflow pages). The limit is part of
-  the documented public API (§5). Value leaves (M4) will lift it for values; keys
-  keep it.
+- Keys larger than a quarter of a page: each leaf's smallest key is also in its
+  parent (§5). The limit is part of the documented public API.
 - Values that don't fit in memory: value leaves are written and read whole.
 - Custom comparators: keys compare as bytes.

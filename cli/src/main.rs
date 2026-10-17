@@ -87,9 +87,11 @@ enum Command {
     },
     /// Prints how many pages the store's file holds, and what they hold
     ///
-    /// The table counts the nodes at each level of the tree, from the root down to
-    /// the leaves, at level 0: the dense ones among them, their entries (an
-    /// internal node's entries are its children), and how full their pages are.
+    /// The table counts the pages at each level of the tree, from the root down to
+    /// the leaves, at level 0: the dense nodes and the value leaves among them, their
+    /// entries (an internal node's entries are its children), and how full their
+    /// pages are. A value leaf holds an entry too large for a leaf, on as many pages
+    /// as it needs.
     Stats {
         /// The store's file
         path: PathBuf,
@@ -97,8 +99,8 @@ enum Command {
     /// Prints a map of the store's pages, 64 to a line
     ///
     /// Each line starts with the number of its first page. M is a meta page, L a
-    /// leaf, D a dense leaf, a digit an internal node at that level, and . a free
-    /// page.
+    /// leaf, D a dense leaf, V a page of a value leaf, a digit an internal node at
+    /// that level, and . a free page.
     Pages {
         /// The store's file
         path: PathBuf,
@@ -198,19 +200,27 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
                 free.iter().max().unwrap_or(&0)
             )?;
             if let Some(height) = nodes.iter().map(|info| info.level).max() {
-                writeln!(out, "\nlevel      pages      dense      entries    full")?;
+                writeln!(
+                    out,
+                    "\nlevel      pages      dense     values      entries    full"
+                )?;
                 for level in (0..=height).rev() {
-                    let (mut count, mut dense, mut entries, mut used) = (0, 0, 0, 0);
-                    for info in nodes.iter().filter(|info| info.level == level) {
-                        count += 1;
+                    let (mut count, mut dense, mut values, mut entries, mut used) = (0, 0, 0, 0, 0);
+                    // A value leaf is listed once for each of its pages.
+                    for (i, info) in nodes.iter().enumerate() {
+                        if info.level != level || (i > 0 && nodes[i - 1].page == info.page) {
+                            continue;
+                        }
+                        count += info.pages as usize;
                         dense += usize::from(info.dense);
+                        values += usize::from(info.value);
                         entries += info.entries;
                         used += info.used;
                     }
                     let full = 100.0 * used as f64 / (count * page_size) as f64;
                     writeln!(
                         out,
-                        "{level:>5} {count:>10} {dense:>10} {entries:>12} {full:>6.1}%"
+                        "{level:>5} {count:>10} {dense:>10} {values:>10} {entries:>12} {full:>6.1}%"
                     )?;
                 }
             }
@@ -231,6 +241,7 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
                             char::from_digit(info.level.into(), 36).unwrap_or('+')
                         }
                         Page::Node(info) if info.dense => 'D',
+                        Page::Node(info) if info.value => 'V',
                         Page::Node(_) => 'L',
                     };
                     write!(out, "{c}")?;
@@ -290,7 +301,7 @@ async fn read_pages(path: &Path) -> Result<(usize, Vec<Page>), Box<dyn Error>> {
     let len = fs::metadata(path)?.len() as usize;
     let end = nodes
         .iter()
-        .map(|info| info.page as usize + 1)
+        .map(|info| (info.page + info.pages) as usize)
         .max()
         .unwrap_or(0);
     let mut pages: Vec<_> = (0..end.max(len / page_size).max(META_PAGES))
@@ -303,7 +314,9 @@ async fn read_pages(path: &Path) -> Result<(usize, Vec<Page>), Box<dyn Error>> {
         })
         .collect();
     for info in nodes {
-        pages[info.page as usize] = Page::Node(info);
+        for page in info.page..info.page + info.pages {
+            pages[page as usize] = Page::Node(info);
+        }
     }
     Ok((page_size, pages))
 }

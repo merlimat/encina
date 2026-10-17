@@ -19,12 +19,12 @@ use std::io;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// A put's key plus value exceeds [`Options::max_entry_size`](crate::Options::max_entry_size).
+    /// A put's key exceeds [`Options::max_key_size`](crate::Options::max_key_size).
     /// The batch containing it was not applied.
-    EntryTooLarge {
-        /// The entry's key plus value, in bytes.
+    KeyTooLarge {
+        /// The key's length, in bytes.
         size: usize,
-        /// The largest key plus value the store accepts, in bytes.
+        /// The longest key the store accepts, in bytes.
         max: usize,
     },
     /// The options are invalid.
@@ -64,7 +64,7 @@ impl Error {
     /// A copy of the error, for each write of a group that failed together.
     pub(crate) fn duplicate(&self) -> Error {
         match self {
-            Error::EntryTooLarge { size, max } => Error::EntryTooLarge {
+            Error::KeyTooLarge { size, max } => Error::KeyTooLarge {
                 size: *size,
                 max: *max,
             },
@@ -89,8 +89,8 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::EntryTooLarge { size, max } => {
-                write!(f, "entry of {size} bytes exceeds the maximum of {max}")
+            Error::KeyTooLarge { size, max } => {
+                write!(f, "key of {size} bytes exceeds the maximum of {max}")
             }
             Error::InvalidOptions(reason) => write!(f, "invalid options: {reason}"),
             Error::PageSizeMismatch { store, options } => {
@@ -137,11 +137,11 @@ mod tests {
         assert_eq!(io.source().unwrap().to_string(), "disk on fire");
         let others = [
             (
-                Error::EntryTooLarge {
+                Error::KeyTooLarge {
                     size: 2000,
                     max: 1000,
                 },
-                "entry of 2000 bytes exceeds the maximum of 1000",
+                "key of 2000 bytes exceeds the maximum of 1000",
             ),
             (Error::InvalidOptions("why"), "invalid options: why"),
             (

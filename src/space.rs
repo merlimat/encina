@@ -75,9 +75,9 @@ pub(crate) struct Space {
     /// How many pages the write in progress freed again.
     #[cfg(test)]
     pub(crate) freed: usize,
-    /// Pages that published versions replaced, with the generation that replaced
-    /// them, oldest first.
-    dropped: VecDeque<(u64, u64)>,
+    /// Stretches of pages that published versions replaced, with the generation
+    /// that replaced them, oldest first: generation, first page, and pages.
+    dropped: VecDeque<(u64, u64, u64)>,
     /// The generations of readers that may still read older versions.
     readers: Vec<u64>,
 }
@@ -160,12 +160,53 @@ impl Space {
             (page, self.runs[i].end) = (next, end);
         }
         self.runs[i].next = page + 1;
-        if page >= self.high_water {
-            self.high_water = page + 1;
+        self.take(page, 1);
+        page
+    }
+
+    /// `n` adjacent free pages for a value leaf, which become used: from what is
+    /// left of the run for long-lived pages if they fit there, or else from the
+    /// first stretch of free pages long enough outside both runs, or the end of the
+    /// file. Returns the first.
+    pub(crate) fn alloc_span(&mut self, n: u64) -> u64 {
+        let run = self.runs[Life::Long as usize];
+        let start = self.next_free(run.next.min(run.end));
+        if start + n <= run.end && self.next_used(start).is_none_or(|used| used >= start + n) {
+            self.runs[Life::Long as usize].next = start + n;
+            self.take(start, n);
+            return start;
+        }
+        let mut start = self.next_free(self.lowest_free);
+        loop {
+            if let Some(run) = self.runs.iter().find(|r| (r.next..r.end).contains(&start)) {
+                start = self.next_free(run.end);
+                continue;
+            }
+            let mut end = self.next_used(start).unwrap_or(u64::MAX);
+            for run in self
+                .runs
+                .iter()
+                .filter(|r| r.next < r.end && r.next > start)
+            {
+                end = end.min(run.next);
+            }
+            if end - start >= n {
+                self.take(start, n);
+                return start;
+            }
+            start = self.next_free(end);
+        }
+    }
+
+    /// Marks free pages `page..page + n` used, growing the file to hold them.
+    fn take(&mut self, page: u64, n: u64) {
+        if page + n > self.high_water {
+            self.high_water = page + n;
             self.used.resize(self.high_water.div_ceil(64) as usize, 0);
         }
-        self.mark_used(page);
-        page
+        for page in page..page + n {
+            self.mark_used(page);
+        }
     }
 
     /// Whether a node on `page` that the write in progress keeps should move to a
@@ -242,9 +283,10 @@ impl Space {
         self.lowest_free = self.lowest_free.min(page);
     }
 
-    /// Records that the version published as `generation` no longer uses `page`.
-    pub(crate) fn drop_page(&mut self, generation: u64, page: u64) {
-        self.dropped.push_back((generation, page));
+    /// Records that the version published as `generation` no longer uses pages
+    /// `page..page + n`.
+    pub(crate) fn drop_pages(&mut self, generation: u64, page: u64, n: u64) {
+        self.dropped.push_back((generation, page, n));
     }
 
     pub(crate) fn add_reader(&mut self, generation: u64) {
@@ -265,20 +307,24 @@ impl Space {
     /// generations.
     pub(crate) fn reclaim(&mut self, mut freed: impl FnMut(u64)) {
         let oldest = self.readers.iter().copied().min().unwrap_or(u64::MAX);
-        while let Some(&(generation, page)) = self.dropped.front() {
+        while let Some(&(generation, first, n)) = self.dropped.front() {
             if generation > oldest {
                 break;
             }
             self.dropped.pop_front();
-            self.unmark(page);
-            freed(page);
+            for page in first..first + n {
+                self.unmark(page);
+                freed(page);
+            }
         }
     }
 
     /// Pages dropped but not reclaimed yet.
     #[cfg(test)]
     pub(crate) fn dropped(&self) -> impl Iterator<Item = u64> + '_ {
-        self.dropped.iter().map(|&(_, page)| page)
+        self.dropped
+            .iter()
+            .flat_map(|&(_, first, n)| first..first + n)
     }
 
     /// Pages in use.
@@ -436,8 +482,9 @@ mod tests {
             space.mark_used(page);
         }
         space.add_reader(4);
-        space.drop_page(5, 7);
-        space.drop_page(6, 8);
+        space.drop_pages(5, 7, 1);
+        space.drop_pages(6, 2, 2);
+        space.drop_pages(6, 8, 1);
         let mut freed = Vec::new();
         space.reclaim(|page| freed.push(page));
         assert!(freed.is_empty());
@@ -447,7 +494,29 @@ mod tests {
         assert_eq!(freed, [7]);
         space.remove_reader(5);
         space.reclaim(|page| freed.push(page));
-        assert_eq!(freed, [7, 8]);
-        assert!(!space.is_used(7) && !space.is_used(8));
+        assert_eq!(freed, [7, 2, 3, 8]);
+        assert!([2, 3, 7, 8].iter().all(|&page| !space.is_used(page)));
+    }
+
+    #[test]
+    fn spans_take_the_long_lived_run_or_a_stretch_long_enough() {
+        let mut space = space_with(200, (10..14).chain(50..50 + MIN_RUN).chain(100..120));
+        // The long-lived run starts at the first stretch of `MIN_RUN` free pages.
+        assert_eq!(space.alloc(Life::Long), 50);
+        assert_eq!(space.alloc_span(5), 51);
+        assert_eq!(space.alloc(Life::Long), 56);
+        // Too long for what is left of the run: the first stretch that holds it,
+        // past the short hole and the run.
+        assert_eq!(space.alloc_span(MIN_RUN), 100);
+        // What fits in the rest of the run goes there, then to the short hole.
+        assert_eq!(space.alloc_span(4), 57);
+        assert_eq!(space.alloc_span(5), 61);
+        assert_eq!(space.alloc_span(4), 10);
+        assert_eq!(space.alloc_span(4), 116);
+        // Then the end of the file, past the run there.
+        assert_eq!(space.alloc(Life::Short), 200);
+        assert_eq!(space.alloc_span(300), 200 + CHUNK);
+        assert_eq!(space.high_water(), 500 + CHUNK);
+        assert_eq!(space.alloc(Life::Short), 201);
     }
 }
