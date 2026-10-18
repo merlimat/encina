@@ -361,14 +361,13 @@ each for the appends' 3,000 pages, and 9 to 14 ms each for the random updates'
 20,000, which a disk writes while the write waits. Pinning the random updates'
 20,000 leaves, all cached, takes another 1.4 ms.
 
-Pausing costs the write some throughput. A pause is a trip through the runtime,
-about 15 µs on an Apple M5 Pro, which is why slices are measured in time: a fixed
-amount of work takes ten times longer in some batches than in others, since the
-operations of an unsorted batch lie scattered in its memory. Slices of 16K units,
-a tenth of a millisecond of the appends' merge, made the benchmark's load (bench/)
-8% slower; slices of a millisecond make it 2% slower. With four writers it is 5%
-slower: while the merge pauses, the other writers build their next batches, work
-that used to wait for the commit's disk writes, where it cost no time.
+A pause is a trip through the runtime, about 15 µs on an Apple M5 Pro, which is
+why slices are measured in time: a fixed amount of work takes ten times longer in
+some batches than in others, since the operations of an unsorted batch lie
+scattered in its memory. Slices of 16K units, a tenth of a millisecond of the
+appends' merge, made the benchmark's load (bench/) 8% slower. With slices of a
+millisecond it is about 2% slower with one writer, and no slower with four, within
+the runs' noise.
 
 Normalizing and planning in slices cost no more, since the merge sort is faster
 than the standard library's sort on the batches the benchmark writes. Over 15
