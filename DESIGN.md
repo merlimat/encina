@@ -2,7 +2,7 @@
 
 > Status: M1 and M2 are implemented: the tree, persistence and the leaf cache.
 > M3, performance, is under way (§12): writes that queue up share commits (§6),
-> large merges pause to let other tasks run (§6), concurrent misses share one
+> large writes pause to let other tasks run (§6), concurrent misses share one
 > read, iterators read ahead (§8), nodes whose entries allow it are dense (§5),
 > and bench/ compares encina with RocksDB (§11). Writing large batches' new
 > leaves early remains. M4 is done: entries too large for a leaf get value
@@ -306,9 +306,13 @@ arena that `clear()` empties without releasing, so a caller that reuses its batc
 doesn't allocate. The operations are applied in order and atomically.
 
 1. **Normalize.** Drop point operations made obsolete by a later range in the same
-   batch. Stable-sort the rest by key (through an index array kept in the batch) and
-   keep the last operation per key. Sorted input (BookKeeper's write cache is
-   sorted) costs one linear check.
+   batch. Sort the rest by key, through an index array kept in the batch, keeping
+   the order of equal keys, and keep the last operation per key. The sort is a
+   natural merge sort: it finds the runs sorted already, then merges them in pairs,
+   so sorted input (BookKeeper's write cache is sorted) costs one linear check, and
+   a group of k sorted batches log2(k) passes. A run shorter than 4,096
+   operations, as unsorted batches have, is first extended by sorting 4,096 at once
+   with the standard library's sort.
 2. **Plan.** Descend the resident internal nodes to find the leaves the batch
    changes, and load the ones that aren't cached, keeping them pinned. Subtrees
    that ranges remove whole aren't read.
@@ -323,31 +327,39 @@ doesn't allocate. The operations are applied in order and atomically.
    and the pages of the nodes it replaced become free, subject to §8.
 
 **Pausing.** Readers keep running while a write waits for the disk, and while it
-merges. The merge is CPU work that grows with the batch, so once it has run for a
-millisecond, it pauses and lets the other tasks run. It looks at the clock every
-4,096 units of work: entries copied, merged or built, and nodes visited. That is
-safe: readers keep using the old root until the swap, and only one commit runs at a
-time. The merge keeps its place in fixed state, one record per level of the path it
-is on: the child it is at, the operations left for the children after it, and how
-far it got rebuilding a leaf or building nodes. So pausing allocates nothing, and
-resuming descends again to where it left off. A merge that pauses builds the same
-tree, on the same pages, as one that doesn't.
+normalizes, plans and merges its batch. That is CPU work that grows with the
+batch, so once it has run for a millisecond, it pauses and lets the other tasks
+run. It looks at the clock every 4,096 units of work: operations listed, compared
+or moved, nodes visited, and entries copied, merged or built. A node that planning
+visits counts as 64, since searching an unsorted batch's operations for it takes up
+to 2 µs. That is safe: readers keep using the old root until the swap, and only one
+commit runs at a time. Each step keeps its place in fixed state. Normalizing keeps
+the step it is at and how far it got: in the merge sort, the pass, the pair of runs
+it merges, and the operation it is at in each. Planning and the merge keep one
+record per level of the path they are on: the child they are at, the operations
+left for the children after it, and how far the merge got rebuilding a leaf or
+building nodes. So pausing allocates nothing, and resuming descends again to where
+it left off. A merge that pauses builds the same tree, on the same pages, as one
+that doesn't.
 
 Measured with the ignored test `read_latency_during_a_load`, on an Apple M5 Pro: a
 store of 2M BookKeeper-shaped entries on the simulated disk takes writes of 1M
 entries, while a lookup is due every 20 µs. A lookup's latency runs from when it
 was due until it returns.
 
-| Write of 1M entries | Merge | Lookup p50 | p99 | Max |
+| Write of 1M entries | Write | Lookup p50 | p99 | Max |
 |---|---|---:|---:|---:|
-| Appends to 1,000 ledgers | doesn't pause | 23.2 ms | 49.1 ms | 50.0 ms |
-| | pauses | 0.70 ms | 14.2 ms | 14.9 ms |
-| Random updates | doesn't pause | 224 ms | 450 ms | 459 ms |
-| | pauses | 0.98 ms | 205 ms | 213 ms |
+| Appends to 1,000 ledgers | doesn't pause | 21.8 ms | 46.4 ms | 47.3 ms |
+| | pauses | 0.55 ms | 2.5 ms | 3.7 ms |
+| Random updates | doesn't pause | 206 ms | 407 ms | 413 ms |
+| | pauses | 0.58 ms | 16.8 ms | 22.1 ms |
 
-What remains is normalizing and planning the batch, which don't pause yet: they
-make the tail above, about 14 ms of the sorted appends, and 200 ms of the random
-updates, which have to be sorted.
+Normalizing, planning and merging then never run for more than 1.3 ms at a time.
+What remains is mostly the simulated disk, which copies the pages a commit writes,
+and copies them again when it syncs, without letting other tasks run: 1 to 2 ms
+each for the appends' 3,000 pages, and 9 to 14 ms each for the random updates'
+20,000, which a disk writes while the write waits. Pinning the random updates'
+20,000 leaves, all cached, takes another 1.4 ms.
 
 A pause is a trip through the runtime, about 15 µs on an Apple M5 Pro, which is
 why slices are measured in time: a fixed amount of work takes ten times longer in
@@ -356,6 +368,17 @@ scattered in its memory. Slices of 16K units, a tenth of a millisecond of the
 appends' merge, made the benchmark's load (bench/) 8% slower. With slices of a
 millisecond it is about 2% slower with one writer, and no slower with four, within
 the runs' noise.
+
+Normalizing and planning in slices cost no more, since the merge sort is faster
+than the standard library's sort on the batches the benchmark writes. Over 15
+alternating runs of its load, against a build that never pauses, the median time
+was 0.6% lower with one writer, 3.8% lower with four, whose groups of sorted
+batches the merge sort merges rather than sorting them again, and 0.4% higher with
+commits of 100 entries, within the runs' noise; pausing only the merge made it
+1.7%, 0.9% and 1.2% higher in the same runs. On its own, the merge sort normalizes
+1M sorted operations in 7.3 ms rather than the 8.5 ms the standard library's sort
+took, four sorted batches of 250K in 11 ms rather than 50, and 1M random ones in
+155 ms rather than 140.
 
 **Split policy.** A rebuilt leaf that overflows splits right after each run of
 inserted keys that fills at least a quarter page (the per-ledger append case): the
@@ -392,9 +415,9 @@ published.
   leaves the store unchanged; during it, the store fails (§7).
 - **Cancellation.** The group holds a copy of each batch, never a reference to a
   caller's. Dropping a write withdraws its batch while the write waits, and while
-  its group is being built, its merge included: the write building it then starts
-  over without that batch, since leaves the batch's ranges covered may now be
-  needed. Once the group
+  its group is being built, its normalizing, planning and merge included: the write
+  building it then starts over without that batch, since leaves the batch's ranges
+  covered may now be needed. Once the group
   writes pages, its batches commit together, whichever of its writes are dropped.
   Dropping the write committing them then fails the store, as it does for a single
   write, and its group's other writes return `Error::Failed`. If the write
@@ -689,8 +712,8 @@ same 282 MiB.
   keeps the reads it holds inline; and the table of reads in flight reuses its
   slots (§8). If compio's show up in profiles, the fix belongs upstream (pooled
   operation slots).
-- Large merges pause after each slice of work and yield to the executor (§6).
-  Normalizing and planning a batch don't yet.
+- A large write normalizes, plans and merges its batch a slice at a time, and
+  yields to the executor in between (§6).
 - **Linux with io_uring is the target.** macOS works for development, but there
   compio runs file I/O on a blocking thread pool and `fsync` is a plain `fsync`
   (no `F_FULLFSYNC`), so macOS gives no durability guarantee against power loss.
@@ -840,19 +863,27 @@ complete without suspending.
   fails the store, leaving all of the group or none after reopening; and that a
   group holds what fits. They drop writes at every stage: while queued or waiting
   for room, which withdraws them; while their group is built, which makes the
-  write building it start over, with a leaf it hadn't needed before, or while its
-  merge pauses; the write building, whose group another write takes over, one
-  queued for the next group included, and while its merge pauses; while the group
-  commits, which commits them anyway; and the write committing, while it syncs or
-  cuts the file. The model-based property tests also write groups, dropping some of
+  write building it start over, with a leaf it hadn't needed before, or while it
+  normalizes the group's batch or its merge pauses; the write building, whose group
+  another write takes over, one queued for the next group included, and while it
+  normalizes or its merge pauses; while the group commits, which commits them
+  anyway; and the write committing, while it syncs or cuts the file. The model-based property tests also write groups, dropping some of
   their writes, and a test on a real file checks that eight concurrent writes take
   two commits.
-- **Pausing merges:** the model-based property tests also run with merges that pause
-  after every 1 to 100 units of work rather than after a millisecond, with a tiny
-  cache too, scanning the store while a write pauses, then finishing or dropping it.
-  Two stores, one of whose merges pause, build the same trees on the same pages. A
-  write dropped at each of its pauses in turn, in a tree of four levels, leaves the
-  store as it was, every page and frame accounted for. On a compio runtime, another
+- **Pausing writes:** the model-based property tests also run with writes that
+  pause after every 1 to 100 units of work rather than after a millisecond, with a
+  tiny cache too, scanning the store while a write pauses, then finishing or
+  dropping it. Normalizing that pauses after any number of units gives the same
+  operations and ranges, down to which of a key's operations is kept, as sorting
+  the batch at once did: for random batches, groups some of whose writes left, and
+  sorted batches merged out of order. The merge sort orders runs of any length,
+  extended to any length, by key, then by operation, and its comparison of keys as
+  16-byte numbers agrees with comparing their bytes. Planning that pauses lists the
+  same leaves as planning at once, in trees of four levels. Two stores, one of whose
+  merges pause, build the same trees on the same pages. A write dropped at each of
+  its pauses in turn, in a tree of four levels, leaves the store as it was, every
+  page and frame accounted for; so does one dropped while it normalizes or plans,
+  and its batch, reused, then writes what it holds. On a compio runtime, another
   task's lookups run while a write merges, and see the last version.
 - **Damage:** a flipped bit in a leaf fails the reads that need it, and one in an
   internal node fails the open, both with `Error::Corruption`, as does a child
@@ -874,9 +905,9 @@ complete without suspending.
   its page write is in flight leaves the store failed until it reopens.
 - **Allocation tests:** a counting global allocator asserts that `get` and iteration
   over cached pages, `get` and iteration that miss the cache (reading ahead
-  included), and `write` with a reused batch, alone, with a merge that pauses, or in
-  a group, all on the simulated disk, perform no allocations. On a real disk, compio
-  adds one per I/O operation.
+  included), and `write` with a reused batch, alone, pausing as it normalizes, plans
+  and merges, with ranges and keys in no order, or in a group, all on the simulated
+  disk, perform no allocations. On a real disk, compio adds one per I/O operation.
 - **Sanitizers:** CI runs every test under AddressSanitizer, std included, so a
   use of freed memory or a leak fails the run even where the test's own checks
   pass, real files' io_uring path included. One test drops a store while the

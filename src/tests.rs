@@ -198,7 +198,7 @@ enum Step {
     Group(Vec<(Vec<Op>, bool)>),
     /// A write polled at most this many times, each poll stopping where it yields,
     /// with a full scan after each, which mustn't see it. Then it is finished if
-    /// marked, and dropped otherwise: if its merge paused, it applies nothing.
+    /// marked, and dropped otherwise: if it paused, it applies nothing.
     Paused(Vec<Op>, u8, bool),
     /// Restarts the machine and reopens the store.
     Reopen,
@@ -317,7 +317,7 @@ fn run(opts: Options, steps: &[Step]) {
     run_sliced(opts, None, steps);
 }
 
-/// Runs `steps` on a store whose merges pause after every `slice` of work, if set.
+/// Runs `steps` on a store whose writes pause after every `slice` of work, if set.
 fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
     let mut store = Store::new(opts);
     store.db.set_merge_slice(slice);
@@ -537,11 +537,43 @@ proptest! {
     }
 
     #[test]
+    fn plans_that_pause_list_the_same_leaves(
+        steps in prop::collection::vec(step(value_len_across_the_limit()), 1..40),
+        ops in prop::collection::vec(op(0..=12usize), 1..60),
+        slice in 1..100usize,
+    ) {
+        same_plans(&steps, &ops, slice);
+    }
+
+    #[test]
     fn merges_that_pause_build_the_same_dense_trees(
         steps in prop::collection::vec(dense_step(), 1..40),
         slice in 1..100usize,
     ) {
         same_trees(Options::new().page_size(256), slice, &steps);
+    }
+}
+
+/// Writes `steps` to a store of four levels, then plans a write of `ops`, at once
+/// and pausing after every `slice` of work: both list the leaves that planning
+/// listed before it paused.
+fn same_plans(steps: &[Step], ops: &[Op], slice: usize) {
+    let store = Store::new(Options::new().page_size(256));
+    let load: Vec<_> = (0..2000u32)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![1; 40]))
+        .collect();
+    write(&store.db, &load);
+    assert_eq!(store.db.tree().current().root.unwrap().level, 3);
+    for ops in steps.iter().map(Step::ops).filter(|ops| !ops.is_empty()) {
+        write(&store.db, &ops);
+    }
+    let mut tree = store.db.tree();
+    let mut batch = batch_of(ops);
+    for slice in [usize::MAX, slice] {
+        tree.set_slice(Some(slice));
+        while tree.plan(&mut batch).is_pending() {}
+        let expected = tree.plan_at_once(&batch);
+        assert_eq!(tree.touched, expected);
     }
 }
 
@@ -2959,7 +2991,7 @@ fn reads_see_the_last_version_while_a_write_merges() {
     let ops = rewrite_all();
     let mut batch = batch_of(&ops);
     let mut write = Box::pin(store.db.write(&mut batch));
-    // The merge pauses before the write reads or writes anything.
+    // The write pauses before it reads or writes anything, normalizing its batch.
     let io = store.disk.ops();
     assert!(poll_once(write.as_mut()).is_pending());
     assert_eq!(store.disk.ops(), io);
@@ -2979,7 +3011,7 @@ fn reads_see_the_last_version_while_a_write_merges() {
     while poll_once(write.as_mut()).is_pending() {
         pauses += 1;
     }
-    assert!(pauses > 10, "the merge paused {pauses} times");
+    assert!(pauses > 10, "the write paused {pauses} times");
     // The iterator started before the write published: it doesn't see it.
     while let Some((k, v)) = now(iter.next()).unwrap() {
         seen.push((k.to_vec(), v.to_vec()));
@@ -2996,11 +3028,12 @@ fn a_write_dropped_while_its_merge_pauses_changes_nothing() {
     let (mut store, model) = store_of(200);
     store.db.set_merge_slice(Some(4));
     let start = generation(&store.db);
-    // The merge pauses 50 times.
+    // The merge pauses 50 times, once normalizing and planning are done.
     for polls in [1, 10, 49] {
         let mut batch = batch_of(&rewrite_all());
         let mut write = Box::pin(store.db.write(&mut batch));
-        for _ in 0..polls {
+        pause_merging(&store.db, write.as_mut());
+        for _ in 1..polls {
             assert!(poll_once(write.as_mut()).is_pending());
         }
         // The pages the merge built go back to the free set, and the leaves it
@@ -3021,12 +3054,67 @@ fn a_write_dropped_while_its_merge_pauses_changes_nothing() {
 }
 
 #[test]
+fn a_write_dropped_while_it_plans_changes_nothing() {
+    // Three levels of 256-byte pages, whose planning pauses.
+    let store = Store::new(Options::new().page_size(256));
+    let mut model = Model::new();
+    let load: Vec<_> = (0..2000).map(|i| scattered_put(i, 1)).collect();
+    write(&store.db, &load);
+    apply(&mut model, &load);
+    assert_eq!(store.db.tree().current().root.unwrap().level, 2);
+    let mut ops: Vec<_> = (0..2000).step_by(3).map(|i| scattered_put(i, 2)).collect();
+    ops.push(range_op(500, 900));
+    store.db.set_merge_slice(Some(4));
+    let start = generation(&store.db);
+    let mut batch = batch_of(&ops);
+    // Dropped at its first pause, normalizing its batch, then once planning has
+    // found leaves to load, before it loads them.
+    for planning in [false, true] {
+        let mut write = Box::pin(store.db.write(&mut batch));
+        loop {
+            assert!(poll_once(write.as_mut()).is_pending());
+            let tree = store.db.tree();
+            assert!(tree.pinned.is_empty(), "the write was done planning");
+            if !planning || !tree.touched.is_empty() {
+                break;
+            }
+        }
+        drop(write);
+        store.db.check();
+        assert_eq!(generation(&store.db), start);
+        assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    }
+    // Their batch, reused, writes what it holds.
+    now(store.db.write(&mut batch)).unwrap();
+    apply(&mut model, &ops);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+/// Polls `write`, each poll stopping where it yields, until it pauses merging, as
+/// it does once it holds the leaves its batch changes.
+fn pause_merging<F: Future + ?Sized>(db: &Db, mut write: Pin<&mut F>) {
+    loop {
+        assert!(
+            poll_once(write.as_mut()).is_pending(),
+            "the write didn't pause"
+        );
+        if !db.tree().pinned.is_empty() {
+            return;
+        }
+    }
+}
+
+/// A put of key `i`, written in `round`. Values that share no prefix keep leaves
+/// from holding many entries.
+fn scattered_put(i: u32, round: u32) -> Op {
+    let value = (i.wrapping_mul(0x9e37_79b9) ^ round).to_be_bytes();
+    Op::Put(i.to_be_bytes().to_vec(), value.repeat(2))
+}
+
+#[test]
 fn a_write_dropped_at_any_pause_changes_nothing() {
-    // Values that share no prefix keep leaves from holding many entries.
-    let put = |i: u32, round: u32| {
-        let value = (i.wrapping_mul(0x9e37_79b9) ^ round).to_be_bytes();
-        Op::Put(i.to_be_bytes().to_vec(), value.repeat(2))
-    };
+    let put = scattered_put;
     // Four levels of 256-byte pages: the merge pauses with nodes of every level
     // built, and with unbuilt ones referring to nodes it built or kept.
     let store = Store::new(Options::new().page_size(256));
@@ -3074,31 +3162,41 @@ fn a_write_dropped_at_any_pause_changes_nothing() {
 }
 
 /// Queues writes of `queued` behind a first write, then has the first of them
-/// lead its group until its merge pauses.
-fn pause_group_merge<'a>(
+/// lead its group until it pauses: normalizing the group's batch, or once
+/// `merging`, merging it.
+fn pause_group<'a>(
     store: &Store,
     model: &mut Model,
     queued: &'a mut [WriteBatch],
     db: &'a Db,
+    merging: bool,
 ) -> Vec<Write<'a>> {
     let first = puts(0..50, 2);
     let mut writes = queue_behind(store, &first, queued, db);
     apply(model, &first);
     db.set_merge_slice(Some(4));
     let io = store.disk.ops();
-    assert!(poll_once(writes[0].as_mut()).is_pending());
-    assert_eq!(store.disk.ops(), io, "the group's merge didn't pause");
+    if merging {
+        pause_merging(db, writes[0].as_mut());
+    } else {
+        assert!(poll_once(writes[0].as_mut()).is_pending());
+        assert!(
+            db.tree().touched.is_empty(),
+            "the group's write was planning"
+        );
+    }
+    assert_eq!(store.disk.ops(), io, "the group's write didn't pause");
     writes
 }
 
-#[test]
-fn a_write_dropped_while_its_merge_pauses_leaves_its_group_to_the_others() {
+/// Drops the write leading a group while it pauses, `merging` or normalizing.
+fn drop_group_leader(merging: bool) {
     let (store, mut model) = store_of(200);
     let start = generation(&store.db);
     let queued = [rewrite_all(), vec![range_op(100, 120)], puts(180..190, 4)];
     let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
     let db = store.db.clone();
-    let mut writes = pause_group_merge(&store, &mut model, &mut batches, &db);
+    let mut writes = pause_group(&store, &mut model, &mut batches, &db, merging);
     // The leader goes before it writes anything; the next write takes over.
     drop(writes.remove(0));
     for write in writes {
@@ -3112,15 +3210,16 @@ fn a_write_dropped_while_its_merge_pauses_leaves_its_group_to_the_others() {
     store.db.check();
 }
 
-#[test]
-fn a_write_dropped_while_its_group_merges_is_withdrawn() {
+/// Drops a write of a group while the write leading it pauses, `merging` or
+/// normalizing.
+fn drop_group_member(merging: bool) {
     let (store, mut model) = store_of(200);
     let start = generation(&store.db);
     let queued = [rewrite_all(), vec![range_op(100, 120)], puts(180..190, 4)];
     let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
     let db = store.db.clone();
-    let mut writes = pause_group_merge(&store, &mut model, &mut batches, &db);
-    // The leader starts its merge over without the range.
+    let mut writes = pause_group(&store, &mut model, &mut batches, &db, merging);
+    // The leader starts over without the range.
     drop(writes.remove(1));
     for write in writes {
         now(write).unwrap();
@@ -3130,6 +3229,26 @@ fn a_write_dropped_while_its_group_merges_is_withdrawn() {
     apply(&mut model, &queued[2]);
     assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
     store.db.check();
+}
+
+#[test]
+fn a_write_dropped_while_its_merge_pauses_leaves_its_group_to_the_others() {
+    drop_group_leader(true);
+}
+
+#[test]
+fn a_write_dropped_while_it_normalizes_leaves_its_group_to_the_others() {
+    drop_group_leader(false);
+}
+
+#[test]
+fn a_write_dropped_while_its_group_merges_is_withdrawn() {
+    drop_group_member(true);
+}
+
+#[test]
+fn a_write_dropped_while_its_group_normalizes_is_withdrawn() {
+    drop_group_member(false);
 }
 
 #[compio::test]

@@ -478,8 +478,9 @@ impl Db {
         self.inner.writes.borrow_mut().set_limit(limit);
     }
 
-    /// Sets the work a merge does before it pauses, instead of the time it runs,
-    /// or with `None`, back to the time.
+    /// Sets the work a write does before it pauses, normalizing, planning or
+    /// merging its batch, instead of the time it runs, or with `None`, back to the
+    /// time.
     #[cfg(test)]
     pub(crate) fn set_merge_slice(&self, slice: Option<usize>) {
         self.tree().set_slice(slice);
@@ -799,13 +800,29 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
     }
     let group = guard.group;
     let changed = loop {
-        // Load the leaves the batch changes, keeping them in the cache.
-        {
-            let mut writes = inner.writes.borrow_mut();
-            let batch = if group { writes.group() } else { &mut *batch };
-            batch.prepare();
-            inner.tree.borrow_mut().plan(batch);
+        // Normalize the batch and list the leaves it changes, a slice at a time, as
+        // the merge goes below.
+        let planned = loop {
+            let planned = {
+                let mut writes = inner.writes.borrow_mut();
+                // A write that left the group meanwhile took its batch along.
+                if writes.take_changed() {
+                    break false;
+                }
+                let batch = if group { writes.group() } else { &mut *batch };
+                inner.tree.borrow_mut().plan(batch)
+            };
+            match planned {
+                Poll::Ready(()) => break true,
+                Poll::Pending => yield_now().await,
+            }
+        };
+        if !planned {
+            // Start over without that batch.
+            inner.tree.borrow_mut().discard();
+            continue;
         }
+        // Load the leaves the batch changes, keeping them in the cache.
         let touched = inner.tree.borrow().touched.len();
         for start in (0..touched).step_by(IO_WINDOW) {
             let loads: [_; IO_WINDOW] = array::from_fn(|i| {

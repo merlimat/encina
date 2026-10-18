@@ -131,7 +131,8 @@ fn the_data_path_does_not_allocate() {
         0,
         "write allocated"
     );
-    // Nor does a write whose merge pauses after every few entries.
+    // Nor does a write that pauses after every few units of work, normalizing its
+    // batch, planning and merging it.
     db.set_merge_slice(Some(64));
     fill(&mut batch, 4);
     assert_eq!(
@@ -139,6 +140,29 @@ fn the_data_path_does_not_allocate() {
         0,
         "a write that paused allocated"
     );
+    // Nor one whose batch holds ranges, and puts and deletes in no order, once a
+    // first one grew the space to sort them.
+    fill_scattered(&mut batch, 5);
+    now(db.write(&mut batch)).unwrap();
+    fill_scattered(&mut batch, 6);
+    assert_eq!(
+        allocations(|| now(db.write(&mut batch)).unwrap()),
+        0,
+        "a write of ranges and scattered keys allocated"
+    );
+}
+
+/// Fills `batch` with puts, deletes and ranges, in no order.
+fn fill_scattered(batch: &mut WriteBatch, round: u8) {
+    batch.clear();
+    for n in 0..ENTRIES {
+        let i = n * 7919 % ENTRIES;
+        match n % 50 {
+            0 => batch.delete(&key(i)),
+            1 => batch.delete_range(&key(i), &key(i + 40)),
+            _ => batch.put(&key(i), &value(i, round)),
+        }
+    }
 }
 
 #[test]
