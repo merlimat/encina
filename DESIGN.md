@@ -312,7 +312,13 @@ doesn't allocate. The operations are applied in order and atomically.
    so sorted input (BookKeeper's write cache is sorted) costs one linear check, and
    a group of k sorted batches log2(k) passes. A run shorter than 4,096
    operations, as unsorted batches have, is first extended by sorting 4,096 at once
-   with the standard library's sort.
+   with the standard library's sort. The ranges are sorted by start the same way,
+   and the pass that keeps the last operation per key finds the later range that
+   covers it, if any: the ranges that start at or before the key and end after it
+   wait on a heap, the one added last on top, which comes off once it ends at or
+   before the key. For a group that appends 1M entries to 1,000 ledgers and
+   deletes 500 older ones, normalizing takes 6 ms on an Apple M5 Pro, where
+   checking each key against every range that starts before it took 0.8 s.
 2. **Plan.** Descend the resident internal nodes to find the leaves the batch
    changes, and load the ones that aren't cached, keeping them pinned. Subtrees
    that ranges remove whole aren't read.
@@ -335,12 +341,12 @@ visits counts as 64, since searching an unsorted batch's operations for it takes
 to 2 µs. That is safe: readers keep using the old root until the swap, and only one
 commit runs at a time. Each step keeps its place in fixed state. Normalizing keeps
 the step it is at and how far it got: in the merge sort, the pass, the pair of runs
-it merges, and the operation it is at in each. Planning and the merge keep one
-record per level of the path they are on: the child they are at, the operations
-left for the children after it, and how far the merge got rebuilding a leaf or
-building nodes. So pausing allocates nothing, and resuming descends again to where
-it left off. A merge that pauses builds the same tree, on the same pages, as one
-that doesn't.
+it merges, and the operation it is at in each, and in the pass after it, the heap
+of ranges. Planning and the merge keep one record per level of the path they are
+on: the child they are at, the operations left for the children after it, and how
+far the merge got rebuilding a leaf or building nodes. So pausing allocates
+nothing, and resuming descends again to where it left off. A merge that pauses
+builds the same tree, on the same pages, as one that doesn't.
 
 Measured with the ignored test `read_latency_during_a_load`, on an Apple M5 Pro: a
 store of 2M BookKeeper-shaped entries on the simulated disk takes writes of 1M
