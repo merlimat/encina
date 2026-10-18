@@ -25,6 +25,11 @@
 //! replaces stays allocated until no reader of an older version is left.
 //!
 //! Each internal key equals the smallest key in its child's subtree.
+//!
+//! An entry too large for a leaf gets a value leaf of its own, which no write ever
+//! reads or rewrites: its key is its parent's key for it, and a write that replaces
+//! or removes its entry drops it whole. A value leaf always has a parent, so the
+//! root is never one.
 
 use std::cmp::Ordering;
 use std::mem;
@@ -35,7 +40,7 @@ use crate::Comparison;
 use crate::batch::WriteBatch;
 use crate::cache::Cache;
 use crate::meta::Meta;
-use crate::node::{self, CHILD_REF, Entries, EntryBuf, NO_FRAME, Node};
+use crate::node::{self, CHILD_REF, Entries, EntryBuf, NO_FRAME, Node, ValueLeaf};
 use crate::pool::{FrameId, Holds, Pool};
 use crate::space::{Life, Space};
 
@@ -136,6 +141,8 @@ pub(crate) struct Tree {
     bounds: Vec<Vec<u8>>,
     /// Where each run of puts ends among the entries of the leaf being rebuilt.
     run_ends: Vec<u32>,
+    /// Where each value leaf goes among those entries, and the put that holds it.
+    value_puts: Vec<(u32, u32)>,
     /// Frames waiting to be released.
     stack: Vec<FrameId>,
     /// The leaf pages the write in progress changes, found before it loads them.
@@ -146,6 +153,9 @@ pub(crate) struct Tree {
     dropped: Vec<u64>,
     /// The nodes of that version that need writing: frame and page.
     pub(crate) dirty: Vec<(FrameId, u64)>,
+    /// The value leaves of that version that need writing: page id, and the put
+    /// in the batch that holds the entry.
+    pub(crate) values: Vec<(u64, u32)>,
     /// That version, until it is published or discarded.
     pending: Option<Option<Root>>,
     /// The nodes the write in progress added for its changes, and those it moved.
@@ -235,9 +245,11 @@ struct Visit {
     /// The operations and ranges that fall in the children it hasn't reached.
     ops: Span,
     ranges: Span,
-    /// The child it is at, and whether that child's merge paused.
+    /// The child it is at, and whether that child's merge paused, with how far it
+    /// got if the child is a value leaf.
     child: usize,
     inside: bool,
+    value: ValueMerge,
     changed: bool,
     /// Where the nodes replacing its children start in the list below, and, once
     /// past its children, how far it got finishing them: at `stage`, from item
@@ -245,6 +257,18 @@ struct Visit {
     mark: Mark,
     stage: Stage,
     k: usize,
+}
+
+/// How far a merge got applying operations to a value leaf: whether they replace
+/// it, and the operations below its key and above it, which go to new leaves
+/// beside it, `second` once those below have.
+#[derive(Clone, Copy, Default)]
+struct ValueMerge {
+    started: bool,
+    replaced: bool,
+    below: Span,
+    above: Span,
+    second: bool,
 }
 
 /// The steps that finish the nodes replacing an internal node's children.
@@ -273,12 +297,16 @@ struct LeafMerge {
     r: usize,
     changed: bool,
     in_run: bool,
-    /// Once merged, the nodes they go to, when they need more than one
-    /// (`splitting`): from item `items` of `lists[0]` on, splitting after run
-    /// `run`, from entry `s` on, while `packing` the run's entries into full nodes.
+    /// Once merged, the nodes they go to, from item `items` of `lists[0]` on: the
+    /// value leaves before value put `vp` are added, and the entries from `a` up to
+    /// it go to leaves. When those need more than one (`splitting`), they split
+    /// after run `run`, from entry `s` on, while `packing` the run's entries into
+    /// full nodes.
     merged: bool,
-    splitting: bool,
     items: usize,
+    vp: usize,
+    a: usize,
+    splitting: bool,
     run: usize,
     s: usize,
     packing: bool,
@@ -324,6 +352,9 @@ pub(crate) enum Find {
     NotFound,
     /// The lookup needs this leaf page, which isn't cached.
     Missing(u64),
+    /// Found in the value leaf with this page id, too large for the cache to keep,
+    /// which has to be read. The key wasn't copied.
+    Value(u64),
 }
 
 impl Tree {
@@ -336,11 +367,13 @@ impl Tree {
             lists: Vec::new(),
             bounds: Vec::new(),
             run_ends: Vec::new(),
+            value_puts: Vec::new(),
             stack: Vec::new(),
             touched: Vec::new(),
             pinned: Vec::new(),
             dropped: Vec::new(),
             dirty: Vec::new(),
+            values: Vec::new(),
             pending: None,
             added: 0,
             moved: 0,
@@ -411,7 +444,7 @@ impl Tree {
     }
 
     /// Frees the pages replaced by versions no reader needs any more, evicting
-    /// any copies cached.
+    /// any copies cached, value leaves' included.
     fn reclaim(&mut self) {
         let Pages { pool, cache, space } = &mut self.pages;
         space.reclaim(|page| {
@@ -520,12 +553,18 @@ impl Tree {
         };
         let mut cur = Cursor::new();
         let page = self.descend(root, key, &mut cur);
-        let Some(frame) = self.pages.cached(page) else {
-            return Find::Missing(page);
+        let (frame, i, eq, n) = if node::span(page) > 0 {
+            // A value leaf holds one entry, whose key is its parent's key for it.
+            let ord = self.cmp_leaf_key(&cur, key);
+            (NO_FRAME, usize::from(ord.is_lt()), ord.is_eq(), 1)
+        } else {
+            let Some(frame) = self.pages.cached(page) else {
+                return Find::Missing(page);
+            };
+            let node = self.node(frame);
+            let (i, eq) = node.search(key);
+            (frame, i, eq, node.count())
         };
-        let node = self.node(frame);
-        let (i, eq) = node.search(key);
-        let n = node.count();
         let at = match cmp {
             Comparison::Equal => eq.then_some(i),
             Comparison::Floor if eq => Some(i),
@@ -533,8 +572,8 @@ impl Tree {
             Comparison::Ceiling => Some(i).filter(|&i| i < n),
             Comparison::Higher => Some(i + usize::from(eq)).filter(|&i| i < n),
         };
-        let (frame, at) = match at {
-            Some(at) => (frame, at),
+        let (page, frame, at) = match at {
+            Some(at) => (page, frame, at),
             None if cmp == Comparison::Equal => return Find::NotFound,
             // The match, if any, is in a neighboring leaf.
             None => {
@@ -542,19 +581,23 @@ impl Tree {
                 let Some(page) = self.next_leaf(&mut cur, forward) else {
                     return Find::NotFound;
                 };
+                if node::span(page) > 0 {
+                    return self.find_value(page, out);
+                }
                 let Some(frame) = self.pages.cached(page) else {
                     return Find::Missing(page);
                 };
-                (
-                    frame,
-                    if forward {
-                        0
-                    } else {
-                        self.node(frame).count() - 1
-                    },
-                )
+                let at = if forward {
+                    0
+                } else {
+                    self.node(frame).count() - 1
+                };
+                (page, frame, at)
             }
         };
+        if frame == NO_FRAME {
+            return self.find_value(page, out);
+        }
         let node = self.node(frame);
         node.key_into(at, out);
         match node.whole_value(at) {
@@ -565,6 +608,21 @@ impl Tree {
                 Find::Copied(key_len)
             }
         }
+    }
+
+    /// The lookup's match: the entry of the value leaf with page id `page`. Copies
+    /// its key into `out` if the leaf is cached.
+    fn find_value(&mut self, page: u64, out: &mut Vec<u8>) -> Find {
+        if !self.pages.cache.caches(node::span(page)) {
+            return Find::Value(page);
+        }
+        let Some(frame) = self.pages.cached(page) else {
+            return Find::Missing(page);
+        };
+        let leaf = ValueLeaf::new(self.pages.pool.page(frame));
+        out.clear();
+        out.extend_from_slice(leaf.key());
+        Find::Found(leaf.value().as_ptr(), leaf.value().len())
     }
 
     // Writes.
@@ -614,7 +672,10 @@ impl Tree {
                 split(batch, &mut ops, &mut ranges, &key, child_hi);
             if !covered && !(child_ops.is_empty() && child_ranges.is_empty()) {
                 if level == 1 {
-                    self.touched.push(node.child_page(i));
+                    // A write never reads a value leaf.
+                    if node::span(node.child_page(i)) == 0 {
+                        self.touched.push(node.child_page(i));
+                    }
                 } else {
                     self.plan_internal(
                         node.child(i),
@@ -763,13 +824,14 @@ impl Tree {
             }
         }
         self.dirty.clear();
+        self.values.clear();
         if let Some(old) = mem::replace(&mut self.root, root)
             && old.frame != NO_FRAME
         {
             self.release(old.frame);
         }
         for page in self.dropped.drain(..) {
-            self.pages.space.drop_page(generation, page);
+            self.pages.space.drop_node(generation, page);
         }
         self.generation = generation;
         self.reclaim();
@@ -786,7 +848,7 @@ impl Tree {
         let Some(root) = self.pending.take() else {
             return;
         };
-        self.free_dirty_leaves();
+        self.free_built_leaves();
         if let Some(root) = root.filter(|r| r.frame != NO_FRAME) {
             self.release(root.frame);
         }
@@ -816,7 +878,7 @@ impl Tree {
         }
         // Free the leaves among them. Letting go of the references frees the
         // internal nodes.
-        self.free_dirty_leaves();
+        self.free_built_leaves();
         for level in 1..self.lists.len() {
             for k in 0..self.lists[level].len() {
                 let item = self.lists[level].items[k];
@@ -837,9 +899,9 @@ impl Tree {
         self.phase = Phase::Idle;
     }
 
-    /// Frees the leaves listed in `dirty`, which the write in progress built, and
-    /// empties the list.
-    fn free_dirty_leaves(&mut self) {
+    /// Frees the leaves the write in progress built: those listed in `dirty`, and
+    /// its value leaves. Empties both lists.
+    fn free_built_leaves(&mut self) {
         let Pages { pool, cache, space } = &mut self.pages;
         for &(frame, page) in &self.dirty {
             if pool.frame(frame).holds == Holds::Leaf {
@@ -850,6 +912,12 @@ impl Tree {
             }
         }
         self.dirty.clear();
+        for (page, _) in self.values.drain(..) {
+            let first = node::first_page(page);
+            for page in first..first + node::span(page) {
+                space.free(page);
+            }
+        }
     }
 
     /// Releases the leaves the write in progress pinned.
@@ -931,11 +999,16 @@ impl Tree {
             } else {
                 hi
             };
-            // `None` once the child is dropped whole.
+            // `None` once the child changed with nothing more to do: dropped whole, or
+            // a value leaf that stays beside new leaves.
             let outcome = if v.inside {
                 // The child's merge paused: it goes on with the operations it kept.
                 let kept = Span::default();
-                Some(self.merge(child, below, kept, kept, child_hi, batch))
+                if node::span(child.1) > 0 {
+                    self.merge_value_leaf(&mut v, child.1, &key, kept, kept, batch)
+                } else {
+                    Some(self.merge(child, below, kept, kept, child_hi, batch))
+                }
             } else if self.budget.spent() {
                 Some(Outcome::Paused)
             } else {
@@ -947,7 +1020,6 @@ impl Tree {
                 } else if covered {
                     // The whole subtree goes, without reading its leaves.
                     self.drop_subtree(child, below);
-                    v.changed = true;
                     None
                 } else {
                     // The child's operations come just before what `split` left,
@@ -962,7 +1034,11 @@ impl Tree {
                         end: v.ranges.start + child_ranges.len(),
                     };
                     v.inside = true;
-                    Some(self.merge(child, below, child_ops, child_ranges, child_hi, batch))
+                    if node::span(child.1) > 0 {
+                        self.merge_value_leaf(&mut v, child.1, &key, child_ops, child_ranges, batch)
+                    } else {
+                        Some(self.merge(child, below, child_ops, child_ranges, child_hi, batch))
+                    }
                 }
             };
             match outcome {
@@ -972,7 +1048,7 @@ impl Tree {
                     self.dropped.push(child.1);
                     v.changed = true;
                 }
-                None => {}
+                None => v.changed = true,
             }
             v.inside = false;
             v.child += 1;
@@ -1016,6 +1092,72 @@ impl Tree {
         self.build_nodes(level, &mut v.k)
     }
 
+    /// Applies `ops` and `ranges` to the value leaf on `page`, whose key is `key`,
+    /// without reading it. A put or delete of `key`, or a range covering it, drops
+    /// it; the puts of other keys go to new leaves beside it. Returns `Unchanged`
+    /// if nothing changes, and the caller keeps it then, `Replaced` if it is
+    /// dropped, and `None` if it stays beside new leaves. If the merge pauses,
+    /// calling this again goes on where it left off, as `v` keeps.
+    fn merge_value_leaf(
+        &mut self,
+        v: &mut Visit,
+        page: u64,
+        key: &[u8],
+        ops: Span,
+        ranges: Span,
+        batch: &WriteBatch,
+    ) -> Option<Outcome> {
+        let mut value = v.value;
+        if !value.started {
+            let points = ops.of(batch.points());
+            let below = points.partition_point(|&op| batch.key(op) < key);
+            let replaced = points.get(below).is_some_and(|&op| batch.key(op) == key)
+                || ranges
+                    .of(batch.ranges())
+                    .iter()
+                    .any(|&(s, e)| batch.range_start(s) <= key && key < batch.range_end(e));
+            if !replaced && points.iter().all(|&op| batch.value(op).is_none()) {
+                return Some(Outcome::Unchanged);
+            }
+            let split = ops.start + below;
+            value = ValueMerge {
+                started: true,
+                replaced,
+                below: Span {
+                    start: ops.start,
+                    end: split,
+                },
+                above: Span {
+                    start: split,
+                    end: ops.end,
+                },
+                second: false,
+            };
+        }
+        // Only the tree's first leaf takes keys below its own.
+        let none = Span::default();
+        if !value.second {
+            if let Outcome::Paused = self.merge_leaf(None, value.below, none, batch) {
+                v.value = value;
+                return Some(Outcome::Paused);
+            }
+            if !value.replaced {
+                self.lists[0].push(key, NO_FRAME, page);
+            }
+            value.second = true;
+        }
+        if let Outcome::Paused = self.merge_leaf(None, value.above, none, batch) {
+            v.value = value;
+            return Some(Outcome::Paused);
+        }
+        v.value = ValueMerge::default();
+        if value.replaced {
+            Some(Outcome::Replaced)
+        } else {
+            None
+        }
+    }
+
     fn merge_leaf(
         &mut self,
         page: Option<u64>,
@@ -1039,6 +1181,7 @@ impl Tree {
                 ..LeafMerge::default()
             };
             self.run_ends.clear();
+            self.value_puts.clear();
         }
         // SAFETY: the write pinned this leaf, and published frames are never
         // modified.
@@ -1054,9 +1197,9 @@ impl Tree {
                 self.leaf.active = false;
                 return Outcome::Unchanged;
             }
-            m.merged = true;
+            (m.merged, m.items, m.a) = (true, self.lists[0].len(), m.base);
         }
-        let outcome = self.emit_leaves(&mut m);
+        let outcome = self.emit_leaves(&mut m, batch);
         self.leaf = m;
         self.leaf.active = matches!(outcome, Outcome::Paused);
         outcome
@@ -1068,9 +1211,14 @@ impl Tree {
     fn merge_entries(&mut self, m: &mut LeafMerge, node: Option<Node>, batch: &WriteBatch) -> bool {
         let old = node.map_or(0, |n| n.count());
         let (ops, ranges) = (m.ops.of(batch.points()), m.ranges.of(batch.ranges()));
+        let max_entry = node::max_entry(self.page_size);
         // The rebuilt leaf's entries go after those of its rebuilt siblings, until
         // the parent builds them all.
-        let (leaf, run_ends) = (&mut self.lists[0].entries, &mut self.run_ends);
+        let (leaf, run_ends, values) = (
+            &mut self.lists[0].entries,
+            &mut self.run_ends,
+            &mut self.value_puts,
+        );
         let LeafMerge {
             i,
             j,
@@ -1129,8 +1277,19 @@ impl Tree {
                 *changed = true;
             }
             if let Some(value) = batch.value(op) {
-                leaf.push(batch.key(op), value);
-                *in_run = true;
+                let key = batch.key(op);
+                if key.len() + value.len() <= max_entry {
+                    leaf.push(key, value);
+                    *in_run = true;
+                } else {
+                    // A value leaf of its own, between the leaves of the entries
+                    // before and after it.
+                    if *in_run {
+                        run_ends.push(leaf.len() as u32);
+                        *in_run = false;
+                    }
+                    values.push((leaf.len() as u32, op));
+                }
                 *changed = true;
             }
         }
@@ -1142,27 +1301,48 @@ impl Tree {
     }
 
     /// Adds to `lists[0]` the nodes, unbuilt, that the entries of the leaf `m`
-    /// rebuilds go to: those past `m.base`. Returns `Paused` if it paused: `m` keeps
-    /// how far it got.
-    fn emit_leaves(&mut self, m: &mut LeafMerge) -> Outcome {
+    /// rebuilds go to, those past `m.base`, with the value leaves among them.
+    /// Returns `Paused` if it paused: `m` keeps how far it got.
+    fn emit_leaves(&mut self, m: &mut LeafMerge, batch: &WriteBatch) -> Outcome {
+        loop {
+            // The entries up to the next value leaf, or all those left.
+            let b = match self.value_puts.get(m.vp) {
+                Some(&(at, _)) => at as usize,
+                None => self.lists[0].entries.len(),
+            };
+            if !self.emit_segment(m, b) {
+                return Outcome::Paused;
+            }
+            let Some(&(at, op)) = self.value_puts.get(m.vp) else {
+                break;
+            };
+            let (key, value) = (batch.key(op), batch.value(op).unwrap());
+            self.lists[0].emit_value(key, op, key.len() + value.len());
+            (m.vp, m.a) = (m.vp + 1, at as usize);
+        }
+        self.added += self.lists[0].len() - m.items;
+        Outcome::Replaced
+    }
+
+    /// Adds leaves holding entries `m.a..b` of `lists[0]`: one if they fit.
+    /// Returns false if it paused: `m` keeps how far it got.
+    fn emit_segment(&mut self, m: &mut LeafMerge, b: usize) -> bool {
         let (out, page) = (&mut self.lists[0], self.page_size);
-        let n = out.entries.len();
         if !m.splitting {
-            if n == m.base {
-                return Outcome::Replaced;
+            if m.a == b {
+                return true;
             }
             // Every entry takes a byte at least: only as many as a page has bytes
             // are worth measuring.
-            let used = match n - m.base <= page {
-                true => node::size(&out.entries, m.base, n, 0),
+            let used = match b - m.a <= page {
+                true => node::size(&out.entries, m.a, b, 0),
                 false => usize::MAX,
             };
             if used <= page {
-                out.emit(m.base, n, used, Life::Short);
-                self.added += 1;
-                return Outcome::Replaced;
+                out.emit(m.a, b, used, Life::Short);
+                return true;
             }
-            (m.splitting, m.items, m.s) = (true, out.len(), m.base);
+            (m.splitting, m.run, m.s) = (true, 0, m.a);
         }
         // Split after each run of puts that fills at least a quarter page, as when
         // appending to ledgers: pack the run full, and leave the entries after it to
@@ -1173,7 +1353,9 @@ impl Tree {
             if !m.packing {
                 // Whether entries `s..end` take less than a quarter page: as many
                 // entries as a quarter page has bytes take more.
-                if end - m.s < page / 4 && node::size(&out.entries, m.s, end, 0) < page / 4 {
+                let small =
+                    |s: usize| end - s < page / 4 && node::size(&out.entries, s, end, 0) < page / 4;
+                if end <= m.a || end > b || small(m.s) {
                     m.run += 1;
                     continue;
                 }
@@ -1181,7 +1363,7 @@ impl Tree {
             }
             while m.s < end {
                 if self.budget.spent() {
-                    return Outcome::Paused;
+                    return false;
                 }
                 let (e, used) = node::fit(&out.entries, m.s, end, page, 0);
                 // The run's full leaves are likely to stay; appends go on in its last.
@@ -1193,9 +1375,9 @@ impl Tree {
             m.packing = false;
             m.run += 1;
         }
-        out.emit_even(m.s, n, page, 0);
-        self.added += out.len() - m.items;
-        Outcome::Replaced
+        out.emit_even(m.s, b, page, 0);
+        m.splitting = false;
+        true
     }
 
     /// Adds an unchanged node to `lists[level]`.
@@ -1266,6 +1448,15 @@ impl Tree {
     fn build_node(&mut self, level: usize, i: usize) {
         let list = &mut self.lists[level];
         let item = list.items[i];
+        if let Some(op) = item.value {
+            // The commit writes the value leaf straight from the batch.
+            let len = node::value_leaf_len(0, item.used as usize);
+            let span = len.div_ceil(self.page_size) as u64;
+            let page = node::spanned(self.pages.space.alloc_span(span), span);
+            self.values.push((page, op));
+            list.built(i, NO_FRAME, page);
+            return;
+        }
         let (a, b) = (item.start as usize, item.end as usize);
         let generation = self.generation + 1;
         let (frame, page, used) =
@@ -1291,7 +1482,11 @@ impl Tree {
             let i = *k;
             *k += 1;
             let item = self.lists[level].items[i];
-            if item.fresh || self.moved >= self.added || !self.pages.space.should_move(item.page) {
+            if item.fresh
+                || item.is_value_leaf()
+                || self.moved >= self.added
+                || !self.pages.space.should_move(item.page)
+            {
                 continue;
             }
             let frame = if level > 0 {
@@ -1336,7 +1531,11 @@ impl Tree {
             self.budget.work += 1;
             let len = self.lists[level].len();
             let item = self.lists[level].items[*k];
-            if item.fresh && (item.used as usize) < self.page_size / 4 && len - start > 1 {
+            if item.fresh
+                && !item.is_value_leaf()
+                && (item.used as usize) < self.page_size / 4
+                && len - start > 1
+            {
                 let left = k.checked_sub(1).filter(|&a| a >= start);
                 let right = (*k + 1 < len).then_some(*k);
                 for a in left.into_iter().chain(right) {
@@ -1356,6 +1555,9 @@ impl Tree {
     fn merge_pair(&mut self, level: usize, a: usize) -> bool {
         let list = &mut self.lists[level];
         let (x, y) = (list.items[a], list.items[a + 1]);
+        if x.is_value_leaf() || y.is_value_leaf() {
+            return false;
+        }
         // Find the frames of the unchanged nodes. A merged node spends at least the
         // bytes both nodes spend on their entries, so skip a pair that can't fit
         // before copying them.
@@ -1437,7 +1639,8 @@ impl Tree {
             }
             match self.lists[level].len() {
                 0 => return Some(None),
-                1 => break,
+                // A value leaf always has a parent.
+                1 if level > 0 || !self.lists[0].items[0].is_value_leaf() => break,
                 _ => {
                     self.ensure_level(level + 1);
                     if !self.build_nodes(level, &mut k) {
@@ -1450,10 +1653,12 @@ impl Tree {
             }
         }
         let item = self.lists[level].items[0];
-        let mut root = if item.fresh && level > 0 && item.end - item.start == 1 {
+        let only_child = (item.fresh && level > 0 && item.end - item.start == 1)
+            .then(|| self.lists[level].entries.value(item.start as usize))
+            .filter(|child| node::span(node::child_page(child)) == 0);
+        let mut root = if let Some(child) = only_child {
             // A root with a single child is redundant: the child becomes the root
             // instead, with the entry's reference to it.
-            let child = self.lists[level].entries.value(item.start as usize);
             Root {
                 page: node::child_page(child),
                 frame: node::child_frame(child),
@@ -1475,7 +1680,7 @@ impl Tree {
         // A root with a single child is redundant.
         while root.level > 0 {
             let node = self.node(root.frame);
-            if node.count() > 1 {
+            if node.count() > 1 || node::span(node.child_page(0)) > 0 {
                 break;
             }
             let child = Root {
@@ -1554,6 +1759,21 @@ struct Item {
     end: u32,
     used: u32,
     life: Life,
+    /// For a value leaf this write adds, the put in the batch that holds its
+    /// entry, whose key plus value take `used` bytes.
+    value: Option<u32>,
+}
+
+impl Item {
+    fn is_value_leaf(&self) -> bool {
+        self.value.is_some() || node::span(self.page) > 0
+    }
+
+    /// Whether this write added the node and built it.
+    fn is_built(&self) -> bool {
+        // No node is on page 0, a meta page.
+        self.fresh && self.page != 0
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1561,14 +1781,6 @@ struct Mark {
     items: usize,
     bytes: usize,
     entries: usize,
-}
-
-impl Item {
-    /// Whether this write added the node and built it.
-    fn is_built(&self) -> bool {
-        // No node is on page 0, a meta page.
-        self.fresh && self.page != 0
-    }
 }
 
 impl NodeList {
@@ -1603,6 +1815,7 @@ impl NodeList {
             end: 0,
             used: 0,
             life: Life::Short,
+            value: None,
         });
     }
 
@@ -1621,6 +1834,25 @@ impl NodeList {
             end: b as u32,
             used: used as u32,
             life,
+            value: None,
+        });
+    }
+
+    /// Adds a value leaf for the put `op`, whose key is `key`, and whose key plus
+    /// value take `len` bytes.
+    fn emit_value(&mut self, key: &[u8], op: u32, len: usize) {
+        let (at, key_len) = append_ref(&mut self.bytes, key, NO_FRAME, 0);
+        self.items.push(Item {
+            at,
+            key_len,
+            frame: NO_FRAME,
+            page: 0,
+            fresh: true,
+            start: 0,
+            end: 0,
+            used: len as u32,
+            life: Life::Long,
+            value: Some(op),
         });
     }
 
@@ -1737,12 +1969,17 @@ impl Tree {
             "pages leaked"
         );
         // Frames that cancelled reads left behind wait for the clock hand.
-        let cancelled = (0..pool.len() as FrameId)
+        // The pages each frame takes: a large frame holds a value leaf.
+        let pages = |frame| pool.frame(frame).pages as usize;
+        let cancelled: usize = (0..pool.slots())
+            .map(|i| pool.slot(i))
             .filter(|&f| pool.frame(f).holds == Holds::Loading && pool.refs(f) == 0)
-            .count();
+            .map(pages)
+            .sum();
+        let cached: usize = cache.entries().map(|(_, frame)| pages(frame)).sum();
         assert_eq!(
             pool.in_use(),
-            stats.internal + cache.len() + cancelled,
+            stats.internal + cached + cancelled,
             "frames leaked"
         );
         for (page, frame) in cache.entries() {
@@ -1751,11 +1988,18 @@ impl Tree {
                 (info.holds, info.page, info.dirty),
                 (Holds::Leaf, page, false)
             );
+            assert_eq!(
+                info.pages as u64,
+                node::pages(page),
+                "leaf {page} misframed"
+            );
             assert_eq!(pool.refs(frame), 0, "leaf {page} still pinned");
-            assert!(space.is_used(page), "cached leaf {page} on a free page");
+            let first = node::first_page(page);
+            assert!(space.is_used(first), "cached leaf {page} on a free page");
         }
         assert!(self.pinned.is_empty() && self.dirty.is_empty() && self.pending.is_none());
         assert!(self.phase == Phase::Idle, "a merge was left halfway");
+        assert!(self.values.is_empty());
     }
 
     /// Checks the subtree at `node`, whose keys fall in `lo..hi`, and returns its
@@ -1768,13 +2012,25 @@ impl Tree {
         hi: Option<&[u8]>,
         stats: &mut Stats,
     ) -> Option<Vec<u8>> {
-        stats.pages += 1;
-        assert!(
-            self.pages.space.is_used(page),
-            "page {page} in the tree but free"
-        );
+        stats.pages += node::pages(page);
+        let first = node::first_page(page);
+        for page in first..first + node::pages(page) {
+            assert!(
+                self.pages.space.is_used(page),
+                "page {page} in the tree but free"
+            );
+        }
         let frame = if level == 0 {
             assert_eq!(frame, NO_FRAME);
+            if node::span(page) > 0 {
+                // Its key is its parent's key for it.
+                let lo = lo.expect("a value leaf at the root");
+                if let Some(frame) = self.pages.cached(page) {
+                    let leaf = ValueLeaf::new(self.pages.pool.page(frame));
+                    assert_eq!(leaf.key(), lo, "value leaf under another key");
+                }
+                return None;
+            }
             self.pages.cached(page)?
         } else {
             stats.internal += 1;
@@ -1853,7 +2109,8 @@ impl Tree {
         while let Some(frame) = stack.pop() {
             let node = self.node(frame);
             for i in 0..node.count() {
-                pages.push(node.child_page(i));
+                let first = node::first_page(node.child_page(i));
+                pages.extend(first..first + node::pages(node.child_page(i)));
                 if node.level() > 1 {
                     stack.push(node.child(i));
                 }

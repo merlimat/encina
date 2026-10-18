@@ -233,10 +233,10 @@ fn key() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(prop::sample::select(&[0u8, 1, 2, 0x7f, 0xff][..]), 0..=8)
 }
 
-fn op(max_value: usize) -> impl Strategy<Value = Op> {
+fn op(value_len: impl Strategy<Value = usize>) -> impl Strategy<Value = Op> {
+    let value = value_len.prop_flat_map(|n| prop::collection::vec(any::<u8>(), n));
     prop_oneof![
-        8 => (key(), prop::collection::vec(any::<u8>(), 0..=max_value))
-            .prop_map(|(k, v)| Op::Put(k, v)),
+        8 => (key(), value).prop_map(|(k, v)| Op::Put(k, v)),
         2 => key().prop_map(Op::Delete),
         // Wide ranges, which drop whole subtrees, and narrow ones.
         1 => (key(), key()).prop_map(|(start, end)| Op::DeleteRange(start, end)),
@@ -256,24 +256,30 @@ fn bound() -> impl Strategy<Value = Bound<Vec<u8>>> {
     ]
 }
 
-/// Steps whose values are at most `max_value` bytes.
-fn step(max_value: usize) -> impl Strategy<Value = Step> {
+/// Steps whose values have lengths from `value_len`.
+fn step(value_len: impl Strategy<Value = usize> + Clone) -> impl Strategy<Value = Step> {
     prop_oneof![
-        4 => prop::collection::vec(op(max_value), 1..40).prop_map(Step::Write),
-        1 => (key(), any::<u16>(), 1..300u16, 0..=max_value)
+        4 => prop::collection::vec(op(value_len.clone()), 1..40).prop_map(Step::Write),
+        1 => (key(), any::<u16>(), 1..300u16, value_len.clone())
             .prop_map(|(prefix, first, count, value_len)| Step::Load { prefix, first, count, value_len }),
         3 => (key(), prop::sample::select(COMPARISONS.to_vec())).prop_map(|(k, cmp)| Step::Get(k, cmp)),
         1 => (bound(), bound()).prop_map(|(lo, hi)| Step::Scan(lo, hi)),
-        1 => prop::collection::vec(op(max_value), 1..40).prop_map(Step::WriteDuringScan),
+        1 => prop::collection::vec(op(value_len.clone()), 1..40).prop_map(Step::WriteDuringScan),
         1 => prop::collection::vec(
-            (prop::collection::vec(op(max_value), 1..20), prop::bool::weighted(0.25)),
+            (prop::collection::vec(op(value_len.clone()), 1..20), prop::bool::weighted(0.25)),
             2..6,
         )
         .prop_map(Step::Group),
-        1 => (prop::collection::vec(op(max_value), 1..40), 1..4u8, any::<bool>())
+        1 => (prop::collection::vec(op(value_len), 1..40), 1..4u8, any::<bool>())
             .prop_map(|(ops, polls, finish)| Step::Paused(ops, polls, finish)),
         1 => Just(Step::Reopen),
     ]
+}
+
+/// Value lengths on both sides of what a leaf on 256-byte pages holds, so that
+/// entries get value leaves of one page or several, among ordinary leaves.
+fn value_len_across_the_limit() -> impl Strategy<Value = usize> + Clone {
+    prop_oneof![3 => 0..=12usize, 1 => 20..=40usize, 2 => 41..=700usize]
 }
 
 /// Keys of one length, as dense nodes need.
@@ -399,23 +405,27 @@ fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
             }
         }
     }
-    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
-    // Every comparison, on every key and on the gap just above it, which covers the
-    // first and last keys of every leaf.
+    check_reads(&store.db, &model);
+}
+
+/// Checks a full scan, and every comparison on every key and on the gap just above
+/// it, which covers the first and last keys of every leaf, against `model`.
+fn check_reads(db: &Db, model: &Model) {
+    assert_eq!(scan(db, ALL), expected_scan(model, ALL));
     for key in model.keys() {
         let mut above = key.clone();
         above.push(0);
         for probe in [key, &above] {
             for cmp in COMPARISONS {
                 assert_eq!(
-                    get(&store.db, probe, cmp),
-                    expected(&model, probe, cmp),
+                    get(db, probe, cmp),
+                    expected(model, probe, cmp),
                     "get({probe:?}, {cmp:?})"
                 );
             }
         }
     }
-    store.db.check();
+    db.check();
 }
 
 /// Starts `writes` together: the first to wait waits for its sync, and the others
@@ -456,20 +466,35 @@ fn write_group(store: &Store, writes: &[(Vec<Op>, bool)]) -> Vec<bool> {
 proptest! {
     // Small pages grow deep trees from few entries.
     #[test]
-    fn matches_the_model_with_small_pages(steps in prop::collection::vec(step(12), 1..40)) {
+    fn matches_the_model_with_small_pages(steps in prop::collection::vec(step(0..=12usize), 1..40)) {
         run(Options::new().page_size(256), &steps);
     }
 
     // A cache of 16 pages keeps evicting leaves and reading them back.
     #[test]
-    fn matches_the_model_with_a_tiny_cache(steps in prop::collection::vec(step(12), 1..40)) {
+    fn matches_the_model_with_a_tiny_cache(steps in prop::collection::vec(step(0..=12usize), 1..40)) {
         run(Options::new().page_size(256).cache_size(16 * 256), &steps);
     }
 
     // Large values fill default pages quickly enough to grow internal levels.
     #[test]
-    fn matches_the_model_with_default_pages(steps in prop::collection::vec(step(200), 1..40)) {
+    fn matches_the_model_with_default_pages(steps in prop::collection::vec(step(0..=200usize), 1..40)) {
         run(Options::new(), &steps);
+    }
+
+    // Entries too large for a leaf get value leaves, which writes never read.
+    #[test]
+    fn matches_the_model_with_value_leaves(
+        steps in prop::collection::vec(step(value_len_across_the_limit()), 1..40),
+    ) {
+        run(Options::new().page_size(256), &steps);
+    }
+
+    #[test]
+    fn matches_the_model_with_value_leaves_and_a_tiny_cache(
+        steps in prop::collection::vec(step(value_len_across_the_limit()), 1..40),
+    ) {
+        run(Options::new().page_size(256).cache_size(16 * 256), &steps);
     }
 
     // Keys and values of one length each make every node dense.
@@ -486,10 +511,10 @@ proptest! {
     }
 
     // Merges that pause after every few entries, and writes dropped while theirs
-    // pauses.
+    // pauses, among entries with value leaves and without.
     #[test]
     fn matches_the_model_when_merges_pause(
-        steps in prop::collection::vec(step(12), 1..40),
+        steps in prop::collection::vec(step(value_len_across_the_limit()), 1..40),
         slice in 1..100usize,
     ) {
         run_sliced(Options::new().page_size(256), Some(slice), &steps);
@@ -497,7 +522,7 @@ proptest! {
 
     #[test]
     fn matches_the_model_when_merges_pause_with_a_tiny_cache(
-        steps in prop::collection::vec(step(12), 1..40),
+        steps in prop::collection::vec(step(value_len_across_the_limit()), 1..40),
         slice in 1..100usize,
     ) {
         run_sliced(Options::new().page_size(256).cache_size(16 * 256), Some(slice), &steps);
@@ -505,7 +530,7 @@ proptest! {
 
     #[test]
     fn merges_that_pause_build_the_same_trees(
-        steps in prop::collection::vec(step(12), 1..40),
+        steps in prop::collection::vec(step(value_len_across_the_limit()), 1..40),
         slice in 1..100usize,
     ) {
         same_trees(Options::new().page_size(256), slice, &steps);
@@ -685,21 +710,147 @@ fn ranges_accept_every_form_of_bounds() {
 }
 
 #[test]
-fn oversized_entries_leave_the_store_unchanged() {
+fn oversized_keys_leave_the_store_unchanged() {
     let store = Store::new(Options::default());
-    let max = Options::default().max_entry_size();
+    let max = Options::default().max_key_size();
     let mut batch = WriteBatch::new();
     batch.put(b"a", b"1");
-    batch.put(b"big", &vec![0; max - 2]);
+    batch.put(&vec![1; max + 1], b"");
     assert!(matches!(
         now(store.db.write(&mut batch)),
-        Err(Error::EntryTooLarge { .. })
+        Err(Error::KeyTooLarge { .. })
     ));
     assert_eq!(get(&store.db, b"a", Comparison::Equal), None);
     batch.clear();
-    batch.put(b"big", &vec![0; max - 3]);
+    batch.put(&vec![1; max], b"");
     now(store.db.write(&mut batch)).unwrap();
-    assert!(get(&store.db, b"big", Comparison::Equal).is_some());
+    assert!(get(&store.db, &vec![1; max], Comparison::Equal).is_some());
+}
+
+/// The value leaves of the tree `db` reads, from a view: pages, entries and bytes
+/// used, in key order.
+fn value_leaves(db: &Store) -> Vec<(u64, usize, usize)> {
+    let view = now(ReadOnlyDb::open_sim(db.disk.clone(), db.opts.clone())).unwrap();
+    let mut found = Vec::new();
+    now(view.pages(|info| found.push(info))).unwrap();
+    found
+        .iter()
+        .filter(|info| info.value)
+        .map(|info| (info.pages, info.entries, info.used))
+        .collect()
+}
+
+#[test]
+fn entries_too_large_for_a_leaf_get_value_leaves() {
+    let max = node::max_entry(256);
+    let mut store = Store::new(Options::new().page_size(256));
+    let mut model = Model::new();
+    // A store whose only entry is large keeps a node above its value leaf.
+    let ops = [Op::Put(b"m".to_vec(), vec![7; 600])];
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    assert_eq!(store.db.tree().current().root.unwrap().level, 1);
+    check_reads(&store.db, &model);
+    // An entry just over the limit takes a page, a larger one several. Just under,
+    // it stays in a leaf.
+    let ops = [
+        Op::Put(b"a".to_vec(), vec![1; 3]),
+        Op::Put(b"c".to_vec(), vec![2; max]),
+        Op::Put(b"e".to_vec(), vec![3; 2000]),
+        Op::Put(b"g".to_vec(), vec![4; max - 1]),
+    ];
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    check_reads(&store.db, &model);
+    let used = |key: usize, value: usize| node::HEADER + key + value;
+    let expected = [
+        (1, 1, used(1, max)),
+        (8, 1, used(1, 2000)),
+        (3, 1, used(1, 600)),
+    ];
+    assert_eq!(value_leaves(&store), expected);
+    store.reopen();
+    check_reads(&store.db, &model);
+    // Replacing one with a small entry, and a small entry with a large one.
+    let ops = [
+        Op::Put(b"e".to_vec(), vec![5]),
+        Op::Put(b"g".to_vec(), vec![6; 300]),
+    ];
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    check_reads(&store.db, &model);
+    let expected = [
+        (1, 1, used(1, max)),
+        (2, 1, used(1, 300)),
+        (3, 1, used(1, 600)),
+    ];
+    assert_eq!(value_leaves(&store), expected);
+    // Deleting every value leaf leaves ordinary leaves only.
+    let ops = [
+        Op::Delete(b"c".to_vec()),
+        Op::DeleteRange(b"f".to_vec(), b"n".to_vec()),
+    ];
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    check_reads(&store.db, &model);
+    assert_eq!(value_leaves(&store), []);
+}
+
+#[test]
+fn writes_never_read_value_leaves() {
+    let opts = Options::new().page_size(256).cache_size(16 * 256);
+    let mut store = Store::new(opts);
+    let mut model = Model::new();
+    let key = |i: u32| i.to_be_bytes().to_vec();
+    let ops: Vec<_> = (0..60)
+        .map(|i| Op::Put(key(i), vec![i as u8; if i % 2 == 0 { 300 } else { 4 }]))
+        .collect();
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    // Damage every value leaf: reading one fails now, but no write reads them.
+    for (page, _) in store.db.tree().leaves() {
+        if node::span(page) > 0 {
+            store.disk.flip(node::first_page(page) * 256 + 100);
+        }
+    }
+    store.reopen();
+    let ops = [
+        // Below the first value leaf's key, and just above another's.
+        Op::Put(Vec::new(), vec![9]),
+        Op::Put([key(40), vec![1]].concat(), vec![9; 3]),
+        // A value leaf replaced by a small entry, and one by another value leaf.
+        Op::Put(key(10), vec![9; 2]),
+        Op::Put(key(12), vec![9; 500]),
+        Op::Delete(key(14)),
+        Op::DeleteRange(key(20), key(31)),
+    ];
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    store.db.check();
+    for (k, v) in &model {
+        let found = now(store.db.get(k, Comparison::Equal, |_, v| v.to_vec()));
+        if v.len() == 300 {
+            assert!(matches!(found, Err(Error::Corruption { .. })), "{k:?}");
+        } else {
+            assert_eq!(found.unwrap().as_ref(), Some(v), "{k:?}");
+        }
+    }
+}
+
+#[test]
+fn a_value_larger_than_a_request_is_written_in_several() {
+    let mut store = Store::new(Options::new());
+    let value: Vec<u8> = (0..17 << 20).map(|i| (i % 251) as u8).collect();
+    let (before, _) = store.disk.written();
+    write(&store.db, &[Op::Put(b"big".to_vec(), value.clone())]);
+    // Requests of 1 MiB, 16 at a time, for 17 MiB and a header: 18 of them, then
+    // the node above the value leaf and the meta page.
+    assert_eq!(store.disk.written().0 - before, 18 + 2);
+    let expected = Some((b"big".to_vec(), value));
+    assert_eq!(get(&store.db, b"big", Comparison::Floor), expected);
+    store.reopen();
+    assert_eq!(get(&store.db, b"bigger", Comparison::Lower), expected);
+    store.db.check();
 }
 
 #[test]
@@ -1037,6 +1188,49 @@ fn a_read_only_view_reads_its_version_until_it_is_overwritten() {
 }
 
 #[test]
+fn a_read_only_view_of_value_leaves_is_stale_once_they_are_overwritten() {
+    let opts = Options::new().page_size(256);
+    let store = Store::new(opts.clone());
+    let key = |i: u32| i.to_be_bytes().to_vec();
+    let round = |r: u8| {
+        (0..20)
+            .map(|i| Op::Put(key(i), vec![r; 300]))
+            .collect::<Vec<_>>()
+    };
+    let mut model = Model::new();
+    write(&store.db, &round(0));
+    apply(&mut model, &round(0));
+    // A cache that holds two of the value leaves, so that the view reads the
+    // others from the disk.
+    let view = now(ReadOnlyDb::open_sim(
+        store.disk.clone(),
+        opts.cache_size(16 * 256),
+    ))
+    .unwrap();
+    let mut stale = 0;
+    for r in 1..6 {
+        // The owner reuses the pages of the value leaves a write replaces from its
+        // next write on.
+        write(&store.db, &round(r));
+        let may_be_stale = r > 1;
+        stale += usize::from(is_stale(
+            view_scan(&view),
+            expected_scan(&model, ALL),
+            may_be_stale,
+        ));
+        for i in 0..20 {
+            let found = view_get(&view, &key(i), Comparison::Equal);
+            let expected = expected(&model, &key(i), Comparison::Equal);
+            stale += usize::from(is_stale(found, expected, may_be_stale));
+        }
+    }
+    assert!(
+        stale > 0,
+        "the owner never overwrote the view's value leaves"
+    );
+}
+
+#[test]
 fn a_read_only_view_lists_the_pages_of_its_tree() {
     let empty = Store::new(Options::new().page_size(256));
     let view = now(ReadOnlyDb::open_sim(empty.disk.clone(), empty.opts.clone())).unwrap();
@@ -1277,6 +1471,38 @@ fn a_damaged_meta_slot_leaves_the_other() {
     assert_eq!(scan(&db, ALL), first);
 }
 
+#[test]
+fn a_store_keeps_its_page_size() {
+    let store = Store::new(Options::new().page_size(512));
+    write(&store.db, &[Op::Put(b"a".to_vec(), b"1".to_vec())]);
+    let expected = scan(&store.db, ALL);
+    for other in [256, 1024] {
+        let opts = Options::new().page_size(other);
+        let opened = now(Db::open_sim(store.disk.restart(), opts.clone())).map(drop);
+        assert!(
+            matches!(opened, Err(Error::PageSizeMismatch { store: 512, options }) if options == other),
+            "{opened:?}"
+        );
+        // A view writes nothing, so it reads the store anyway.
+        let view = now(ReadOnlyDb::open_sim(store.disk.restart(), opts)).unwrap();
+        assert_eq!(view_scan(&view).unwrap(), expected);
+    }
+    // Options without a page size open the store with its own, and its key limit.
+    let db = now(Db::open_sim(store.disk.restart(), Options::new())).unwrap();
+    assert_eq!(scan(&db, ALL), expected);
+    let max = node::max_entry(512);
+    let mut batch = WriteBatch::new();
+    batch.put(&vec![1; max + 1], b"");
+    let written = now(db.write(&mut batch));
+    assert!(
+        matches!(written, Err(Error::KeyTooLarge { size, max: m }) if size == max + 1 && m == max),
+        "{written:?}"
+    );
+    batch.clear();
+    batch.put(&vec![1; max], b"");
+    now(db.write(&mut batch)).unwrap();
+}
+
 /// Batches that build a few levels on 256-byte pages, rewrite and delete parts of
 /// them, then delete everything.
 fn failure_scenario() -> Vec<Vec<Op>> {
@@ -1293,6 +1519,34 @@ fn failure_scenario() -> Vec<Vec<Op>> {
             .map(|i| Op::Put(key(i), vec![4; 4]))
             .collect(),
         vec![Op::DeleteRange(key(0), key(300))],
+    ]
+}
+
+/// Batches on 256-byte pages that mix entries too large for a leaf, of one page,
+/// several, and more than a write request carries, with small ones, then replace,
+/// remove and add to them.
+fn value_scenario() -> Vec<Vec<Op>> {
+    let key = |i: u32| i.to_be_bytes().to_vec();
+    let len = |i: u32| {
+        if i.is_multiple_of(3) {
+            40 + 20 * i as usize
+        } else {
+            8
+        }
+    };
+    vec![
+        (0..40).map(|i| Op::Put(key(i), vec![1; len(i)])).collect(),
+        vec![Op::Put(key(17), vec![2; 300 << 10])],
+        (0..40)
+            .step_by(2)
+            .map(|i| Op::Put(key(i), vec![3; 700]))
+            .collect(),
+        vec![
+            Op::DeleteRange(key(5), key(25)),
+            Op::Put(key(10), vec![4; 300]),
+            Op::Put([key(30), vec![0]].concat(), vec![4]),
+        ],
+        (0..40).map(|i| Op::Delete(key(i))).collect(),
     ]
 }
 
@@ -1331,6 +1585,12 @@ fn every_single_failure_leaves_a_recoverable_store() {
     // A small cache, so that writes read leaves back from the disk.
     let opts = Options::new().page_size(256).cache_size(16 * 256);
     check_every_single_failure(&opts, &failure_scenario());
+}
+
+#[test]
+fn every_single_failure_with_value_leaves_leaves_a_recoverable_store() {
+    let opts = Options::new().page_size(256).cache_size(16 * 256);
+    check_every_single_failure(&opts, &value_scenario());
 }
 
 #[test]
@@ -1794,7 +2054,9 @@ fn cold_store(n: u32, frames: usize) -> (Store, Model) {
 fn loading_frames(db: &Db) -> (usize, usize) {
     let tree = db.tree();
     let pool = &tree.pages.pool;
-    let loading = (0..pool.len() as u32).filter(|&f| pool.frame(f).holds == Holds::Loading);
+    let loading = (0..pool.slots())
+        .map(|i| pool.slot(i))
+        .filter(|&f| pool.frame(f).holds == Holds::Loading);
     loading.fold((0, 0), |(busy, idle), f| match pool.refs(f) {
         0 => (busy, idle + 1),
         _ => (busy + 1, idle),
@@ -2009,6 +2271,127 @@ fn reading_ahead_stays_within_the_cache_budget() {
     store.db.check();
 }
 
+/// A store on 256-byte pages of `n` entries too large for a leaf, two pages each,
+/// reopened with a cache of `frames` pages, so that none of them is cached.
+fn cold_value_store(n: u32, frames: usize) -> (Store, Model) {
+    let mut store = Store::new(Options::new().page_size(256).cache_size(frames * 256));
+    let puts: Vec<_> = (0..n)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![i as u8; 300]))
+        .collect();
+    write(&store.db, &puts);
+    let mut model = Model::new();
+    apply(&mut model, &puts);
+    store.reopen();
+    (store, model)
+}
+
+#[test]
+fn concurrent_misses_on_a_value_leaf_share_one_read() {
+    let (store, model) = cold_value_store(40, 64);
+    let key = 17u32.to_be_bytes();
+    store.disk.hold();
+    let ops = store.disk.ops();
+    let value = |_: &[u8], v: &[u8]| v.to_vec();
+    let mut a = Box::pin(store.db.get(&key, Comparison::Equal, value));
+    let mut b = pin!(store.db.get(&key, Comparison::Equal, value));
+    let mut c = pin!(store.db.get(&key, Comparison::Equal, value));
+    assert!(poll(a.as_mut()).is_pending());
+    assert!(poll(b.as_mut()).is_pending());
+    assert!(poll(c.as_mut()).is_pending());
+    assert_eq!(
+        store.disk.ops() - ops,
+        1,
+        "a lookup read the value leaf again"
+    );
+    drop(a);
+    store.disk.release();
+    let value = Some(model[&key[..]].clone());
+    for get in [b, c] {
+        assert_eq!(now(get).unwrap(), value);
+    }
+    // The cache keeps it: reading it again reads nothing.
+    let found = now(store.db.get(&key, Comparison::Floor, |_, v| v.to_vec())).unwrap();
+    assert_eq!(found, value);
+    assert_eq!(store.disk.ops() - ops, 1);
+    store.db.check();
+}
+
+#[test]
+fn a_cold_scan_reads_value_leaves_ahead() {
+    let (store, model) = cold_value_store(40, 64);
+    store.disk.hold();
+    let ops = store.disk.ops();
+    let mut iter = store.db.range(..);
+    assert!(poll(pin!(iter.next())).is_pending());
+    // Value leaves take at most a quarter of the 64-page cache: the one the
+    // iterator waits for, and the 7 after it.
+    assert_eq!(store.disk.ops() - ops, 8);
+    assert_eq!(store.db.tree().pages.pool.large_pages(), 16);
+    store.disk.release();
+    assert_eq!(scan_rest(&mut iter), expected_scan(&model, ALL));
+    // Each value leaf was read once, and the cache kept a quarter's worth.
+    assert_eq!(store.disk.ops() - ops, 40);
+    assert!(store.db.tree().pages.pool.large_pages() <= 16);
+    drop(iter);
+    store.db.check();
+}
+
+/// The entries left in `iter`.
+fn scan_rest(iter: &mut crate::Iter) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    while let Some((k, v)) = now(iter.next()).unwrap() {
+        entries.push((k.to_vec(), v.to_vec()));
+    }
+    entries
+}
+
+#[test]
+fn value_leaves_take_at_most_a_quarter_of_the_cache() {
+    let (store, mut model) = cold_value_store(40, 64);
+    for key in model.keys() {
+        assert_eq!(
+            get(&store.db, key, Comparison::Equal).unwrap().1,
+            model[key]
+        );
+        assert!(store.db.tree().pages.pool.large_pages() <= 16);
+    }
+    // One larger than that quarter isn't cached: each read of it reads it.
+    let ops = [Op::Put(vec![1], vec![1; 5000])];
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    for _ in 0..2 {
+        let before = store.disk.ops();
+        assert_eq!(
+            get(&store.db, &[1], Comparison::Equal).unwrap().1,
+            model[&vec![1]]
+        );
+        assert_eq!(store.disk.ops() - before, 1);
+    }
+    check_reads(&store.db, &model);
+}
+
+#[test]
+fn a_cached_value_leaf_leaves_the_cache_with_its_pages() {
+    let store = Store::new(Options::new().page_size(256));
+    let key = b"k".to_vec();
+    let mut pages = Vec::new();
+    for round in 0..4u8 {
+        // Each write frees the pages of the value leaf it replaces, and the next one
+        // reuses them, under the same page id: no copy of the old one may remain.
+        write(&store.db, &[Op::Put(key.clone(), vec![round; 300])]);
+        assert_eq!(
+            get(&store.db, &key, Comparison::Equal),
+            Some((key.clone(), vec![round; 300]))
+        );
+        store.db.check();
+        pages.push(store.db.tree().leaves()[0].0);
+    }
+    assert!(
+        node::span(pages[0]) > 0 && pages[0] == pages[2],
+        "{pages:?}"
+    );
+}
+
 #[test]
 fn a_failed_read_ahead_fails_at_its_leaf() {
     let (store, model) = cold_store(2000, 64);
@@ -2173,7 +2556,7 @@ fn writes_queued_behind_a_commit_share_the_next_one() {
 fn an_oversized_batch_is_rejected_on_its_own() {
     let (store, mut model) = store_of(200);
     let start = generation(&store.db);
-    let too_large = vec![0; store.opts.max_entry_size()];
+    let too_large = vec![0; store.opts.max_key_size() + 1];
     store.disk.hold_syncs();
     let mut first = batch_of(&puts(0..10, 2));
     let mut first_write = pin!(store.db.write(&mut first));
@@ -2182,10 +2565,10 @@ fn an_oversized_batch_is_rejected_on_its_own() {
     let mut second_write = pin!(store.db.write(&mut second));
     assert!(poll(second_write.as_mut()).is_pending());
     // Rejected before it joins the others.
-    let mut oversized = batch_of(&[put_op(20, 4), Op::Put(vec![1], too_large)]);
+    let mut oversized = batch_of(&[put_op(20, 4), Op::Put(too_large, vec![1])]);
     assert!(matches!(
         poll(pin!(store.db.write(&mut oversized))),
-        Poll::Ready(Err(Error::EntryTooLarge { .. }))
+        Poll::Ready(Err(Error::KeyTooLarge { .. }))
     ));
     let mut third = batch_of(&puts(30..40, 5));
     let mut third_write = pin!(store.db.write(&mut third));
@@ -2968,7 +3351,7 @@ async fn a_file_store_survives_reopening() {
     db.close().await.unwrap();
 
     // The page size comes from the file. A small cache sends reads to the disk.
-    let opts = Options::default().page_size(65536).cache_size(16 * 4096);
+    let opts = Options::default().cache_size(16 * 4096);
     let db = Db::open(&path, opts).await.unwrap();
     for i in (0..20_000u32).step_by(97) {
         let found = db

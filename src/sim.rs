@@ -26,7 +26,7 @@ use std::task::{Context, Poll, Waker};
 
 use compio::buf::IoBuf;
 
-use crate::pool::FrameBuf;
+use crate::pool::{FrameBuf, ValueBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fault {
@@ -157,14 +157,23 @@ impl SimDisk {
     }
 
     pub(crate) fn read(&self, mut buf: FrameBuf, offset: u64) -> (io::Result<()>, FrameBuf) {
-        let res = self.begin(None).and_then(|()| self.fill(&mut buf, offset));
+        let res = self
+            .begin(None)
+            .and_then(|()| self.fill(buf.bytes_mut(), offset));
         (res, buf)
     }
 
-    /// Copies what the disk holds at `offset` into `buf`.
-    fn fill(&self, buf: &mut FrameBuf, offset: u64) -> io::Result<()> {
+    pub(crate) fn read_value(&self, mut buf: ValueBuf, offset: u64) -> (io::Result<()>, ValueBuf) {
+        let res = self
+            .begin(None)
+            .and_then(|()| self.fill(buf.bytes_mut(), offset));
+        (res, buf)
+    }
+
+    /// Copies what the disk holds at `offset` into `out`.
+    fn fill(&self, out: &mut [u8], offset: u64) -> io::Result<()> {
         let disk = self.0.borrow();
-        let (at, out) = (offset as usize, buf.bytes_mut());
+        let at = offset as usize;
         let data = disk.current.get(at..at + out.len());
         out.copy_from_slice(data.ok_or(io::ErrorKind::UnexpectedEof)?);
         Ok(())
@@ -343,7 +352,7 @@ impl SimRead {
         }
         let (_, res) = self.started.take().unwrap();
         let mut buf = self.buf.take().unwrap();
-        let res = res.and_then(|()| self.disk.fill(&mut buf, self.offset));
+        let res = res.and_then(|()| self.disk.fill(buf.bytes_mut(), self.offset));
         Poll::Ready((res, buf))
     }
 }

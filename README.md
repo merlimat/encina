@@ -26,7 +26,8 @@ and ordered lookups, range scans, and deleting whole key ranges at once.
 - **No compaction.** Copy-on-write pages instead of an LSM tree: no background
   rewrites and no write stalls.
 - **No allocation on the data path.** Reads, iteration, and writes that reuse a
-  batch work in preallocated memory.
+  batch work in preallocated memory. Reading an entry too large for a leaf into
+  the cache takes a frame of its own size.
 - **Thread-per-core.** A `Db` is `!Send`: each compio thread owns its own stores,
   with no locks or atomics.
 
@@ -42,6 +43,9 @@ and ordered lookups, range scans, and deleting whole key ranges at once.
   merges and benchmarks against RocksDB are done. Writing a large batch's new
   leaves before it commits ([#25](https://github.com/merlimat/encina/issues/25))
   remains.
+- [x] **M4, large values:** an entry too large for a leaf gets pages of its own, so
+  values may be any size that fits in memory. The cache keeps them, up to a quarter
+  of its budget.
 
 Until 1.0, a minor release may change the API and the file format. A store records
 its format version, and encina refuses to open one whose version it doesn't know,

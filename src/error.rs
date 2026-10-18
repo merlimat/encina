@@ -19,16 +19,24 @@ use std::io;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// A put's key plus value exceeds [`Options::max_entry_size`](crate::Options::max_entry_size).
+    /// A put's key exceeds [`Options::max_key_size`](crate::Options::max_key_size).
     /// The batch containing it was not applied.
-    EntryTooLarge {
-        /// The entry's key plus value, in bytes.
+    KeyTooLarge {
+        /// The key's length, in bytes.
         size: usize,
-        /// The largest key plus value the store accepts, in bytes.
+        /// The longest key the store accepts, in bytes.
         max: usize,
     },
     /// The options are invalid.
     InvalidOptions(&'static str),
+    /// The options set a page size other than the store's, which keeps the one it
+    /// was created with.
+    PageSizeMismatch {
+        /// The store's page size, in bytes.
+        store: usize,
+        /// The page size the options set, in bytes.
+        options: usize,
+    },
     /// The file is not a store this version of encina can open.
     InvalidFile(&'static str),
     /// Another [`Db`](crate::Db), in this process or another, has the store open.
@@ -56,11 +64,15 @@ impl Error {
     /// A copy of the error, for each write of a group that failed together.
     pub(crate) fn duplicate(&self) -> Error {
         match self {
-            Error::EntryTooLarge { size, max } => Error::EntryTooLarge {
+            Error::KeyTooLarge { size, max } => Error::KeyTooLarge {
                 size: *size,
                 max: *max,
             },
             Error::InvalidOptions(reason) => Error::InvalidOptions(reason),
+            Error::PageSizeMismatch { store, options } => Error::PageSizeMismatch {
+                store: *store,
+                options: *options,
+            },
             Error::InvalidFile(reason) => Error::InvalidFile(reason),
             Error::Locked => Error::Locked,
             Error::Corruption { page } => Error::Corruption { page: *page },
@@ -77,10 +89,16 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::EntryTooLarge { size, max } => {
-                write!(f, "entry of {size} bytes exceeds the maximum of {max}")
+            Error::KeyTooLarge { size, max } => {
+                write!(f, "key of {size} bytes exceeds the maximum of {max}")
             }
             Error::InvalidOptions(reason) => write!(f, "invalid options: {reason}"),
+            Error::PageSizeMismatch { store, options } => {
+                write!(
+                    f,
+                    "the store has {store}-byte pages, not the {options} the options set"
+                )
+            }
             Error::InvalidFile(reason) => write!(f, "invalid store file: {reason}"),
             Error::Locked => write!(f, "the store is already open"),
             Error::Corruption { page } => write!(f, "page {page} is corrupt"),
@@ -119,13 +137,20 @@ mod tests {
         assert_eq!(io.source().unwrap().to_string(), "disk on fire");
         let others = [
             (
-                Error::EntryTooLarge {
+                Error::KeyTooLarge {
                     size: 2000,
                     max: 1000,
                 },
-                "entry of 2000 bytes exceeds the maximum of 1000",
+                "key of 2000 bytes exceeds the maximum of 1000",
             ),
             (Error::InvalidOptions("why"), "invalid options: why"),
+            (
+                Error::PageSizeMismatch {
+                    store: 4096,
+                    options: 8192,
+                },
+                "the store has 4096-byte pages, not the 8192 the options set",
+            ),
             (Error::InvalidFile("why"), "invalid store file: why"),
             (Error::Locked, "the store is already open"),
             (Error::Corruption { page: 7 }, "page 7 is corrupt"),

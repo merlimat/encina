@@ -13,16 +13,21 @@
 // limitations under the License.
 
 //! The leaf cache: which frame holds each cached leaf, and CLOCK eviction.
+//!
+//! The budget counts pages. A value leaf takes a large frame, of as many pages as
+//! it spans, and value leaves take at most a quarter of the budget in all: a larger
+//! one isn't cached.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
-use crate::pool::{FrameId, Holds, Pool};
+use crate::pool::{self, FrameId, Holds, Pool};
 
 pub(crate) struct Cache {
+    /// Each cached leaf's frame, by page id.
     map: HashMap<u64, FrameId, BuildHasherDefault<PageHasher>>,
     hand: usize,
-    /// Frames the pool may hold before leaves get evicted.
+    /// Pages the pool may hold before leaves get evicted.
     budget: usize,
 }
 
@@ -52,9 +57,14 @@ impl Cache {
         self.map.remove(&page)
     }
 
-    /// Frames the pool may hold before leaves get evicted.
+    /// Pages the pool may hold before leaves get evicted.
     pub(crate) fn budget(&self) -> usize {
         self.budget
+    }
+
+    /// Whether a value leaf of `pages` pages is cached.
+    pub(crate) fn caches(&self, pages: u64) -> bool {
+        pages <= (self.budget / 4) as u64
     }
 
     /// A frame holding one reference, evicting a cold leaf first when the pool is
@@ -73,31 +83,79 @@ impl Cache {
         page: u64,
     ) -> Option<FrameId> {
         if pool.in_use() >= self.budget {
-            let victim = self.evict(pool)?;
+            let victim = self.evict(pool, false)?;
             pool.free(victim);
         }
         Some(pool.alloc(holds, page))
     }
 
-    /// Finds a frame to reuse: a clean, unreferenced leaf the clock hand finds
-    /// cold, or one left over from a read whose future was dropped.
-    fn evict(&mut self, pool: &mut Pool) -> Option<FrameId> {
-        let n = pool.len();
+    /// A large frame of `pages` pages, for a value leaf the cache [`caches`](Self::caches),
+    /// holding one reference. It evicts cold leaves first, until value leaves take
+    /// at most a quarter of the budget, and the pool fits in it. If every leaf is in
+    /// use, the pool grows past them.
+    pub(crate) fn alloc_large(
+        &mut self,
+        pool: &mut Pool,
+        holds: Holds,
+        page: u64,
+        pages: usize,
+    ) -> FrameId {
+        self.make_room(pool, pages);
+        pool.alloc_large(holds, page, pages)
+    }
+
+    /// Like [`alloc_large`](Self::alloc_large), but returns `None` rather than
+    /// growing the pool past its budget.
+    pub(crate) fn try_alloc_large(
+        &mut self,
+        pool: &mut Pool,
+        holds: Holds,
+        page: u64,
+        pages: usize,
+    ) -> Option<FrameId> {
+        self.make_room(pool, pages)
+            .then(|| pool.alloc_large(holds, page, pages))
+    }
+
+    /// Evicts cold leaves until a large frame of `pages` pages fits: value leaves
+    /// within a quarter of the budget, and the pool within the budget. Returns
+    /// whether it fits.
+    fn make_room(&mut self, pool: &mut Pool, pages: usize) -> bool {
+        while pool.large_pages() + pages > self.budget / 4 {
+            let Some(victim) = self.evict(pool, true) else {
+                return false;
+            };
+            pool.free(victim);
+        }
+        while pool.in_use() + pages > self.budget {
+            let Some(victim) = self.evict(pool, false) else {
+                return false;
+            };
+            pool.free(victim);
+        }
+        true
+    }
+
+    /// Finds a frame to reuse, a large one if `large`: a clean, unreferenced leaf
+    /// the clock hand finds cold, or one left over from a read whose future was
+    /// dropped.
+    fn evict(&mut self, pool: &mut Pool, large: bool) -> Option<FrameId> {
+        let n = pool.slots();
         for _ in 0..2 * n {
-            let id = (self.hand % n) as FrameId;
+            let id = pool.slot(self.hand % n);
             self.hand = (self.hand + 1) % n;
-            if pool.refs(id) != 0 {
+            let frame = *pool.frame(id);
+            if frame.holds == Holds::Nothing || (large && !pool::is_large(id)) || pool.refs(id) != 0
+            {
                 continue;
             }
-            let frame = pool.frame_mut(id);
             match frame.holds {
                 Holds::Loading => return Some(id),
                 Holds::Leaf if !frame.dirty => {
                     if frame.clock {
-                        frame.clock = false;
+                        pool.frame_mut(id).clock = false;
                     } else {
-                        let page = frame.page;
-                        self.map.remove(&page);
+                        self.map.remove(&frame.page);
                         return Some(id);
                     }
                 }
@@ -105,11 +163,6 @@ impl Cache {
             }
         }
         None
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.map.len()
     }
 
     #[cfg(test)]
