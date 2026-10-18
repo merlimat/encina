@@ -15,12 +15,14 @@
 //! Store tests: a `BTreeMap` model, BookKeeper-shaped scenarios, failures injected
 //! into a simulated disk, and a real file.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Bound;
 use std::pin::{Pin, pin};
+use std::ptr;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use proptest::prelude::*;
 
@@ -31,12 +33,31 @@ use crate::sim::{Fault, SimDisk};
 use crate::{Comparison, Db, Error, Options, ReadOnlyDb, WriteBatch};
 
 /// Runs a future that must finish without waiting, as everything does on the
-/// simulated disk.
+/// simulated disk. It may yield, as a write does while it merges.
 pub(crate) fn now<F: Future>(f: F) -> F::Output {
-    match pin!(f).poll(&mut Context::from_waker(Waker::noop())) {
+    match poll(pin!(f)) {
         Poll::Ready(output) => output,
         Poll::Pending => panic!("the future had to wait"),
     }
+}
+
+thread_local! {
+    /// Whether [`woken_waker`] was woken.
+    static WOKEN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A waker that notes on this thread that it was woken, without allocating.
+fn woken_waker() -> Waker {
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop);
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(ptr::null(), &VTABLE)
+    }
+    fn wake(_: *const ()) {
+        WOKEN.set(true);
+    }
+    fn drop(_: *const ()) {}
+    // SAFETY: the functions ignore the data pointer, and do what wakers may.
+    unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE)) }
 }
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -175,6 +196,10 @@ enum Step {
     /// Writes that start together: the first waits for its sync, and the others
     /// queue up behind it. Those marked are dropped while they wait.
     Group(Vec<(Vec<Op>, bool)>),
+    /// A write polled at most this many times, each poll stopping where it yields,
+    /// with a full scan after each, which mustn't see it. Then it is finished if
+    /// marked, and dropped otherwise: if its merge paused, it applies nothing.
+    Paused(Vec<Op>, u8, bool),
     /// Restarts the machine and reopens the store.
     Reopen,
 }
@@ -195,7 +220,9 @@ impl Step {
                     Op::Put(key, vec![i as u8; *value_len])
                 })
                 .collect(),
-            Step::Get(..) | Step::Scan(..) | Step::Group(_) | Step::Reopen => Vec::new(),
+            Step::Get(..) | Step::Scan(..) | Step::Group(_) | Step::Paused(..) | Step::Reopen => {
+                Vec::new()
+            }
         }
     }
 }
@@ -243,6 +270,8 @@ fn step(max_value: usize) -> impl Strategy<Value = Step> {
             2..6,
         )
         .prop_map(Step::Group),
+        1 => (prop::collection::vec(op(max_value), 1..40), 1..4u8, any::<bool>())
+            .prop_map(|(ops, polls, finish)| Step::Paused(ops, polls, finish)),
         1 => Just(Step::Reopen),
     ]
 }
@@ -279,7 +308,13 @@ fn dense_step() -> impl Strategy<Value = Step> {
 }
 
 fn run(opts: Options, steps: &[Step]) {
+    run_sliced(opts, None, steps);
+}
+
+/// Runs `steps` on a store whose merges pause after every `slice` of work, if set.
+fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
     let mut store = Store::new(opts);
+    store.db.set_merge_slice(slice);
     let mut model = Model::new();
     for step in steps {
         match step {
@@ -329,8 +364,37 @@ fn run(opts: Options, steps: &[Step]) {
                 }
                 store.db.check();
             }
+            Step::Paused(ops, polls, finish) => {
+                let before = expected_scan(&model, ALL);
+                let mut batch = batch_of(ops);
+                let mut write = Box::pin(store.db.write(&mut batch));
+                let mut finished = false;
+                for _ in 0..*polls {
+                    if let Poll::Ready(result) = poll_once(write.as_mut()) {
+                        result.unwrap();
+                        finished = true;
+                        break;
+                    }
+                    assert_eq!(
+                        scan(&store.db, ALL),
+                        before,
+                        "a scan saw a write in progress"
+                    );
+                }
+                if *finish && !finished {
+                    now(write).unwrap();
+                    finished = true;
+                } else {
+                    drop(write);
+                }
+                if finished {
+                    apply(&mut model, ops);
+                }
+                store.db.check();
+            }
             Step::Reopen => {
                 store.reopen();
+                store.db.set_merge_slice(slice);
                 store.db.check();
             }
         }
@@ -420,6 +484,54 @@ proptest! {
     ) {
         run(Options::new().page_size(256).cache_size(16 * 256), &steps);
     }
+
+    // Merges that pause after every few entries, and writes dropped while theirs
+    // pauses.
+    #[test]
+    fn matches_the_model_when_merges_pause(
+        steps in prop::collection::vec(step(12), 1..40),
+        slice in 1..100usize,
+    ) {
+        run_sliced(Options::new().page_size(256), Some(slice), &steps);
+    }
+
+    #[test]
+    fn matches_the_model_when_merges_pause_with_a_tiny_cache(
+        steps in prop::collection::vec(step(12), 1..40),
+        slice in 1..100usize,
+    ) {
+        run_sliced(Options::new().page_size(256).cache_size(16 * 256), Some(slice), &steps);
+    }
+
+    #[test]
+    fn merges_that_pause_build_the_same_trees(
+        steps in prop::collection::vec(step(12), 1..40),
+        slice in 1..100usize,
+    ) {
+        same_trees(Options::new().page_size(256), slice, &steps);
+    }
+
+    #[test]
+    fn merges_that_pause_build_the_same_dense_trees(
+        steps in prop::collection::vec(dense_step(), 1..40),
+        slice in 1..100usize,
+    ) {
+        same_trees(Options::new().page_size(256), slice, &steps);
+    }
+}
+
+/// Applies the writes of `steps` to two stores, one of whose merges pause after
+/// every `slice` of work: both build the same trees, on the same pages.
+fn same_trees(opts: Options, slice: usize, steps: &[Step]) {
+    let (store, paused) = (Store::new(opts.clone()), Store::new(opts));
+    paused.db.set_merge_slice(Some(slice));
+    for ops in steps.iter().map(Step::ops).filter(|ops| !ops.is_empty()) {
+        write(&store.db, &ops);
+        write(&paused.db, &ops);
+        assert_eq!(store.db.tree().leaves(), paused.db.tree().leaves());
+        assert_eq!(store.db.tree().pages(), paused.db.tree().pages());
+    }
+    assert_eq!(scan(&store.db, ALL), scan(&paused.db, ALL));
 }
 
 fn entry_key(ledger: u64, entry: u64) -> [u8; 16] {
@@ -1647,8 +1759,20 @@ fn a_failed_page_write_leaves_its_pages_to_the_next_write() {
     assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
 }
 
-/// Polls a future once.
-pub(crate) fn poll<F: Future + ?Sized>(f: Pin<&mut F>) -> Poll<F::Output> {
+/// Polls a future until it finishes or waits: a future that yields, waking
+/// itself before it returns `Pending`, is polled again.
+pub(crate) fn poll<F: Future + ?Sized>(mut f: Pin<&mut F>) -> Poll<F::Output> {
+    loop {
+        WOKEN.set(false);
+        match f.as_mut().poll(&mut Context::from_waker(&woken_waker())) {
+            Poll::Pending if WOKEN.get() => {}
+            polled => return polled,
+        }
+    }
+}
+
+/// Polls a future once: one that yields stops there.
+fn poll_once<F: Future + ?Sized>(f: Pin<&mut F>) -> Poll<F::Output> {
     f.poll(&mut Context::from_waker(Waker::noop()))
 }
 
@@ -2436,6 +2560,224 @@ fn a_write_dropped_while_cutting_the_file_leaves_its_group_committed() {
     assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
 }
 
+/// A batch that rewrites every entry of `store_of(200)`, and removes some.
+fn rewrite_all() -> Vec<Op> {
+    let mut ops = puts(0..200, 7);
+    ops.push(range_op(50, 60));
+    ops.push(Op::Delete(150u32.to_be_bytes().to_vec()));
+    ops
+}
+
+#[test]
+fn reads_see_the_last_version_while_a_write_merges() {
+    let (store, mut model) = store_of(200);
+    store.db.set_merge_slice(Some(4));
+    let before = expected_scan(&model, ALL);
+    let ops = rewrite_all();
+    let mut batch = batch_of(&ops);
+    let mut write = Box::pin(store.db.write(&mut batch));
+    // The merge pauses before the write reads or writes anything.
+    let io = store.disk.ops();
+    assert!(poll_once(write.as_mut()).is_pending());
+    assert_eq!(store.disk.ops(), io);
+    for (k, v) in &before {
+        assert_eq!(
+            get(&store.db, k, Comparison::Equal),
+            Some((k.clone(), v.clone()))
+        );
+    }
+    assert_eq!(scan(&store.db, ALL), before);
+    let mut iter = store.db.range(..);
+    let mut seen = vec![];
+    let (k, v) = now(iter.next()).unwrap().unwrap();
+    seen.push((k.to_vec(), v.to_vec()));
+    // It goes on a slice at a time.
+    let mut pauses = 1;
+    while poll_once(write.as_mut()).is_pending() {
+        pauses += 1;
+    }
+    assert!(pauses > 10, "the merge paused {pauses} times");
+    // The iterator started before the write published: it doesn't see it.
+    while let Some((k, v)) = now(iter.next()).unwrap() {
+        seen.push((k.to_vec(), v.to_vec()));
+    }
+    assert_eq!(seen, before);
+    drop(iter);
+    apply(&mut model, &ops);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+#[test]
+fn a_write_dropped_while_its_merge_pauses_changes_nothing() {
+    let (mut store, model) = store_of(200);
+    store.db.set_merge_slice(Some(4));
+    let start = generation(&store.db);
+    // The merge pauses 50 times.
+    for polls in [1, 10, 49] {
+        let mut batch = batch_of(&rewrite_all());
+        let mut write = Box::pin(store.db.write(&mut batch));
+        for _ in 0..polls {
+            assert!(poll_once(write.as_mut()).is_pending());
+        }
+        // The pages the merge built go back to the free set, and the leaves it
+        // pinned are unpinned.
+        drop(write);
+        store.db.check();
+        assert_eq!(generation(&store.db), start);
+        assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    }
+    store.reopen();
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    // The store takes writes again.
+    let mut model = model;
+    write(&store.db, &rewrite_all());
+    apply(&mut model, &rewrite_all());
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+#[test]
+fn a_write_dropped_at_any_pause_changes_nothing() {
+    // Values that share no prefix keep leaves from holding many entries.
+    let put = |i: u32, round: u32| {
+        let value = (i.wrapping_mul(0x9e37_79b9) ^ round).to_be_bytes();
+        Op::Put(i.to_be_bytes().to_vec(), value.repeat(2))
+    };
+    // Four levels of 256-byte pages: the merge pauses with nodes of every level
+    // built, and with unbuilt ones referring to nodes it built or kept.
+    let store = Store::new(Options::new().page_size(256));
+    let mut model = Model::new();
+    for chunk in 0..4 {
+        let load: Vec<_> = (chunk * 5000..(chunk + 1) * 5000)
+            .map(|i| put(i, 1))
+            .collect();
+        write(&store.db, &load);
+        apply(&mut model, &load);
+    }
+    assert!(store.db.tree().current().root.unwrap().level >= 3);
+    // Rewrites some entries, appends, and removes ranges, some of whole subtrees:
+    // nodes split and merge at every level.
+    let mut ops: Vec<_> = (0..20_000).step_by(3).map(|i| put(i, 2)).collect();
+    ops.extend((20_000..23_000).map(|i| put(i, 3)));
+    ops.extend([range_op(5000, 9000), range_op(12_000, 12_100)]);
+    store.db.set_merge_slice(Some(256));
+    let start = generation(&store.db);
+    let mut drops = 0;
+    loop {
+        let mut batch = batch_of(&ops);
+        let mut write = Box::pin(store.db.write(&mut batch));
+        // Poll one more time than last time, then drop it.
+        let finished = (0..=drops).any(|_| match poll_once(write.as_mut()) {
+            Poll::Ready(result) => {
+                result.unwrap();
+                true
+            }
+            Poll::Pending => false,
+        });
+        drop(write);
+        if finished {
+            break;
+        }
+        drops += 1;
+        store.db.check();
+        assert_eq!(generation(&store.db), start);
+    }
+    assert!(drops > 100, "dropped at {drops} pauses");
+    assert_eq!(generation(&store.db), start + 1);
+    apply(&mut model, &ops);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+/// Queues writes of `queued` behind a first write, then has the first of them
+/// lead its group until its merge pauses.
+fn pause_group_merge<'a>(
+    store: &Store,
+    model: &mut Model,
+    queued: &'a mut [WriteBatch],
+    db: &'a Db,
+) -> Vec<Write<'a>> {
+    let first = puts(0..50, 2);
+    let mut writes = queue_behind(store, &first, queued, db);
+    apply(model, &first);
+    db.set_merge_slice(Some(4));
+    let io = store.disk.ops();
+    assert!(poll_once(writes[0].as_mut()).is_pending());
+    assert_eq!(store.disk.ops(), io, "the group's merge didn't pause");
+    writes
+}
+
+#[test]
+fn a_write_dropped_while_its_merge_pauses_leaves_its_group_to_the_others() {
+    let (store, mut model) = store_of(200);
+    let start = generation(&store.db);
+    let queued = [rewrite_all(), vec![range_op(100, 120)], puts(180..190, 4)];
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let db = store.db.clone();
+    let mut writes = pause_group_merge(&store, &mut model, &mut batches, &db);
+    // The leader goes before it writes anything; the next write takes over.
+    drop(writes.remove(0));
+    for write in writes {
+        now(write).unwrap();
+    }
+    assert!(!store.db.has_failed());
+    assert_eq!(generation(&store.db), start + 2);
+    apply(&mut model, &queued[1]);
+    apply(&mut model, &queued[2]);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+#[test]
+fn a_write_dropped_while_its_group_merges_is_withdrawn() {
+    let (store, mut model) = store_of(200);
+    let start = generation(&store.db);
+    let queued = [rewrite_all(), vec![range_op(100, 120)], puts(180..190, 4)];
+    let mut batches: Vec<_> = queued.iter().map(|ops| batch_of(ops)).collect();
+    let db = store.db.clone();
+    let mut writes = pause_group_merge(&store, &mut model, &mut batches, &db);
+    // The leader starts its merge over without the range.
+    drop(writes.remove(1));
+    for write in writes {
+        now(write).unwrap();
+    }
+    assert_eq!(generation(&store.db), start + 2);
+    apply(&mut model, &queued[0]);
+    apply(&mut model, &queued[2]);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+#[compio::test]
+async fn other_tasks_run_while_a_write_merges() {
+    let (store, _) = store_of(200);
+    let db = store.db.clone();
+    db.set_merge_slice(Some(4));
+    let writing = Rc::new(Cell::new(true));
+    let lookups = Rc::new(Cell::new(0));
+    let reader = compio::runtime::spawn({
+        let (db, writing, lookups) = (db.clone(), writing.clone(), lookups.clone());
+        async move {
+            let key = 100u32.to_be_bytes();
+            while writing.get() {
+                let found = db.get(&key, Comparison::Equal, |_, v| v[0]).await;
+                assert_eq!(found.unwrap(), Some(1));
+                lookups.set(lookups.get() + 1);
+                yield_once().await;
+            }
+        }
+    });
+    db.write(&mut batch_of(&rewrite_all())).await.unwrap();
+    writing.set(false);
+    reader.await.unwrap();
+    assert!(lookups.get() > 10, "{} lookups ran", lookups.get());
+    let found = db
+        .get(&100u32.to_be_bytes(), Comparison::Equal, |_, v| v[0])
+        .await;
+    assert_eq!(found.unwrap(), Some(7));
+}
+
 #[test]
 fn a_group_holds_the_batches_that_fit() {
     let (store, mut model) = store_of(200);
@@ -3026,4 +3368,138 @@ fn file_size_and_requests() {
         });
         usage.report(name, &store);
     }
+}
+
+/// Measures how long lookups wait while large writes merge, on the simulated disk
+/// with 4 KiB pages and a cache that holds everything, so that lookups only ever
+/// wait for the thread. Run it with
+/// `cargo test --release -- --ignored --nocapture read_latency_during_a_load`.
+///
+/// A store of 2M BookKeeper-shaped entries takes writes of 1M entries each, while a
+/// lookup of a random key is due every 20 µs: a lookup's latency runs from when it
+/// was due until it returns. Writes that never pause show what a merge costs them.
+///
+/// - append: each write appends 1,000 entries to each of 1,000 ledgers.
+/// - random: each write updates 1M random keys.
+#[test]
+#[ignore]
+fn read_latency_during_a_load() {
+    println!(
+        "{:<8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "workload", "slice", "write", "lookups", "p50", "p99", "p99.9", "max"
+    );
+    for workload in ["append", "random"] {
+        for pause in [false, true] {
+            latency_during_writes(workload, pause);
+        }
+    }
+}
+
+fn latency_during_writes(workload: &str, pause: bool) {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    let (ledgers, preload, writes) = (1000u64, 2000u64, 3u64);
+    let store = Store::new(Options::new().cache_size(4 << 30));
+    let db = store.db.clone();
+    let mut batch = WriteBatch::new();
+    for chunk in 0..preload / 100 {
+        batch.clear();
+        for ledger in 0..ledgers {
+            for entry in chunk * 100..(chunk + 1) * 100 {
+                batch.put(&entry_key(ledger, entry), &location(ledger, entry));
+            }
+        }
+        now(db.write(&mut batch)).unwrap();
+    }
+    if !pause {
+        db.set_merge_slice(Some(usize::MAX));
+    }
+    let runtime = compio::runtime::Runtime::new().unwrap();
+    let done = Rc::new(Cell::new(false));
+    let latencies = Rc::new(RefCell::new(Vec::new()));
+    let reader = {
+        let (db, done, latencies) = (db.clone(), done.clone(), latencies.clone());
+        async move {
+            let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+            let interval = Duration::from_micros(20);
+            let mut due = Instant::now();
+            while !done.get() {
+                while due <= Instant::now() {
+                    let key = entry_key(rng.next() % ledgers, rng.next() % preload);
+                    db.get(&key, Comparison::Equal, |_, _| ()).await.unwrap();
+                    latencies.borrow_mut().push(due.elapsed());
+                    due += interval;
+                }
+                yield_once().await;
+            }
+        }
+    };
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut batches: Vec<_> = (0..writes)
+        .map(|round| {
+            let mut batch = WriteBatch::new();
+            match workload {
+                "append" => {
+                    let first = preload + round * 1000;
+                    for ledger in 0..ledgers {
+                        for entry in first..first + 1000 {
+                            batch.put(&entry_key(ledger, entry), &location(ledger, entry));
+                        }
+                    }
+                }
+                _ => {
+                    for _ in 0..1_000_000 {
+                        let (ledger, entry) = (rng.next() % ledgers, rng.next() % preload);
+                        batch.put(&entry_key(ledger, entry), &location(round, entry));
+                    }
+                }
+            }
+            batch
+        })
+        .collect();
+    let elapsed = runtime.block_on(async {
+        let reader = compio::runtime::spawn(reader);
+        let mut elapsed = Duration::ZERO;
+        for batch in &mut batches {
+            let start = Instant::now();
+            db.write(batch).await.unwrap();
+            elapsed += start.elapsed();
+            // Let the lookups that were due catch up before the next write.
+            yield_once().await;
+        }
+        done.set(true);
+        let _ = reader.await;
+        elapsed / writes as u32
+    });
+    let mut latencies = latencies.take();
+    latencies.sort_unstable();
+    let at = |q: f64| latencies[((latencies.len() - 1) as f64 * q) as usize];
+    let ms = |d: Duration| format!("{:.3} ms", d.as_secs_f64() * 1e3);
+    let slice = if pause { "1 ms" } else { "never" };
+    println!(
+        "{:<8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        workload,
+        slice,
+        ms(elapsed),
+        latencies.len(),
+        ms(at(0.5)),
+        ms(at(0.99)),
+        ms(at(0.999)),
+        ms(*latencies.last().unwrap()),
+    );
+}
+
+/// Lets the runtime run the other tasks once.
+async fn yield_once() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
 }

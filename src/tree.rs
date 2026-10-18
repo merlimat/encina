@@ -28,6 +28,8 @@
 
 use std::cmp::Ordering;
 use std::mem;
+use std::task::Poll;
+use std::time::{Duration, Instant};
 
 use crate::Comparison;
 use crate::batch::WriteBatch;
@@ -40,6 +42,17 @@ use crate::space::{Life, Space};
 /// The deepest tree supported. Every split leaves internal nodes with at least two
 /// children, so real trees stay far shallower.
 pub(crate) const MAX_HEIGHT: usize = 32;
+
+/// How long a merge runs before it pauses, so that the write building it can let
+/// the other tasks run. A pause costs a trip through the runtime, about 15 µs on an
+/// Apple M5 Pro, so much shorter slices would slow writes down.
+const SLICE: Duration = Duration::from_millis(1);
+
+/// The work a merge does between looks at the clock: entries copied, merged and
+/// built, and nodes visited. On an Apple M5 Pro, 4,096 units take about 25 µs of
+/// a sorted load, and 180 µs of random updates, whose operations lie scattered in
+/// the batch's memory.
+const CHECK: usize = 4096;
 
 /// A version's root node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,10 +78,11 @@ pub(crate) struct Pages {
 }
 
 impl Pages {
-    /// Builds entries `a..b` of `src` into a new node at `level`, on a new page. The
-    /// node is dirty until its write publishes. A leaf goes into the cache, holding
-    /// a reference until then; an internal node's one reference goes to the caller.
-    /// Returns the node's frame ([`NO_FRAME`] for a leaf), page, and bytes used.
+    /// Builds entries `a..b` of `src` into a new node at `level`, on a new page,
+    /// sealed as written by `generation`. The node is dirty until its write
+    /// publishes. A leaf goes into the cache, holding a reference until then; an
+    /// internal node's one reference goes to the caller. Returns the node's frame
+    /// ([`NO_FRAME`] for a leaf), page, and bytes used.
     fn build(
         &mut self,
         level: u8,
@@ -76,6 +90,7 @@ impl Pages {
         a: usize,
         b: usize,
         life: Life,
+        generation: u64,
     ) -> (FrameId, u64, usize) {
         let page = self.space.alloc(life);
         let holds = if level == 0 {
@@ -85,6 +100,7 @@ impl Pages {
         };
         let frame = self.cache.alloc(&mut self.pool, holds, page);
         let used = node::build(self.pool.page_mut(frame), level, src, a, b);
+        node::seal(self.pool.page_mut(frame), generation);
         self.pool.frame_mut(frame).dirty = true;
         if level > 0 {
             return (frame, page, used);
@@ -135,11 +151,166 @@ pub(crate) struct Tree {
     /// The nodes the write in progress added for its changes, and those it moved.
     added: usize,
     moved: usize,
+    /// The merge in progress, which pauses after each slice: how far it got, what
+    /// it keeps of each internal node on its path and of the leaf it rebuilds, and
+    /// when it pauses next.
+    phase: Phase,
+    visits: [Visit; MAX_HEIGHT],
+    leaf: LeafMerge,
+    budget: Budget,
 }
 
 enum Outcome {
     Unchanged,
     Replaced,
+    /// The merge did a slice of its work, and paused.
+    Paused,
+}
+
+/// When the merge in progress pauses: once it has run for [`SLICE`], or, in tests,
+/// once it has done a set amount of work.
+struct Budget {
+    /// The work done since the merge last paused, and the work after which it next
+    /// looks at the clock, or pauses in tests.
+    work: usize,
+    check: usize,
+    /// When it last started or resumed.
+    start: Instant,
+    /// The work it does before pausing, in tests.
+    fixed: Option<usize>,
+}
+
+impl Budget {
+    fn new() -> Budget {
+        Budget {
+            work: 0,
+            check: CHECK,
+            start: Instant::now(),
+            fixed: None,
+        }
+    }
+
+    /// Starts a slice.
+    fn start(&mut self) {
+        self.work = 0;
+        self.check = self.fixed.unwrap_or(CHECK);
+        self.start = Instant::now();
+    }
+
+    /// Whether the slice is over.
+    fn spent(&mut self) -> bool {
+        if self.work < self.check {
+            return false;
+        }
+        if self.fixed.is_some() || self.start.elapsed() >= SLICE {
+            return true;
+        }
+        self.check = self.work + CHECK;
+        false
+    }
+}
+
+/// How far the merge in progress got.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Idle,
+    /// Merging the batch into the tree, from the root down.
+    Merging,
+    /// Stacking levels on the nodes that replace the root: at `level`, whose
+    /// nodes under a quarter full are merged once `fixed`, then built from item
+    /// `k` on.
+    Growing {
+        level: usize,
+        fixed: bool,
+        k: usize,
+    },
+}
+
+/// What a merge keeps of an internal node it merges while it pauses. The node is
+/// found again from its parent.
+#[derive(Clone, Copy, Default)]
+struct Visit {
+    /// The merge is at this level.
+    active: bool,
+    /// The operations and ranges that fall in the children it hasn't reached.
+    ops: Span,
+    ranges: Span,
+    /// The child it is at, and whether that child's merge paused.
+    child: usize,
+    inside: bool,
+    changed: bool,
+    /// Where the nodes replacing its children start in the list below, and, once
+    /// past its children, how far it got finishing them: at `stage`, from item
+    /// `k` on.
+    mark: Mark,
+    stage: Stage,
+    k: usize,
+}
+
+/// The steps that finish the nodes replacing an internal node's children.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Stage {
+    #[default]
+    Move,
+    Fix,
+    Build,
+}
+
+/// What a merge keeps of the leaf it rebuilds while it pauses.
+#[derive(Clone, Copy, Default)]
+struct LeafMerge {
+    /// The merge is at this leaf.
+    active: bool,
+    /// The leaf's frame, which the write pinned, or [`NO_FRAME`] in an empty tree.
+    frame: FrameId,
+    ops: Span,
+    ranges: Span,
+    /// Where the rebuilt entries start in `lists[0]`, and how far merging them
+    /// got: the leaf's entry `i`, operation `j` and range `r`.
+    base: usize,
+    i: usize,
+    j: usize,
+    r: usize,
+    changed: bool,
+    in_run: bool,
+    /// Once merged, the nodes they go to, when they need more than one
+    /// (`splitting`): from item `items` of `lists[0]` on, splitting after run
+    /// `run`, from entry `s` on, while `packing` the run's entries into full nodes.
+    merged: bool,
+    splitting: bool,
+    items: usize,
+    run: usize,
+    s: usize,
+    packing: bool,
+}
+
+/// Operations or ranges of a prepared batch: indexes `start..end` into its
+/// points or ranges.
+#[derive(Clone, Copy, Default)]
+struct Span {
+    start: usize,
+    end: usize,
+}
+
+impl Span {
+    fn all<T>(items: &[T]) -> Span {
+        Span {
+            start: 0,
+            end: items.len(),
+        }
+    }
+
+    fn of<T>(self, items: &[T]) -> &[T] {
+        &items[self.start..self.end]
+    }
+
+    /// Its last `len` items.
+    fn last(self, len: usize) -> Span {
+        Span {
+            start: self.end - len,
+            end: self.end,
+        }
+    }
 }
 
 /// The result of looking an entry up using cached leaves only.
@@ -173,6 +344,10 @@ impl Tree {
             pending: None,
             added: 0,
             moved: 0,
+            phase: Phase::Idle,
+            visits: [Visit::default(); MAX_HEIGHT],
+            leaf: LeafMerge::default(),
+            budget: Budget::new(),
         }
     }
 
@@ -458,40 +633,65 @@ impl Tree {
     }
 
     /// Applies a prepared batch, whose touched leaves must be cached, building the
-    /// next version. Returns false if the batch changes nothing. Otherwise the new
-    /// version is pending until [`publish`](Self::publish) or
-    /// [`discard`](Self::discard).
-    pub(crate) fn apply(&mut self, batch: &WriteBatch) -> bool {
-        debug_assert!(self.pending.is_none());
-        let (ops, ranges) = (batch.points(), batch.ranges());
-        if ops.is_empty() && ranges.is_empty() {
-            return false;
-        }
-        self.dropped.clear();
-        self.pages.space.restart();
-        (self.added, self.moved) = (0, 0);
-        let (level, outcome) = match self.root {
-            Some(root) => {
-                let level = usize::from(root.level);
-                self.ensure_level(level);
-                (
-                    level,
-                    self.merge((root.frame, root.page), level, ops, ranges, None, batch),
-                )
+    /// next version. The merge pauses after each slice of work, returning
+    /// `Pending`, so that the caller can let other tasks run: calling this again
+    /// with the same batch goes on where it left off. Returns false if the batch
+    /// changes nothing. Otherwise the new version is pending until
+    /// [`publish`](Self::publish) or [`discard`](Self::discard), which also throws
+    /// away a merge that paused.
+    pub(crate) fn apply(&mut self, batch: &WriteBatch) -> Poll<bool> {
+        self.budget.start();
+        loop {
+            match self.phase {
+                Phase::Idle => {
+                    debug_assert!(self.pending.is_none());
+                    if batch.points().is_empty() && batch.ranges().is_empty() {
+                        return Poll::Ready(false);
+                    }
+                    self.dropped.clear();
+                    self.pages.space.restart();
+                    (self.added, self.moved) = (0, 0);
+                    self.ensure_level(self.root.map_or(0, |r| usize::from(r.level)));
+                    self.phase = Phase::Merging;
+                }
+                Phase::Merging => {
+                    let (ops, ranges) = (Span::all(batch.points()), Span::all(batch.ranges()));
+                    let (level, outcome) = match self.root {
+                        Some(root) => {
+                            let level = usize::from(root.level);
+                            let node = (root.frame, root.page);
+                            (level, self.merge(node, level, ops, ranges, None, batch))
+                        }
+                        None => (0, self.merge_leaf(None, ops, Span::default(), batch)),
+                    };
+                    match outcome {
+                        Outcome::Paused => return Poll::Pending,
+                        Outcome::Unchanged => {
+                            self.phase = Phase::Idle;
+                            return Poll::Ready(false);
+                        }
+                        Outcome::Replaced => {
+                            if let Some(root) = self.root {
+                                self.dropped.push(root.page);
+                            }
+                            self.phase = Phase::Growing {
+                                level,
+                                fixed: false,
+                                k: 0,
+                            };
+                        }
+                    }
+                }
+                Phase::Growing { level, fixed, k } => {
+                    let Some(root) = self.grow(level, fixed, k) else {
+                        return Poll::Pending;
+                    };
+                    self.pending = Some(root);
+                    self.phase = Phase::Idle;
+                    return Poll::Ready(true);
+                }
             }
-            None => {
-                self.ensure_level(0);
-                (0, self.merge_leaf(None, ops, &[], batch))
-            }
-        };
-        if let Outcome::Unchanged = outcome {
-            return false;
         }
-        if let Some(root) = self.root {
-            self.dropped.push(root.page);
-        }
-        self.pending = Some(self.grow(level));
-        true
     }
 
     /// The meta page that makes the pending version current as `generation`.
@@ -506,39 +706,34 @@ impl Tree {
         }
     }
 
-    /// Lists in `dirty` the nodes of the pending version that need writing, and
-    /// seals them as written by `generation`.
-    pub(crate) fn seal_pending(&mut self, generation: u64) {
-        self.collect_pending();
-        for i in 0..self.dirty.len() {
-            let frame = self.dirty[i].0;
-            node::seal(self.pages.pool.page_mut(frame), generation);
+    /// Lists in `dirty` the nodes of the pending version that need writing: those
+    /// it doesn't share with the current one. They are sealed already.
+    pub(crate) fn collect_pending(&mut self) {
+        self.dirty.clear();
+        if let Some(Some(root)) = self.pending {
+            self.collect_built(usize::from(root.level), root.frame, root.page);
         }
     }
 
-    /// Lists in `dirty` the nodes the pending version doesn't share with the
-    /// current one.
-    fn collect_pending(&mut self) {
-        self.dirty.clear();
-        let Some(Some(root)) = self.pending else {
-            return;
-        };
-        // Leaves this write built are cached until it ends, so an uncached leaf is
-        // one it kept.
-        if root.level == 0 {
-            if let Some(frame) = self.pages.cached(root.page)
-                && self.pages.pool.frame(frame).dirty
-            {
-                self.dirty.push((frame, root.page));
+    /// Lists in `dirty` the node at `level`, on `frame` and `page`, if the write in
+    /// progress built it, and the nodes it built below it.
+    fn collect_built(&mut self, level: usize, frame: FrameId, page: u64) {
+        if level > 0 {
+            if self.pages.pool.frame(frame).dirty {
+                self.collect_dirty(frame, page);
             }
-        } else if self.pages.pool.frame(root.frame).dirty {
-            self.collect_dirty(root.frame, root.page);
+        } else if let Some(leaf) = self.pages.cached(page)
+            && self.pages.pool.frame(leaf).dirty
+        {
+            // Leaves this write built are cached until it ends, so an uncached leaf
+            // is one it kept.
+            self.dirty.push((leaf, page));
         }
     }
 
     fn collect_dirty(&mut self, frame: FrameId, page: u64) {
         self.dirty.push((frame, page));
-        // SAFETY: the pending version's nodes stay put until it is published.
+        // SAFETY: the nodes this write built stay put until it ends.
         let node = unsafe { Node::new(self.pages.pool.page_unbounded(frame)) };
         for i in 0..node.count() {
             let page = node.child_page(i);
@@ -580,14 +775,71 @@ impl Tree {
         self.reclaim();
     }
 
-    /// Throws the pending version away: the write failed before committing it.
+    /// Throws away the version the write in progress builds, whether pending or
+    /// halfway through its merge: the write failed, or went away, before committing
+    /// it.
     pub(crate) fn discard(&mut self) {
+        self.abort_merge();
         self.unpin_touched();
         self.dropped.clear();
         self.collect_pending();
         let Some(root) = self.pending.take() else {
             return;
         };
+        self.free_dirty_leaves();
+        if let Some(root) = root.filter(|r| r.frame != NO_FRAME) {
+            self.release(root.frame);
+        }
+    }
+
+    /// Throws away a merge that paused, if any. The nodes it built are in its lists,
+    /// or below the nodes there, and so are its references to internal nodes.
+    fn abort_merge(&mut self) {
+        if self.phase == Phase::Idle {
+            return;
+        }
+        // Collect the nodes it built.
+        self.dirty.clear();
+        for level in 0..self.lists.len() {
+            for k in 0..self.lists[level].len() {
+                let item = self.lists[level].items[k];
+                if item.is_built() {
+                    self.collect_built(level, item.frame, item.page);
+                } else if item.fresh && level > 0 {
+                    for e in item.start as usize..item.end as usize {
+                        let child = self.lists[level].entries.value(e);
+                        let (frame, page) = (node::child_frame(child), node::child_page(child));
+                        self.collect_built(level - 1, frame, page);
+                    }
+                }
+            }
+        }
+        // Free the leaves among them. Letting go of the references frees the
+        // internal nodes.
+        self.free_dirty_leaves();
+        for level in 1..self.lists.len() {
+            for k in 0..self.lists[level].len() {
+                let item = self.lists[level].items[k];
+                if !item.fresh || item.is_built() {
+                    self.release(item.frame);
+                } else if level > 1 {
+                    for e in item.start as usize..item.end as usize {
+                        self.release(node::child_frame(self.lists[level].entries.value(e)));
+                    }
+                }
+            }
+        }
+        for list in &mut self.lists {
+            list.truncate(Mark::default());
+        }
+        self.visits = [Visit::default(); MAX_HEIGHT];
+        self.leaf = LeafMerge::default();
+        self.phase = Phase::Idle;
+    }
+
+    /// Frees the leaves listed in `dirty`, which the write in progress built, and
+    /// empties the list.
+    fn free_dirty_leaves(&mut self) {
         let Pages { pool, cache, space } = &mut self.pages;
         for &(frame, page) in &self.dirty {
             if pool.frame(frame).holds == Holds::Leaf {
@@ -598,9 +850,6 @@ impl Tree {
             }
         }
         self.dirty.clear();
-        if let Some(root) = root.filter(|r| r.frame != NO_FRAME) {
-            self.release(root.frame);
-        }
     }
 
     /// Releases the leaves the write in progress pinned.
@@ -623,12 +872,14 @@ impl Tree {
 
     /// Applies `ops` and `ranges`, which all fall below `hi`, to the subtree at
     /// `node` (frame and page). Its replacement nodes, if any, go to `lists[level]`.
+    /// If the merge pauses, calling this again with the same `node` and `hi` goes
+    /// on where it left off, with the operations and ranges it kept.
     fn merge(
         &mut self,
         node: (FrameId, u64),
         level: usize,
-        ops: &[u32],
-        ranges: &[(u32, u32)],
+        ops: Span,
+        ranges: Span,
         hi: Option<&[u8]>,
         batch: &WriteBatch,
     ) -> Outcome {
@@ -643,8 +894,8 @@ impl Tree {
         &mut self,
         frame: FrameId,
         level: usize,
-        mut ops: &[u32],
-        mut ranges: &[(u32, u32)],
+        ops: Span,
+        ranges: Span,
         hi: Option<&[u8]>,
         batch: &WriteBatch,
     ) -> Outcome {
@@ -652,12 +903,27 @@ impl Tree {
         // by the current root until the write publishes its new root.
         let node = unsafe { Node::new(self.pages.pool.page_unbounded(frame)) };
         let below = level - 1;
-        let mark = self.lists[below].mark();
+        let mut v = self.visits[level];
+        if !v.active {
+            let mark = self.lists[below].mark();
+            v = Visit {
+                active: true,
+                ops,
+                ranges,
+                mark,
+                k: mark.items,
+                ..Visit::default()
+            };
+            node.key_into(0, &mut self.bounds[2 * level]);
+        }
         let mut key = mem::take(&mut self.bounds[2 * level]);
         let mut next = mem::take(&mut self.bounds[2 * level + 1]);
-        let mut changed = false;
-        node.key_into(0, &mut key);
-        for i in 0..node.count() {
+        // The operations and ranges for the children it hasn't reached, which
+        // `split` narrows: what it leaves of each is their spans' last items.
+        let mut ops = v.ops.of(batch.points());
+        let mut ranges = v.ranges.of(batch.ranges());
+        while v.child < node.count() {
+            let i = v.child;
             let child = (node.child(i), node.child_page(i));
             let child_hi = if i + 1 < node.count() {
                 node.key_into(i + 1, &mut next);
@@ -665,151 +931,270 @@ impl Tree {
             } else {
                 hi
             };
-            let (child_ops, child_ranges, covered) =
-                split(batch, &mut ops, &mut ranges, &key, child_hi);
-            if child_ops.is_empty() && child_ranges.is_empty() {
-                self.keep(below, &key, child);
-            } else if covered {
-                // The whole subtree goes, without reading its leaves.
-                self.drop_subtree(child, below);
-                changed = true;
+            // `None` once the child is dropped whole.
+            let outcome = if v.inside {
+                // The child's merge paused: it goes on with the operations it kept.
+                let kept = Span::default();
+                Some(self.merge(child, below, kept, kept, child_hi, batch))
+            } else if self.budget.spent() {
+                Some(Outcome::Paused)
             } else {
-                match self.merge(child, below, child_ops, child_ranges, child_hi, batch) {
-                    Outcome::Unchanged => self.keep(below, &key, child),
-                    Outcome::Replaced => {
-                        self.dropped.push(child.1);
-                        changed = true;
-                    }
+                self.budget.work += 1;
+                let (child_ops, child_ranges, covered) =
+                    split(batch, &mut ops, &mut ranges, &key, child_hi);
+                if child_ops.is_empty() && child_ranges.is_empty() {
+                    Some(Outcome::Unchanged)
+                } else if covered {
+                    // The whole subtree goes, without reading its leaves.
+                    self.drop_subtree(child, below);
+                    v.changed = true;
+                    None
+                } else {
+                    // The child's operations come just before what `split` left,
+                    // and its ranges first in what it left.
+                    (v.ops, v.ranges) = (v.ops.last(ops.len()), v.ranges.last(ranges.len()));
+                    let child_ops = Span {
+                        start: v.ops.start - child_ops.len(),
+                        end: v.ops.start,
+                    };
+                    let child_ranges = Span {
+                        start: v.ranges.start,
+                        end: v.ranges.start + child_ranges.len(),
+                    };
+                    v.inside = true;
+                    Some(self.merge(child, below, child_ops, child_ranges, child_hi, batch))
                 }
+            };
+            match outcome {
+                Some(Outcome::Paused) => break,
+                Some(Outcome::Unchanged) => self.keep(below, &key, child),
+                Some(Outcome::Replaced) => {
+                    self.dropped.push(child.1);
+                    v.changed = true;
+                }
+                None => {}
             }
+            v.inside = false;
+            v.child += 1;
             mem::swap(&mut key, &mut next);
         }
         self.bounds[2 * level] = key;
         self.bounds[2 * level + 1] = next;
-        if !changed {
-            self.discard_list(below, mark);
+        (v.ops, v.ranges) = (v.ops.last(ops.len()), v.ranges.last(ranges.len()));
+        // Paused at a child, or finishing them.
+        if v.child < node.count() || (v.changed && !self.finish(below, &mut v)) {
+            self.visits[level] = v;
+            return Outcome::Paused;
+        }
+        self.visits[level].active = false;
+        if !v.changed {
+            self.discard_list(below, v.mark);
             return Outcome::Unchanged;
         }
-        self.move_kept(below, mark.items);
-        self.fix_underfull(below, mark.items);
-        self.build_parents(below, mark);
+        self.add_parents(below, v.mark);
         Outcome::Replaced
+    }
+
+    /// Finishes the nodes past `v.mark` in `lists[level]`, which replace the
+    /// children of the node `v` merges: moves the kept nodes that should move,
+    /// merges those under a quarter full, then builds them. Returns false if it
+    /// paused: `v` keeps how far it got.
+    fn finish(&mut self, level: usize, v: &mut Visit) -> bool {
+        let start = v.mark.items;
+        if v.stage == Stage::Move {
+            if !self.move_kept(level, &mut v.k) {
+                return false;
+            }
+            (v.stage, v.k) = (Stage::Fix, start);
+        }
+        if v.stage == Stage::Fix {
+            if !self.fix_underfull(level, start, &mut v.k) {
+                return false;
+            }
+            (v.stage, v.k) = (Stage::Build, start);
+        }
+        self.build_nodes(level, &mut v.k)
     }
 
     fn merge_leaf(
         &mut self,
         page: Option<u64>,
-        ops: &[u32],
-        ranges: &[(u32, u32)],
+        ops: Span,
+        ranges: Span,
         batch: &WriteBatch,
     ) -> Outcome {
-        let node = page.map(|page| {
-            let frame = self
-                .pages
-                .cached(page)
-                .expect("the write loads the leaves it changes");
-            // SAFETY: the write pinned this leaf, and published frames are never
-            // modified.
-            unsafe { Node::new(self.pages.pool.page_unbounded(frame)) }
-        });
+        let mut m = self.leaf;
+        if !m.active {
+            let frame = page.map_or(NO_FRAME, |page| {
+                self.pages
+                    .cached(page)
+                    .expect("the write loads the leaves it changes")
+            });
+            m = LeafMerge {
+                active: true,
+                frame,
+                ops,
+                ranges,
+                base: self.lists[0].entries.len(),
+                ..LeafMerge::default()
+            };
+            self.run_ends.clear();
+        }
+        // SAFETY: the write pinned this leaf, and published frames are never
+        // modified.
+        let node = (m.frame != NO_FRAME)
+            .then(|| unsafe { Node::new(self.pages.pool.page_unbounded(m.frame)) });
+        if !m.merged {
+            if !self.merge_entries(&mut m, node, batch) {
+                self.leaf = m;
+                return Outcome::Paused;
+            }
+            if !m.changed {
+                self.lists[0].entries.truncate(m.base);
+                self.leaf.active = false;
+                return Outcome::Unchanged;
+            }
+            m.merged = true;
+        }
+        let outcome = self.emit_leaves(&mut m);
+        self.leaf = m;
+        self.leaf.active = matches!(outcome, Outcome::Paused);
+        outcome
+    }
+
+    /// Merges the entries of the leaf `m` rebuilds, `node`, with its operations and
+    /// ranges into `lists[0]`. Returns false if it paused: `m` keeps how far it
+    /// got.
+    fn merge_entries(&mut self, m: &mut LeafMerge, node: Option<Node>, batch: &WriteBatch) -> bool {
         let old = node.map_or(0, |n| n.count());
+        let (ops, ranges) = (m.ops.of(batch.points()), m.ranges.of(batch.ranges()));
         // The rebuilt leaf's entries go after those of its rebuilt siblings, until
         // the parent builds them all.
         let (leaf, run_ends) = (&mut self.lists[0].entries, &mut self.run_ends);
-        let base = leaf.len();
-        run_ends.clear();
-        let (mut i, mut j, mut r) = (0, 0, 0);
-        let mut changed = false;
-        let mut in_run = false;
+        let LeafMerge {
+            i,
+            j,
+            r,
+            changed,
+            in_run,
+            ..
+        } = m;
         loop {
-            let ord = match (i < old, j < ops.len()) {
+            if self.budget.spent() {
+                return false;
+            }
+            self.budget.work += 1;
+            let ord = match (*i < old, *j < ops.len()) {
                 (false, false) => break,
                 (true, false) => Ordering::Less,
                 (false, true) => Ordering::Greater,
-                (true, true) => node.unwrap().cmp_key(i, batch.key(ops[j])),
+                (true, true) => node.unwrap().cmp_key(*i, batch.key(ops[*j])),
             };
             if ord == Ordering::Less {
                 let n = node.unwrap();
-                while r < ranges.len() && n.cmp_key(i, batch.range_end(ranges[r].1)).is_ge() {
-                    r += 1;
+                while *r < ranges.len() && n.cmp_key(*i, batch.range_end(ranges[*r].1)).is_ge() {
+                    *r += 1;
                 }
-                if r < ranges.len() && n.cmp_key(i, batch.range_start(ranges[r].0)).is_ge() {
-                    changed = true;
-                    i += 1;
+                if *r < ranges.len() && n.cmp_key(*i, batch.range_start(ranges[*r].0)).is_ge() {
+                    *changed = true;
+                    *i += 1;
                     continue;
                 }
                 // The entries below the next put or delete, and below the next range,
                 // all stay: copy them without comparing each.
                 let mut end = old;
-                if j < ops.len() {
-                    end = end.min(n.search(batch.key(ops[j])).0);
+                if *j < ops.len() {
+                    end = end.min(n.search(batch.key(ops[*j])).0);
                 }
-                if r < ranges.len() {
-                    end = end.min(n.search(batch.range_start(ranges[r].0)).0);
+                if *r < ranges.len() {
+                    end = end.min(n.search(batch.range_start(ranges[*r].0)).0);
                 }
-                debug_assert!(end > i);
-                if in_run {
+                debug_assert!(end > *i);
+                if *in_run {
                     run_ends.push(leaf.len() as u32);
-                    in_run = false;
+                    *in_run = false;
                 }
-                for k in i..end {
+                for k in *i..end {
                     leaf.push_from(&n, k);
                 }
-                i = end;
+                self.budget.work += end - *i;
+                *i = end;
                 continue;
             }
-            let op = ops[j];
-            j += 1;
+            let op = ops[*j];
+            *j += 1;
             if ord == Ordering::Equal {
                 // The existing entry is replaced or deleted.
-                i += 1;
-                changed = true;
+                *i += 1;
+                *changed = true;
             }
             if let Some(value) = batch.value(op) {
                 leaf.push(batch.key(op), value);
-                in_run = true;
-                changed = true;
+                *in_run = true;
+                *changed = true;
             }
         }
-        if in_run {
+        if *in_run {
             run_ends.push(leaf.len() as u32);
+            *in_run = false;
         }
-        if !changed {
-            leaf.truncate(base);
-            return Outcome::Unchanged;
-        }
+        true
+    }
+
+    /// Adds to `lists[0]` the nodes, unbuilt, that the entries of the leaf `m`
+    /// rebuilds go to: those past `m.base`. Returns `Paused` if it paused: `m` keeps
+    /// how far it got.
+    fn emit_leaves(&mut self, m: &mut LeafMerge) -> Outcome {
         let (out, page) = (&mut self.lists[0], self.page_size);
         let n = out.entries.len();
-        if n == base {
-            return Outcome::Replaced;
+        if !m.splitting {
+            if n == m.base {
+                return Outcome::Replaced;
+            }
+            // Every entry takes a byte at least: only as many as a page has bytes
+            // are worth measuring.
+            let used = match n - m.base <= page {
+                true => node::size(&out.entries, m.base, n, 0),
+                false => usize::MAX,
+            };
+            if used <= page {
+                out.emit(m.base, n, used, Life::Short);
+                self.added += 1;
+                return Outcome::Replaced;
+            }
+            (m.splitting, m.items, m.s) = (true, out.len(), m.base);
         }
-        let used = node::size(&out.entries, base, n, 0);
-        if used <= page {
-            out.emit(base, n, used, Life::Short);
-            self.added += 1;
-            return Outcome::Replaced;
-        }
-        let items = out.len();
         // Split after each run of puts that fills at least a quarter page, as when
         // appending to ledgers: pack the run full, and leave the entries after it to
         // other leaves, so that the next appends don't rewrite them. Smaller runs,
         // like scattered inserts, aren't worth leaves of their own.
-        let mut s = base;
-        for &end in &self.run_ends {
-            let end = end as usize;
-            if node::size(&out.entries, s, end, 0) < page / 4 {
-                continue;
+        while m.run < self.run_ends.len() {
+            let end = self.run_ends[m.run] as usize;
+            if !m.packing {
+                // Whether entries `s..end` take less than a quarter page: as many
+                // entries as a quarter page has bytes take more.
+                if end - m.s < page / 4 && node::size(&out.entries, m.s, end, 0) < page / 4 {
+                    m.run += 1;
+                    continue;
+                }
+                m.packing = true;
             }
-            while s < end {
-                let (e, used) = node::fit(&out.entries, s, end, page, 0);
+            while m.s < end {
+                if self.budget.spent() {
+                    return Outcome::Paused;
+                }
+                let (e, used) = node::fit(&out.entries, m.s, end, page, 0);
                 // The run's full leaves are likely to stay; appends go on in its last.
                 let life = if e < end { Life::Long } else { Life::Short };
-                out.emit(s, e, used, life);
-                s = e;
+                out.emit(m.s, e, used, life);
+                self.budget.work += e - m.s;
+                m.s = e;
             }
+            m.packing = false;
+            m.run += 1;
         }
-        out.emit_even(s, n, page, 0);
-        self.added += out.len() - items;
+        out.emit_even(m.s, n, page, 0);
+        self.added += out.len() - m.items;
         Outcome::Replaced
     }
 
@@ -824,6 +1209,7 @@ impl Tree {
     /// Records every page of the subtree at `node` as dropped.
     fn drop_subtree(&mut self, (frame, page): (FrameId, u64), level: usize) {
         self.dropped.push(page);
+        self.budget.work += 1;
         if level == 0 {
             return;
         }
@@ -845,14 +1231,25 @@ impl Tree {
         self.lists[level].truncate(mark);
     }
 
-    /// Builds the nodes this write added to `lists[level]` past `mark`, then adds
-    /// nodes one level up that take them all over to `lists[level + 1]`.
-    fn build_parents(&mut self, level: usize, mark: Mark) {
-        for i in mark.items..self.lists[level].len() {
-            if self.lists[level].items[i].fresh {
-                self.build_node(level, i);
+    /// Builds the nodes this write added to `lists[level]`, from item `*k` on.
+    /// Returns false if it paused: `*k` is where it goes on.
+    fn build_nodes(&mut self, level: usize, k: &mut usize) -> bool {
+        while *k < self.lists[level].len() {
+            if self.budget.spent() {
+                return false;
             }
+            self.budget.work += 1;
+            if self.lists[level].items[*k].fresh {
+                self.build_node(level, *k);
+            }
+            *k += 1;
         }
+        true
+    }
+
+    /// Adds nodes one level up that take over the nodes of `lists[level]` past
+    /// `mark`, all built, to `lists[level + 1]`.
+    fn add_parents(&mut self, level: usize, mark: Mark) {
         let (lower, upper) = self.lists.split_at_mut(level + 1);
         let (children, parents) = (&mut lower[level], &mut upper[0]);
         let (a, items) = (parents.entries.len(), parents.len());
@@ -870,21 +1267,30 @@ impl Tree {
         let list = &mut self.lists[level];
         let item = list.items[i];
         let (a, b) = (item.start as usize, item.end as usize);
-        let (frame, page, used) = self
-            .pages
-            .build(level as u8, &list.entries, a, b, item.life);
+        let generation = self.generation + 1;
+        let (frame, page, used) =
+            self.pages
+                .build(level as u8, &list.entries, a, b, item.life, generation);
         debug_assert_eq!(used, item.used as usize);
         list.built(i, frame, page);
+        self.budget.work += b - a;
     }
 
-    /// Moves the nodes of `lists[level]` past `start` that the write keeps, but
-    /// whose pages the allocator wants freed: they become nodes the write adds,
+    /// Moves the nodes of `lists[level]`, from item `*k` on, that the write keeps,
+    /// but whose pages the allocator wants freed: they become nodes the write adds,
     /// with the same entries, built next to the others. Their parent is rebuilt
     /// anyway, so a move costs a page write and nothing else: leaves move only if
-    /// they are cached. A write moves at most as many nodes as it adds.
-    fn move_kept(&mut self, level: usize, start: usize) {
-        for k in start..self.lists[level].len() {
-            let item = self.lists[level].items[k];
+    /// they are cached. A write moves at most as many nodes as it adds. Returns
+    /// false if it paused: `*k` is where it goes on.
+    fn move_kept(&mut self, level: usize, k: &mut usize) -> bool {
+        while *k < self.lists[level].len() {
+            if self.budget.spent() {
+                return false;
+            }
+            self.budget.work += 1;
+            let i = *k;
+            *k += 1;
+            let item = self.lists[level].items[i];
             if item.fresh || self.moved >= self.added || !self.pages.space.should_move(item.page) {
                 continue;
             }
@@ -906,36 +1312,43 @@ impl Tree {
                 }
             }
             let b = list.entries.len();
-            list.restage(k, a, b, node::size(&list.entries, a, b, level as u8));
+            list.restage(i, a, b, node::size(&list.entries, a, b, level as u8));
+            self.budget.work += b - a;
             self.dropped.push(item.page);
             if level > 0 {
                 self.release(frame);
             }
             self.moved += 1;
         }
+        true
     }
 
     /// Merges each node this write added that is under a quarter full into a
     /// neighbor, among the nodes of `lists[level]` past `start`, if the two fit in a
-    /// page and the neighbor is in memory. The nodes this write added aren't built
-    /// yet, so no build goes to waste.
-    fn fix_underfull(&mut self, level: usize, start: usize) {
-        let mut k = start;
-        'next: while k < self.lists[level].len() {
+    /// page and the neighbor is in memory, going through them from item `*k` on.
+    /// The nodes this write added aren't built yet, so no build goes to waste.
+    /// Returns false if it paused: `*k` is where it goes on.
+    fn fix_underfull(&mut self, level: usize, start: usize, k: &mut usize) -> bool {
+        'next: while *k < self.lists[level].len() {
+            if self.budget.spent() {
+                return false;
+            }
+            self.budget.work += 1;
             let len = self.lists[level].len();
-            let item = self.lists[level].items[k];
+            let item = self.lists[level].items[*k];
             if item.fresh && (item.used as usize) < self.page_size / 4 && len - start > 1 {
                 let left = k.checked_sub(1).filter(|&a| a >= start);
-                let right = (k + 1 < len).then_some(k);
+                let right = (*k + 1 < len).then_some(*k);
                 for a in left.into_iter().chain(right) {
                     if self.merge_pair(level, a) {
-                        k = a;
+                        *k = a;
                         continue 'next;
                     }
                 }
             }
-            k += 1;
+            *k += 1;
         }
+        true
     }
 
     /// Replaces nodes `a` and `a + 1` of `lists[level]` with a node holding the
@@ -986,6 +1399,7 @@ impl Tree {
         };
         let used = node::size(&list.entries, start, end, level as u8);
         debug_assert!(used >= least);
+        self.budget.work += end - start;
         if used > self.page_size {
             list.entries.truncate(len);
             return false;
@@ -1009,20 +1423,29 @@ impl Tree {
         true
     }
 
-    /// Stacks levels on the replacement nodes for the root, in `lists[level]`,
-    /// until one node remains, and returns it as the new root.
-    fn grow(&mut self, mut level: usize) -> Option<Root> {
+    /// Stacks levels on the nodes that replace the root, from `lists[level]`, until
+    /// one node remains, and returns it as the new root. Returns `None` if it
+    /// paused, keeping how far it got in [`Phase::Growing`].
+    fn grow(&mut self, mut level: usize, mut fixed: bool, mut k: usize) -> Option<Option<Root>> {
         loop {
-            if self.lists[level].len() > 1 {
-                self.fix_underfull(level, 0);
+            if !fixed {
+                if self.lists[level].len() > 1 && !self.fix_underfull(level, 0, &mut k) {
+                    self.phase = Phase::Growing { level, fixed, k };
+                    return None;
+                }
+                (fixed, k) = (true, 0);
             }
             match self.lists[level].len() {
-                0 => return None,
+                0 => return Some(None),
                 1 => break,
                 _ => {
                     self.ensure_level(level + 1);
-                    self.build_parents(level, Mark::default());
-                    level += 1;
+                    if !self.build_nodes(level, &mut k) {
+                        self.phase = Phase::Growing { level, fixed, k };
+                        return None;
+                    }
+                    self.add_parents(level, Mark::default());
+                    (level, fixed, k) = (level + 1, false, 0);
                 }
             }
         }
@@ -1069,7 +1492,7 @@ impl Tree {
             self.release(root.frame);
             root = child;
         }
-        Some(root)
+        Some(Some(root))
     }
 }
 
@@ -1138,6 +1561,14 @@ struct Mark {
     items: usize,
     bytes: usize,
     entries: usize,
+}
+
+impl Item {
+    /// Whether this write added the node and built it.
+    fn is_built(&self) -> bool {
+        // No node is on page 0, a meta page.
+        self.fresh && self.page != 0
+    }
 }
 
 impl NodeList {
@@ -1324,6 +1755,7 @@ impl Tree {
             assert!(space.is_used(page), "cached leaf {page} on a free page");
         }
         assert!(self.pinned.is_empty() && self.dirty.is_empty() && self.pending.is_none());
+        assert!(self.phase == Phase::Idle, "a merge was left halfway");
     }
 
     /// Checks the subtree at `node`, whose keys fall in `lo..hi`, and returns its
@@ -1462,6 +1894,10 @@ impl Tree {
 
     pub(crate) fn page_size(&self) -> usize {
         self.page_size
+    }
+
+    pub(crate) fn set_slice(&mut self, slice: Option<usize>) {
+        self.budget.fixed = slice;
     }
 
     /// The nodes the last write added for its changes, and those it moved.
