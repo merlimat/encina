@@ -132,7 +132,7 @@ fn the_data_path_does_not_allocate() {
         "write allocated"
     );
     // Nor does a write that pauses after every few units of work, normalizing its
-    // batch, planning and merging it.
+    // batch, planning it, loading its leaves and merging it.
     db.set_merge_slice(Some(64));
     fill(&mut batch, 4);
     assert_eq!(

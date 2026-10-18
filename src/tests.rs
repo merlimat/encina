@@ -3091,15 +3091,49 @@ fn a_write_dropped_while_it_plans_changes_nothing() {
     store.db.check();
 }
 
-/// Polls `write`, each poll stopping where it yields, until it pauses merging, as
-/// it does once it holds the leaves its batch changes.
+#[test]
+fn a_write_dropped_while_it_loads_its_leaves_changes_nothing() {
+    // On 256-byte pages, the write changes more leaves than it loads at once.
+    let store = Store::new(Options::new().page_size(256));
+    let mut model = Model::new();
+    let load: Vec<_> = (0..2000).map(|i| scattered_put(i, 1)).collect();
+    write(&store.db, &load);
+    apply(&mut model, &load);
+    let ops: Vec<_> = (0..2000).step_by(3).map(|i| scattered_put(i, 2)).collect();
+    store.db.set_merge_slice(Some(4));
+    let start = generation(&store.db);
+    let mut batch = batch_of(&ops);
+    let mut write = Box::pin(store.db.write(&mut batch));
+    // The leaves are cached, yet it pauses once it has pinned some of them.
+    let io = store.disk.ops();
+    loop {
+        assert!(poll_once(write.as_mut()).is_pending());
+        let tree = store.db.tree();
+        if !tree.pinned.is_empty() {
+            assert!(tree.pinned.len() < tree.touched.len());
+            break;
+        }
+    }
+    assert_eq!(store.disk.ops(), io);
+    drop(write);
+    store.db.check();
+    assert_eq!(generation(&store.db), start);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    now(store.db.write(&mut batch)).unwrap();
+    apply(&mut model, &ops);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+/// Polls `write`, each poll stopping where it yields, until it pauses merging,
+/// which it does once it holds the leaves its batch changes.
 fn pause_merging<F: Future + ?Sized>(db: &Db, mut write: Pin<&mut F>) {
     loop {
         assert!(
             poll_once(write.as_mut()).is_pending(),
             "the write didn't pause"
         );
-        if !db.tree().pinned.is_empty() {
+        if db.tree().merging() {
             return;
         }
     }
@@ -3874,7 +3908,8 @@ fn file_size_and_requests() {
 
 /// Measures how long lookups wait while large writes merge, on the simulated disk
 /// with 4 KiB pages and a cache that holds everything, so that lookups only ever
-/// wait for the thread. Run it with
+/// wait for the thread. The disk delays writes and syncs while the lookups run, as
+/// a real disk's take time. Run it with
 /// `cargo test --release -- --ignored --nocapture read_latency_during_a_load`.
 ///
 /// A store of 2M BookKeeper-shaped entries takes writes of 1M entries each, while a
@@ -3903,6 +3938,7 @@ fn latency_during_writes(workload: &str, pause: bool) {
 
     let (ledgers, preload, writes) = (1000u64, 2000u64, 3u64);
     let store = Store::new(Options::new().cache_size(4 << 30));
+    store.disk.delay_writes();
     let db = store.db.clone();
     let mut batch = WriteBatch::new();
     for chunk in 0..preload / 100 {

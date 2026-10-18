@@ -15,7 +15,8 @@
 //! A simulated disk for tests. It can fail any single operation, or crash during
 //! one: then only what was synced survives, plus whichever pages written since
 //! happen to have landed, with the write in progress torn. It can also hold leaf
-//! reads in flight, or syncs and cuts, until a test releases them.
+//! reads in flight, or syncs and cuts, until a test releases them, and delay
+//! writes and syncs while the runtime runs other tasks, as a real disk's take time.
 
 use std::cell::RefCell;
 use std::future::poll_fn;
@@ -67,6 +68,10 @@ struct Disk {
     /// What the disk holds from an operation number on, as if another process
     /// wrote it meanwhile.
     overwrite: Option<(u64, Vec<u8>)>,
+    /// Whether writes and syncs first let the runtime run other tasks, and how many
+    /// have finished. Syncs then keep nothing for a crash.
+    delay: bool,
+    finished: u64,
 }
 
 impl SimDisk {
@@ -223,6 +228,38 @@ impl SimDisk {
         }
     }
 
+    /// Makes each write and sync from now on first let the runtime run other
+    /// tasks, as the thread would while a real disk worked, so that a test can time
+    /// what the thread does. Syncs then keep no copy of what survives a crash: the
+    /// disk mustn't crash.
+    pub(crate) fn delay_writes(&self) {
+        self.0.borrow_mut().delay = true;
+    }
+
+    /// Waits for the operation's turn, if writes and syncs are delayed: until the
+    /// runtime has run other tasks, with no other one finishing since it last
+    /// looked. One finishes per turn, as a disk works through its queue, so that the
+    /// simulated disk copies the pages of one request at a time, which takes the
+    /// thread only briefly.
+    async fn delayed(&self) {
+        if !self.0.borrow().delay {
+            return;
+        }
+        // How many had finished when it last looked.
+        let mut seen = None;
+        poll_fn(|cx| {
+            let mut disk = self.0.borrow_mut();
+            if seen == Some(disk.finished) {
+                disk.finished += 1;
+                return Poll::Ready(());
+            }
+            seen = Some(disk.finished);
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await;
+    }
+
     /// Waits while syncs and cuts are held.
     async fn unheld(&self) {
         poll_fn(|cx| {
@@ -267,18 +304,20 @@ impl SimDisk {
         }
     }
 
-    pub(crate) fn write(&self, buf: FrameBuf, offset: u64) -> (io::Result<()>, FrameBuf) {
+    pub(crate) async fn write(&self, buf: FrameBuf, offset: u64) -> (io::Result<()>, FrameBuf) {
+        self.delayed().await;
         let res = self.write_pages(slice::from_ref(&buf), offset);
         (res, buf)
     }
 
     /// Writes the pages in `bufs` back to back from `offset`, in one operation.
     /// Until a sync, each page lands, or not, on its own.
-    pub(crate) fn write_run(
+    pub(crate) async fn write_run(
         &self,
         bufs: Vec<FrameBuf>,
         offset: u64,
     ) -> (io::Result<()>, Vec<FrameBuf>) {
+        self.delayed().await;
         let res = self.write_pages(&bufs, offset);
         (res, bufs)
     }
@@ -308,14 +347,20 @@ impl SimDisk {
 
     pub(crate) async fn sync(&self) -> io::Result<()> {
         self.unheld().await;
+        self.delayed().await;
         self.begin(None)?;
         let mut disk = self.0.borrow_mut();
         let Disk {
             current,
             durable,
             unsynced,
+            delay,
             ..
         } = &mut *disk;
+        if *delay {
+            unsynced.clear();
+            return Ok(());
+        }
         durable.resize(current.len(), 0);
         for (at, len) in unsynced.drain(..) {
             durable[at..at + len].copy_from_slice(&current[at..at + len]);
