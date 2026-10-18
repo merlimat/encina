@@ -340,23 +340,22 @@ was due until it returns.
 
 | Write of 1M entries | Merge | Lookup p50 | p99 | Max |
 |---|---|---:|---:|---:|
-| Appends to 1,000 ledgers | doesn't pause | 21.5 ms | 45.1 ms | 45.9 ms |
-| | pauses | 0.68 ms | 12.0 ms | 12.6 ms |
-| Random updates | doesn't pause | 181 ms | 361 ms | 368 ms |
-| | pauses | 0.95 ms | 159 ms | 166 ms |
+| Appends to 1,000 ledgers | doesn't pause | 23.2 ms | 49.1 ms | 50.0 ms |
+| | pauses | 0.70 ms | 14.2 ms | 14.9 ms |
+| Random updates | doesn't pause | 224 ms | 450 ms | 459 ms |
+| | pauses | 0.98 ms | 205 ms | 213 ms |
 
-What remains is normalizing and planning the batch, which don't pause yet: 11 ms of
-the sorted appends, and 150 to 180 ms of the random updates, which have to be
-sorted.
+What remains is normalizing and planning the batch, which don't pause yet: they
+make the tail above, about 14 ms of the sorted appends, and 200 ms of the random
+updates, which have to be sorted.
 
-Pausing costs the write some throughput. A pause is a trip through the runtime,
-about 15 µs on an Apple M5 Pro, which is why slices are measured in time: a fixed
-amount of work takes ten times longer in some batches than in others, since the
-operations of an unsorted batch lie scattered in its memory. Slices of 16K units,
-a tenth of a millisecond of the appends' merge, made the benchmark's load (bench/)
-8% slower; slices of a millisecond make it 2% slower. With four writers it is 5%
-slower: while the merge pauses, the other writers build their next batches, work
-that used to wait for the commit's disk writes, where it cost no time.
+A pause is a trip through the runtime, about 15 µs on an Apple M5 Pro, which is
+why slices are measured in time: a fixed amount of work takes ten times longer in
+some batches than in others, since the operations of an unsorted batch lie
+scattered in its memory. Slices of 16K units, a tenth of a millisecond of the
+appends' merge, made the benchmark's load (bench/) 8% slower. With slices of a
+millisecond it is about 2% slower with one writer, and no slower with four, within
+the runs' noise.
 
 **Split policy.** A rebuilt leaf that overflows splits right after each run of
 inserted keys that fills at least a quarter page (the per-ledger append case): the
