@@ -2,11 +2,11 @@
 
 > Status: M1 and M2 are implemented: the tree, persistence and the leaf cache.
 > M3, performance, is under way (§12): writes that queue up share commits (§6),
-> concurrent misses share one read, iterators read ahead (§8), nodes whose entries
-> allow it are dense (§5), and bench/ compares encina with RocksDB (§11). Yielding
-> inside large merges and writing large batches' new leaves early remain. M4 is
-> done: entries too large for a leaf get value leaves, which the cache keeps and
-> iterators read ahead (§5).
+> large merges pause to let other tasks run (§6), concurrent misses share one
+> read, iterators read ahead (§8), nodes whose entries allow it are dense (§5),
+> and bench/ compares encina with RocksDB (§11). Writing large batches' new
+> leaves early remains. M4 is done: entries too large for a leaf get value
+> leaves, which the cache keeps and iterators read ahead (§5).
 
 encina is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. Its first
@@ -322,10 +322,40 @@ doesn't allocate. The operations are applied in order and atomically.
 6. **Publish** the new root. Readers see the batch only now, once it is durable,
    and the pages of the nodes it replaced become free, subject to §8.
 
-Readers keep running while a write waits for the disk. The merge itself doesn't
-yield yet: it is CPU work bounded by the batch, and yielding inside it is planned
-for M3. Doing so is safe: readers keep using the old root until the swap, and only
-one commit runs at a time.
+**Pausing.** Readers keep running while a write waits for the disk, and while it
+merges. The merge is CPU work that grows with the batch, so once it has run for a
+millisecond, it pauses and lets the other tasks run. It looks at the clock every
+4,096 units of work: entries copied, merged or built, and nodes visited. That is
+safe: readers keep using the old root until the swap, and only one commit runs at a
+time. The merge keeps its place in fixed state, one record per level of the path it
+is on: the child it is at, the operations left for the children after it, and how
+far it got rebuilding a leaf or building nodes. So pausing allocates nothing, and
+resuming descends again to where it left off. A merge that pauses builds the same
+tree, on the same pages, as one that doesn't.
+
+Measured with the ignored test `read_latency_during_a_load`, on an Apple M5 Pro: a
+store of 2M BookKeeper-shaped entries on the simulated disk takes writes of 1M
+entries, while a lookup is due every 20 µs. A lookup's latency runs from when it
+was due until it returns.
+
+| Write of 1M entries | Merge | Lookup p50 | p99 | Max |
+|---|---|---:|---:|---:|
+| Appends to 1,000 ledgers | doesn't pause | 23.2 ms | 49.1 ms | 50.0 ms |
+| | pauses | 0.70 ms | 14.2 ms | 14.9 ms |
+| Random updates | doesn't pause | 224 ms | 450 ms | 459 ms |
+| | pauses | 0.98 ms | 205 ms | 213 ms |
+
+What remains is normalizing and planning the batch, which don't pause yet: they
+make the tail above, about 14 ms of the sorted appends, and 200 ms of the random
+updates, which have to be sorted.
+
+A pause is a trip through the runtime, about 15 µs on an Apple M5 Pro, which is
+why slices are measured in time: a fixed amount of work takes ten times longer in
+some batches than in others, since the operations of an unsorted batch lie
+scattered in its memory. Slices of 16K units, a tenth of a millisecond of the
+appends' merge, made the benchmark's load (bench/) 8% slower. With slices of a
+millisecond it is about 2% slower with one writer, and no slower with four, within
+the runs' noise.
 
 **Split policy.** A rebuilt leaf that overflows splits right after each run of
 inserted keys that fills at least a quarter page (the per-ledger append case): the
@@ -362,8 +392,9 @@ published.
   leaves the store unchanged; during it, the store fails (§7).
 - **Cancellation.** The group holds a copy of each batch, never a reference to a
   caller's. Dropping a write withdraws its batch while the write waits, and while
-  its group is being built: the write building it then starts over without that
-  batch, since leaves the batch's ranges covered may now be needed. Once the group
+  its group is being built, its merge included: the write building it then starts
+  over without that batch, since leaves the batch's ranges covered may now be
+  needed. Once the group
   writes pages, its batches commit together, whichever of its writes are dropped.
   Dropping the write committing them then fails the store, as it does for a single
   write, and its group's other writes return `Error::Failed`. If the write
@@ -403,8 +434,9 @@ nothing.
 Every `write()` ends with a commit, its own or its group's (§6), that makes its
 batch durable in one atomic step.
 
-1. Seal the new version's dirty nodes: stamp the generation and the checksum. Each
-   already has its page, so they can be written in any order.
+1. List the new version's dirty nodes. The merge sealed each as it built it,
+   stamping the generation and the checksum, and gave it its page, so they can be
+   written in any order.
 2. Sort them by page, and write each run of adjacent pages with one vectored write
    of up to 1 MiB, 16 writes at a time. Await every write, then `sync_data`.
    Allocation hands a write its pages in runs (see below), so a commit takes a few
@@ -657,8 +689,8 @@ same 282 MiB.
   keeps the reads it holds inline; and the table of reads in flight reuses its
   slots (§8). If compio's show up in profiles, the fix belongs upstream (pooled
   operation slots).
-- CPU-heavy steps, large merges in particular, don't yield to the executor yet;
-  that is planned for M3.
+- Large merges pause after each slice of work and yield to the executor (§6).
+  Normalizing and planning a batch don't yet.
 - **Linux with io_uring is the target.** macOS works for development, but there
   compio runs file I/O on a blocking thread pool and `fsync` is a plain `fsync`
   (no `F_FULLFSYNC`), so macOS gives no durability guarantee against power loss.
@@ -808,12 +840,20 @@ complete without suspending.
   fails the store, leaving all of the group or none after reopening; and that a
   group holds what fits. They drop writes at every stage: while queued or waiting
   for room, which withdraws them; while their group is built, which makes the
-  write building it start over, with a leaf it hadn't needed before; the write
-  building, whose group another write takes over, one queued for the next group
-  included; while the group commits, which commits them anyway; and the write
-  committing, while it syncs or cuts the file. The model-based property tests also
-  write groups, dropping some of their writes, and a test on a real file checks
-  that eight concurrent writes take two commits.
+  write building it start over, with a leaf it hadn't needed before, or while its
+  merge pauses; the write building, whose group another write takes over, one
+  queued for the next group included, and while its merge pauses; while the group
+  commits, which commits them anyway; and the write committing, while it syncs or
+  cuts the file. The model-based property tests also write groups, dropping some of
+  their writes, and a test on a real file checks that eight concurrent writes take
+  two commits.
+- **Pausing merges:** the model-based property tests also run with merges that pause
+  after every 1 to 100 units of work rather than after a millisecond, with a tiny
+  cache too, scanning the store while a write pauses, then finishing or dropping it.
+  Two stores, one of whose merges pause, build the same trees on the same pages. A
+  write dropped at each of its pauses in turn, in a tree of four levels, leaves the
+  store as it was, every page and frame accounted for. On a compio runtime, another
+  task's lookups run while a write merges, and see the last version.
 - **Damage:** a flipped bit in a leaf fails the reads that need it, and one in an
   internal node fails the open, both with `Error::Corruption`, as does a child
   reference past the end of the file or to a page already used. A flipped bit in
@@ -832,11 +872,11 @@ complete without suspending.
   a directory that can't be synced, and a read-only view, which opens beside the
   owner, creates nothing, and opens a file it may only read. A write dropped while
   its page write is in flight leaves the store failed until it reopens.
-- **Allocation tests:** a counting global allocator asserts that `get` and
-  iteration over cached pages, `get` and iteration that miss the cache (reading
-  ahead included), and `write` with a reused batch, alone or in a group, all on
-  the simulated disk, perform no allocations. On a real disk, compio adds one per
-  I/O operation.
+- **Allocation tests:** a counting global allocator asserts that `get` and iteration
+  over cached pages, `get` and iteration that miss the cache (reading ahead
+  included), and `write` with a reused batch, alone, with a merge that pauses, or in
+  a group, all on the simulated disk, perform no allocations. On a real disk, compio
+  adds one per I/O operation.
 - **Sanitizers:** CI runs every test under AddressSanitizer, std included, so a
   use of freed memory or a leak fails the run even where the test's own checks
   pass, real files' io_uring path included. One test drops a store while the
@@ -857,8 +897,7 @@ complete without suspending.
    and eviction, snapshot-aware page reuse, failure-path tests.
 3. **M3, performance:** group commit (writes that queue up during a commit share
    the next one, done, §6), the dense node format (done, §5), yielding inside
-   large merges ([#24](https://github.com/merlimat/encina/issues/24)), writing
-   large batches' new leaves early
+   large merges (done, §6), writing large batches' new leaves early
    ([#25](https://github.com/merlimat/encina/issues/25)), one shared read for
    concurrent misses and reading ahead in iterators (done, §8), coverage measured
    in CI (done, §11), and benchmarks against RocksDB (done, §11).

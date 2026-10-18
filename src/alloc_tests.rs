@@ -131,6 +131,14 @@ fn the_data_path_does_not_allocate() {
         0,
         "write allocated"
     );
+    // Nor does a write whose merge pauses after every few entries.
+    db.set_merge_slice(Some(64));
+    fill(&mut batch, 4);
+    assert_eq!(
+        allocations(|| now(db.write(&mut batch)).unwrap()),
+        0,
+        "a write that paused allocated"
+    );
 }
 
 #[test]

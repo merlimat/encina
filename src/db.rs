@@ -478,6 +478,13 @@ impl Db {
         self.inner.writes.borrow_mut().set_limit(limit);
     }
 
+    /// Sets the work a merge does before it pauses, instead of the time it runs,
+    /// or with `None`, back to the time.
+    #[cfg(test)]
+    pub(crate) fn set_merge_slice(&self, slice: Option<usize>) {
+        self.tree().set_slice(slice);
+    }
+
     /// Checks the tree, and that no read is held and no write waits: only valid
     /// while no reader or write is in progress.
     #[cfg(test)]
@@ -791,7 +798,7 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
         return Err(Error::Failed);
     }
     let group = guard.group;
-    loop {
+    let changed = loop {
         // Load the leaves the batch changes, keeping them in the cache.
         {
             let mut writes = inner.writes.borrow_mut();
@@ -816,28 +823,39 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
                 return Err(e);
             }
         }
-        // A write that left the group meanwhile took its batch along: start over.
-        if !inner.writes.borrow_mut().take_changed() {
-            break;
+        // Build the new version, a slice of the merge at a time, letting the other
+        // tasks run in between.
+        let built = loop {
+            let applied = {
+                let mut writes = inner.writes.borrow_mut();
+                // A write that left the group meanwhile took its batch along.
+                if writes.take_changed() {
+                    break None;
+                }
+                let batch = if group { writes.group() } else { &mut *batch };
+                let applied = inner.tree.borrow_mut().apply(batch);
+                // Once it is built, the group's writes can't leave it.
+                if group && applied.is_ready() {
+                    writes.committing();
+                }
+                applied
+            };
+            match applied {
+                Poll::Ready(changed) => break Some(changed),
+                Poll::Pending => yield_now().await,
+            }
+        };
+        match built {
+            Some(changed) => break changed,
+            // Start over without that batch.
+            None => inner.tree.borrow_mut().discard(),
         }
-        inner.tree.borrow_mut().unpin_touched();
-    }
-
-    // Build the new version. From here on, the group's writes can't leave it.
-    let changed = {
-        let mut writes = inner.writes.borrow_mut();
-        let batch = if group { writes.group() } else { &mut *batch };
-        let changed = inner.tree.borrow_mut().apply(batch);
-        if group {
-            writes.committing();
-        }
-        changed
     };
     if !changed {
         return Ok(());
     }
     let generation = inner.tree.borrow().current().generation + 1;
-    inner.tree.borrow_mut().seal_pending(generation);
+    inner.tree.borrow_mut().collect_pending();
 
     // Commit: write the new nodes, sync, then switch the meta page and sync.
     let meta = inner.tree.borrow().pending_meta(generation);
@@ -1164,6 +1182,21 @@ async fn write_meta(inner: &Inner, meta: &Meta) -> Result<()> {
     drop(buf);
     inner.tree.borrow_mut().pages.pool.free(frame);
     Ok(res?)
+}
+
+/// Lets the runtime run the other tasks that are ready, and poll for I/O, before
+/// this one goes on.
+async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
 }
 
 /// Runs the futures in `slots` concurrently, returning their outputs in order.
