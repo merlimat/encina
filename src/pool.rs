@@ -19,6 +19,10 @@
 //! outlives its future, like a cancelled read, never touches freed memory. The
 //! reference counts live there too, so a buffer can drop its reference wherever
 //! the runtime drops it. Frames are the only memory the tree allocates.
+//!
+//! A value leaf that the cache keeps takes a large frame: one of several pages, in
+//! memory of its own, which `Memory` owns as well. Freeing a large frame gives its
+//! memory back.
 
 use std::alloc::{self, Layout};
 use std::cell::{Cell, RefCell};
@@ -33,6 +37,9 @@ pub(crate) type FrameId = u32;
 
 const CHUNK_FRAMES: usize = 64;
 const ALIGN: usize = 4096;
+
+/// The bit that marks the ids of large frames.
+const LARGE: FrameId = 1 << 31;
 
 /// What a frame holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +63,8 @@ pub(crate) struct Frame {
     pub(crate) dirty: bool,
     /// Used since the cache's clock hand last passed it.
     pub(crate) clock: bool,
+    /// The pages it spans: 1, unless it is a large frame.
+    pub(crate) pages: u32,
 }
 
 struct Chunk {
@@ -64,10 +73,27 @@ struct Chunk {
     _refs: Box<[Cell<u32>]>,
 }
 
+/// A large frame's memory.
+struct Large {
+    data: NonNull<u8>,
+    layout: Layout,
+    /// Owns the reference count, which `Pool` and `FrameBuf` reach by pointer.
+    _refs: Box<Cell<u32>>,
+}
+
+impl Drop for Large {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `Pool::alloc_large` with this layout.
+        unsafe { alloc::dealloc(self.data.as_ptr(), self.layout) };
+    }
+}
+
 /// The frames' memory, shared by the pool and in-flight I/O buffers.
 struct Memory {
     layout: Layout,
     chunks: RefCell<Vec<Chunk>>,
+    /// The large frames, by index; `None` once freed.
+    large: RefCell<Vec<Option<Large>>>,
 }
 
 impl Drop for Memory {
@@ -86,6 +112,11 @@ pub(crate) struct Pool {
     chunks: Vec<(NonNull<u8>, NonNull<Cell<u32>>)>,
     frames: Vec<Frame>,
     free: Vec<FrameId>,
+    /// Each large frame's data and reference count, copied out of `mem`, and the
+    /// frame; its indexes free for reuse; and the pages the large frames take.
+    large: Vec<(NonNull<u8>, NonNull<Cell<u32>>, Frame)>,
+    large_free: Vec<usize>,
+    large_pages: usize,
 }
 
 impl Pool {
@@ -95,22 +126,43 @@ impl Pool {
             mem: Rc::new(Memory {
                 layout,
                 chunks: RefCell::new(Vec::new()),
+                large: RefCell::new(Vec::new()),
             }),
             page_size,
             chunks: Vec::new(),
             frames: Vec::new(),
             free: Vec::new(),
+            large: Vec::new(),
+            large_free: Vec::new(),
+            large_pages: 0,
         }
     }
 
-    /// Frames allocated so far, in use or free.
-    pub(crate) fn len(&self) -> usize {
-        self.frames.len()
+    pub(crate) fn page_size(&self) -> usize {
+        self.page_size
     }
 
-    /// Frames in use.
+    /// Pages in use: the page frames in use, and the large frames' pages.
     pub(crate) fn in_use(&self) -> usize {
-        self.frames.len() - self.free.len()
+        self.frames.len() - self.free.len() + self.large_pages
+    }
+
+    /// The pages the large frames take.
+    pub(crate) fn large_pages(&self) -> usize {
+        self.large_pages
+    }
+
+    /// How many frame ids [`slot`](Self::slot) maps, the free ones included.
+    pub(crate) fn slots(&self) -> usize {
+        self.frames.len() + self.large.len()
+    }
+
+    /// The `i`th frame id: the page frames', then the large frames'.
+    pub(crate) fn slot(&self, i: usize) -> FrameId {
+        match i.checked_sub(self.frames.len()) {
+            None => i as FrameId,
+            Some(i) => LARGE | i as FrameId,
+        }
     }
 
     /// A free frame for `holds`, holding one reference.
@@ -126,8 +178,44 @@ impl Pool {
             page,
             dirty: false,
             clock: true,
+            pages: 1,
         };
         id
+    }
+
+    /// A large frame of `pages` pages for `holds`, holding one reference.
+    pub(crate) fn alloc_large(&mut self, holds: Holds, page: u64, pages: usize) -> FrameId {
+        let layout = Layout::from_size_align(pages * self.page_size, ALIGN).unwrap();
+        // SAFETY: the layout has a non-zero size.
+        let data = unsafe { alloc::alloc_zeroed(layout) };
+        let data = NonNull::new(data).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        let refs = Box::new(Cell::new(1));
+        let frame = Frame {
+            holds,
+            page,
+            dirty: false,
+            clock: true,
+            pages: pages as u32,
+        };
+        let mut large = self.mem.large.borrow_mut();
+        let i = self.large_free.pop().unwrap_or_else(|| {
+            large.push(None);
+            self.large.push((data, NonNull::dangling(), frame));
+            large.len() - 1
+        });
+        // The pointer to the count is taken once its box has moved into place.
+        let refs = NonNull::from(
+            &*large[i]
+                .insert(Large {
+                    data,
+                    layout,
+                    _refs: refs,
+                })
+                ._refs,
+        );
+        self.large[i] = (data, refs, frame);
+        self.large_pages += pages;
+        LARGE | i as FrameId
     }
 
     fn grow(&mut self) {
@@ -149,6 +237,7 @@ impl Pool {
             page: 0,
             dirty: false,
             clock: false,
+            pages: 1,
         };
         self.frames.resize(first + CHUNK_FRAMES, blank);
         // Room for every frame, so that freeing never allocates.
@@ -158,14 +247,29 @@ impl Pool {
     }
 
     pub(crate) fn frame(&self, id: FrameId) -> &Frame {
-        &self.frames[id as usize]
+        match large_index(id) {
+            Some(i) => &self.large[i].2,
+            None => &self.frames[id as usize],
+        }
     }
 
     pub(crate) fn frame_mut(&mut self, id: FrameId) -> &mut Frame {
-        &mut self.frames[id as usize]
+        match large_index(id) {
+            Some(i) => &mut self.large[i].2,
+            None => &mut self.frames[id as usize],
+        }
     }
 
     fn refs_cell(&self, id: FrameId) -> &Cell<u32> {
+        if let Some(i) = large_index(id) {
+            debug_assert_ne!(
+                self.large[i].2.holds,
+                Holds::Nothing,
+                "large frame {id} freed"
+            );
+            // SAFETY: the count lives as long as the frame, which is allocated.
+            return unsafe { self.large[i].1.as_ref() };
+        }
         let id = id as usize;
         // SAFETY: each chunk has CHUNK_FRAMES counts, alive as long as `mem`.
         unsafe {
@@ -193,14 +297,26 @@ impl Pool {
         refs.get() == 0
     }
 
-    /// Returns an unreferenced frame to the free list.
+    /// Returns an unreferenced frame to the free list, or a large frame's memory
+    /// to the allocator.
     pub(crate) fn free(&mut self, id: FrameId) {
         debug_assert_eq!(self.refs(id), 0, "freeing a referenced frame");
+        if let Some(i) = large_index(id) {
+            let frame = &mut self.large[i].2;
+            frame.holds = Holds::Nothing;
+            self.large_pages -= frame.pages as usize;
+            self.mem.large.borrow_mut()[i] = None;
+            self.large_free.push(i);
+            return;
+        }
         self.frames[id as usize].holds = Holds::Nothing;
         self.free.push(id);
     }
 
     fn ptr(&self, id: FrameId) -> *mut u8 {
+        if let Some(i) = large_index(id) {
+            return self.large[i].0.as_ptr();
+        }
         let id = id as usize;
         // SAFETY: frames are carved out of their chunk at `page_size` strides.
         unsafe {
@@ -211,16 +327,22 @@ impl Pool {
         }
     }
 
+    /// The bytes a frame spans: a page, or a large frame's pages.
+    fn len_of(&self, id: FrameId) -> usize {
+        self.frame(id).pages as usize * self.page_size
+    }
+
     /// Address of byte `offset` of a frame.
     pub(crate) fn addr(&self, id: FrameId, offset: usize) -> *const u8 {
-        debug_assert!(offset <= self.page_size);
+        debug_assert!(offset <= self.len_of(id));
         self.ptr(id).wrapping_add(offset)
     }
 
+    /// The frame's page, or a large frame's pages.
     pub(crate) fn page(&self, id: FrameId) -> &[u8] {
         // SAFETY: frames are only written through `page_mut`, which needs `&mut self`,
         // or by I/O into frames nothing else is looking at.
-        unsafe { slice::from_raw_parts(self.ptr(id), self.page_size) }
+        unsafe { slice::from_raw_parts(self.ptr(id), self.len_of(id)) }
     }
 
     /// Like [`page`](Self::page), without tying the slice to a borrow of the pool.
@@ -230,14 +352,14 @@ impl Pool {
     /// The frame must stay allocated and unmodified for `'a`.
     pub(crate) unsafe fn page_unbounded<'a>(&self, id: FrameId) -> &'a [u8] {
         // SAFETY: guaranteed by the caller.
-        unsafe { slice::from_raw_parts(self.ptr(id), self.page_size) }
+        unsafe { slice::from_raw_parts(self.ptr(id), self.len_of(id)) }
     }
 
     /// The page of a frame no reader can see: one this write just built, or one
     /// still loading.
     pub(crate) fn page_mut(&mut self, id: FrameId) -> &mut [u8] {
         // SAFETY: `&mut self` excludes bounded readers, and the frame is unpublished.
-        unsafe { slice::from_raw_parts_mut(self.ptr(id), self.page_size) }
+        unsafe { slice::from_raw_parts_mut(self.ptr(id), self.len_of(id)) }
     }
 
     /// An I/O buffer over a frame, which holds a reference to it until dropped.
@@ -252,10 +374,20 @@ impl Pool {
             _mem: self.mem.clone(),
             id,
             data: NonNull::new(self.ptr(id)).unwrap(),
-            len: self.page_size,
+            len: self.len_of(id),
             refs: NonNull::from(self.refs_cell(id)),
         }
     }
+}
+
+/// Whether `id` is a large frame's.
+pub(crate) fn is_large(id: FrameId) -> bool {
+    id & LARGE != 0
+}
+
+/// The index of the large frame `id`, if it is one.
+fn large_index(id: FrameId) -> Option<usize> {
+    is_large(id).then_some((id & !LARGE) as usize)
 }
 
 /// An I/O buffer over one frame. It keeps the frame memory alive, and holds a
@@ -299,7 +431,7 @@ impl IoBuf for FrameBuf {
 
 impl SetLen for FrameBuf {
     unsafe fn set_len(&mut self, _len: usize) {
-        // A frame is always a full page.
+        // A frame is always full: a page, or a large frame's pages.
     }
 }
 

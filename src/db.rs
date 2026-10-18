@@ -410,7 +410,8 @@ impl Db {
 
     /// Iterates over the entries with keys in `range`, in key order, as of now:
     /// later writes don't affect it. Creating and advancing it never allocates,
-    /// except to read a value larger than the ones read before, which isn't cached.
+    /// but for the frames of the leaves it reads into the cache, and to read a value
+    /// too large to cache, if larger than the ones it read before.
     /// When it reaches a leaf that isn't cached, it also starts reading the next
     /// leaves in the range, up to 16 of them.
     ///
@@ -432,6 +433,7 @@ impl Db {
             version,
             cursor: Cursor::new(),
             leaf: None,
+            on_value: false,
             value: None,
             at: 0,
             state: State::Unstarted,
@@ -888,9 +890,9 @@ impl Drop for Queued<'_> {
     }
 }
 
-/// Reads the value leaf with page id `page` into a buffer, `old` if it is large
-/// enough, and checks it. No value leaf a reader can reach was written after the
-/// current generation.
+/// Reads the value leaf with page id `page`, which the cache doesn't keep, into a
+/// buffer, `old` if it is large enough, and checks it. No value leaf a reader can
+/// reach was written after the current generation.
 async fn read_value_leaf(inner: &Inner, page: u64, old: Option<ValueBuf>) -> Result<ValueBuf> {
     let first = node::first_page(page);
     let buf = ValueBuf::new(old, node::span(page) as usize * inner.page_size);
@@ -959,17 +961,25 @@ fn read_leaf(inner: &Inner, tree: &mut Tree, reads: &mut Reads, page: u64) -> us
         return slot;
     }
     let pages = &mut tree.pages;
-    let frame = pages.cache.alloc(&mut pages.pool, Holds::Loading, page);
+    let frame = match node::span(page) {
+        0 => pages.cache.alloc(&mut pages.pool, Holds::Loading, page),
+        span => {
+            let pool = &mut pages.pool;
+            pages
+                .cache
+                .alloc_large(pool, Holds::Loading, page, span as usize)
+        }
+    };
     reads.start(page, frame, start_read(inner, &pages.pool, frame, page))
 }
 
-/// Starts reading leaf `page` into `frame`.
+/// Starts reading the leaf with page id `page` into `frame`: a large frame for a
+/// value leaf.
 fn start_read(inner: &Inner, pool: &Pool, frame: FrameId, page: u64) -> PageRead {
     // The buffer takes the frame's only reference: if the read is cancelled, the
     // frame is reclaimed once the read completes.
-    inner
-        .storage
-        .start_read(pool.adopt_buf(frame), inner.offset(page))
+    let offset = inner.offset(node::first_page(page));
+    inner.storage.start_read(pool.adopt_buf(frame), offset)
 }
 
 /// Waits for the read of leaf `page` held in `slot` to finish, and lets go of it.
@@ -998,13 +1008,18 @@ fn finish(pages: &mut Pages, page: u64, claim: Claim, generation: u64) -> Result
     pages.pool.retain(frame);
     drop(buf);
     let bytes = pages.pool.page(frame);
-    if res.is_err()
-        || !node::verify(bytes)
-        || Node::new(bytes).level() != 0
-        || Node::new(bytes).generation() > generation
-    {
+    let intact = if node::span(page) > 0 {
+        node::verify_value_leaf(bytes, pages.pool.page_size())
+            && ValueLeaf::new(bytes).generation() <= generation
+    } else {
+        node::verify(bytes)
+            && Node::new(bytes).level() == 0
+            && Node::new(bytes).generation() <= generation
+    };
+    if res.is_err() || !intact {
         pages.pool.unref(frame);
         pages.pool.free(frame);
+        let page = node::first_page(page);
         return Err(res.err().map_or(Error::Corruption { page }, Error::from));
     }
     pages.adopt_leaf(frame, page);
@@ -1307,10 +1322,13 @@ pub struct Iter {
     inner: Rc<Inner>,
     version: Version,
     cursor: Cursor,
-    /// The pinned leaf the iterator is on. It is on a value leaf instead when
-    /// `None` past the start.
+    /// The pinned leaf the iterator is on: a cached value leaf if `on_value`.
     leaf: Option<FrameId>,
-    /// The last value leaf it was on, whose buffer the next one reuses.
+    /// Whether it is on a value leaf: the one `leaf` pins, or else, for one too
+    /// large to cache, the one read into `value`.
+    on_value: bool,
+    /// The last value leaf too large to cache that it read, whose buffer the next
+    /// one reuses.
     value: Option<ValueBuf>,
     at: usize,
     state: State,
@@ -1376,15 +1394,29 @@ impl Iter {
                         self.state = self.next_leaf();
                         continue;
                     }
-                    let buf = match read_value_leaf(&self.inner, page, self.value.take()).await {
-                        Ok(buf) => buf,
-                        Err(e) => return Err(self.inner.explain(e).await),
+                    let cached = self
+                        .inner
+                        .tree
+                        .borrow()
+                        .pages
+                        .cache
+                        .caches(node::span(page));
+                    let frame = if cached {
+                        match poll_fn(|cx| self.poll_enter(cx, page)).await {
+                            Ok(frame) => Some(frame),
+                            Err(e) => return Err(self.inner.explain(e).await),
+                        }
+                    } else {
+                        match read_value_leaf(&self.inner, page, self.value.take()).await {
+                            Ok(buf) => self.value = Some(buf),
+                            Err(e) => return Err(self.inner.explain(e).await),
+                        }
+                        None
                     };
-                    if let Some(old) = self.leaf.take() {
+                    if let Some(old) = mem::replace(&mut self.leaf, frame) {
                         self.inner.tree.borrow().pages.pool.unref(old);
                     }
-                    self.value = Some(buf);
-                    self.at = 0;
+                    (self.on_value, self.at) = (true, 0);
                     self.state = State::Ready;
                 }
                 State::Enter { page, first } => {
@@ -1396,6 +1428,7 @@ impl Iter {
                     if let Some(old) = self.leaf.replace(frame) {
                         tree.pages.pool.unref(old);
                     }
+                    self.on_value = false;
                     let node = tree.node(frame);
                     self.at = if first {
                         0
@@ -1412,9 +1445,10 @@ impl Iter {
                     };
                 }
                 State::Returned => {
-                    let count = self
-                        .leaf
-                        .map_or(1, |leaf| self.inner.tree.borrow().node(leaf).count());
+                    let count = match self.leaf {
+                        Some(leaf) if !self.on_value => self.inner.tree.borrow().node(leaf).count(),
+                        _ => 1,
+                    };
                     self.at += 1;
                     self.state = if self.at < count {
                         State::Ready
@@ -1424,12 +1458,19 @@ impl Iter {
                 }
             }
         }
-        let Some(frame) = self.leaf else {
-            // A value leaf, in the range: entering it checked.
+        if self.on_value {
+            // In the range: entering it checked.
             self.state = State::Returned;
-            let leaf = ValueLeaf::new(self.value.as_ref().unwrap().bytes());
+            let bytes = match self.leaf {
+                // SAFETY: the iterator pins this leaf, and frames are never modified
+                // while referenced.
+                Some(frame) => unsafe { self.inner.tree.borrow().pages.pool.page_unbounded(frame) },
+                None => self.value.as_ref().unwrap().bytes(),
+            };
+            let leaf = ValueLeaf::new(bytes);
             return Ok(Some((leaf.key(), leaf.value())));
-        };
+        }
+        let frame = self.leaf.unwrap();
         let tree = self.inner.tree.borrow();
         let node = tree.node(frame);
         node.key_into(self.at, &mut self.key);
@@ -1512,9 +1553,10 @@ impl Iter {
     }
 
     fn next_leaf(&mut self) -> State {
-        match self.inner.tree.borrow().next_leaf(&mut self.cursor, true) {
+        let tree = self.inner.tree.borrow();
+        match tree.next_leaf(&mut self.cursor, true) {
             Some(page) => {
-                self.ahead.by = self.ahead.by.saturating_sub(1);
+                self.ahead.passed(window_pages(&tree.pages.cache, page));
                 State::Enter { page, first: true }
             }
             None => State::Done,
@@ -1541,12 +1583,24 @@ impl Drop for Iter {
     }
 }
 
+/// The pages the leaf with page id `page` takes in the window an iterator reads
+/// ahead: a value leaf too large to cache isn't read ahead, and takes none.
+fn window_pages(cache: &Cache, page: u64) -> usize {
+    match node::span(page) {
+        0 => 1,
+        span if cache.caches(span) => span as usize,
+        _ => 0,
+    }
+}
+
 /// The leaves an iterator reads ahead of the one it is on.
 struct Ahead {
-    /// The last leaf considered, `by` leaves past the current one. When `by` is 0
-    /// it may be behind, and the next fill starts over from the current leaf.
+    /// The last leaf considered, `by` leaves past the current one, which take
+    /// `pages` pages. When `by` is 0 it may be behind, and the next fill starts
+    /// over from the current leaf.
     cursor: Cursor,
     by: usize,
+    pages: usize,
     /// No leaf after `cursor` is in the range.
     done: bool,
     /// The reads held for the leaves considered that weren't cached, in key
@@ -1561,6 +1615,7 @@ impl Ahead {
         Ahead {
             cursor: Cursor::new(),
             by: 0,
+            pages: 0,
             done: false,
             reads: [(0, 0); IO_WINDOW],
             first: 0,
@@ -1584,6 +1639,15 @@ impl Ahead {
         Some(slot)
     }
 
+    /// Moves past the first leaf considered, which takes `pages` pages: the
+    /// iterator enters it.
+    fn passed(&mut self, pages: usize) {
+        if self.by > 0 {
+            self.by -= 1;
+            self.pages -= pages;
+        }
+    }
+
     /// Holds the read of the last leaf considered, at `page`.
     fn push(&mut self, page: u64, slot: usize) {
         // Each read held is for a different leaf of the `by` ahead.
@@ -1594,8 +1658,8 @@ impl Ahead {
 
     /// Starts reading the leaves after the current one, at `current`, that aren't
     /// cached and fall in the range ending at `end`: at most `IO_WINDOW` leaves
-    /// ahead, and a quarter of the cache budget, so that reading ahead never
-    /// crowds out the leaves other readers use.
+    /// ahead, which take at most a quarter of the cache budget, so that reading
+    /// ahead never crowds out the leaves other readers use.
     fn fill(
         &mut self,
         inner: &Inner,
@@ -1604,11 +1668,12 @@ impl Ahead {
         current: &Cursor,
         end: Bound<&[u8]>,
     ) {
-        let window = IO_WINDOW.min(tree.pages.cache.budget() / 4);
+        let window = tree.pages.cache.budget() / 4;
         if self.by == 0 {
             self.cursor.clone_from(current);
+            self.pages = 0;
         }
-        while !self.done && self.by < window {
+        while !self.done && self.by < IO_WINDOW {
             let mut next = self.cursor.clone();
             let Some(page) = tree.next_leaf(&mut next, true) else {
                 self.done = true;
@@ -1623,25 +1688,32 @@ impl Ahead {
                 self.done = true;
                 break;
             }
-            // A value leaf isn't read ahead: it has no frame to go to.
-            let read = if node::span(page) > 0 || tree.pages.cached(page).is_some() {
+            let pages = window_pages(&tree.pages.cache, page);
+            if self.pages + pages > window {
+                break;
+            }
+            let read = if pages == 0 || tree.pages.cached(page).is_some() {
                 None
             } else if let Some(slot) = reads.find(page) {
                 reads.join(slot);
                 Some(slot)
             } else {
                 // Reading ahead only uses frames within the budget.
-                let pages = &mut tree.pages;
-                let Some(frame) = pages.cache.try_alloc(&mut pages.pool, Holds::Loading, page)
-                else {
+                let (pool, cache) = (&mut tree.pages.pool, &mut tree.pages.cache);
+                let frame = match node::span(page) {
+                    0 => cache.try_alloc(pool, Holds::Loading, page),
+                    span => cache.try_alloc_large(pool, Holds::Loading, page, span as usize),
+                };
+                let Some(frame) = frame else {
                     break;
                 };
-                let slot = reads.start(page, frame, start_read(inner, &pages.pool, frame, page));
+                let slot = reads.start(page, frame, start_read(inner, pool, frame, page));
                 reads.submit(slot);
                 Some(slot)
             };
             self.cursor = next;
             self.by += 1;
+            self.pages += pages;
             if let Some(slot) = read {
                 self.push(page, slot);
             }
