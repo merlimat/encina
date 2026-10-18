@@ -48,16 +48,23 @@ use crate::space::{Life, Space};
 /// children, so real trees stay far shallower.
 pub(crate) const MAX_HEIGHT: usize = 32;
 
-/// How long a merge runs before it pauses, so that the write building it can let
-/// the other tasks run. A pause costs a trip through the runtime, about 15 µs on an
-/// Apple M5 Pro, so much shorter slices would slow writes down.
+/// How long a write normalizes, plans or merges its batch before it pauses, so
+/// that it can let the other tasks run. A pause costs a trip through the runtime,
+/// about 15 µs on an Apple M5 Pro, so much shorter slices would slow writes down.
 const SLICE: Duration = Duration::from_millis(1);
 
-/// The work a merge does between looks at the clock: entries copied, merged and
-/// built, and nodes visited. On an Apple M5 Pro, 4,096 units take about 25 µs of
-/// a sorted load, and 180 µs of random updates, whose operations lie scattered in
-/// the batch's memory.
+/// The work a write does between looks at the clock: operations its normalizing
+/// lists, compares or moves, nodes its planning visits, and entries its merge
+/// copies, merges and builds, and nodes it visits. On an Apple M5 Pro, 4,096 units
+/// of merging take about 25 µs of a sorted load, and 180 µs of random updates,
+/// whose operations lie scattered in the batch's memory.
 const CHECK: usize = 4096;
+
+/// The work planning counts for a node it visits, so that it looks at the clock
+/// every 64 visits. A visit searches the operations and ranges left for the node,
+/// whose keys lie scattered in the memory of an unsorted batch: on an Apple M5
+/// Pro, it takes up to 2 µs of random updates.
+const VISIT: usize = 64;
 
 /// A version's root node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,9 +168,9 @@ pub(crate) struct Tree {
     /// The nodes the write in progress added for its changes, and those it moved.
     added: usize,
     moved: usize,
-    /// The merge in progress, which pauses after each slice: how far it got, what
-    /// it keeps of each internal node on its path and of the leaf it rebuilds, and
-    /// when it pauses next.
+    /// The write in progress, which pauses after each slice: how far it got
+    /// planning or merging, what it keeps of each internal node on its path and of
+    /// the leaf it rebuilds, and when it pauses next.
     phase: Phase,
     visits: [Visit; MAX_HEIGHT],
     leaf: LeafMerge,
@@ -177,12 +184,12 @@ enum Outcome {
     Paused,
 }
 
-/// When the merge in progress pauses: once it has run for [`SLICE`], or, in tests,
-/// once it has done a set amount of work.
-struct Budget {
-    /// The work done since the merge last paused, and the work after which it next
+/// When the write in progress pauses its work on the batch: once it has run for
+/// [`SLICE`], or, in tests, once it has done a set amount of work.
+pub(crate) struct Budget {
+    /// The work done since the write last paused, and the work after which it next
     /// looks at the clock, or pauses in tests.
-    work: usize,
+    pub(crate) work: usize,
     check: usize,
     /// When it last started or resumed.
     start: Instant,
@@ -200,15 +207,24 @@ impl Budget {
         }
     }
 
+    /// A budget that pauses after `work` units of work.
+    #[cfg(test)]
+    pub(crate) fn fixed(work: usize) -> Budget {
+        Budget {
+            fixed: Some(work),
+            ..Budget::new()
+        }
+    }
+
     /// Starts a slice.
-    fn start(&mut self) {
+    pub(crate) fn start(&mut self) {
         self.work = 0;
         self.check = self.fixed.unwrap_or(CHECK);
         self.start = Instant::now();
     }
 
     /// Whether the slice is over.
-    fn spent(&mut self) -> bool {
+    pub(crate) fn spent(&mut self) -> bool {
         if self.work < self.check {
             return false;
         }
@@ -220,10 +236,14 @@ impl Budget {
     }
 }
 
-/// How far the merge in progress got.
+/// How far the write in progress got.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Idle,
+    /// Normalizing the batch, which keeps how far it got.
+    Normalizing,
+    /// Listing the leaves the batch changes, from the root down.
+    Planning,
     /// Merging the batch into the tree, from the root down.
     Merging,
     /// Stacking levels on the nodes that replace the root: at `level`, whose
@@ -236,11 +256,12 @@ enum Phase {
     },
 }
 
-/// What a merge keeps of an internal node it merges while it pauses. The node is
-/// found again from its parent.
+/// What a merge keeps of an internal node it merges while it pauses. Planning,
+/// which ends before the merge starts, keeps the same of a node it plans, up to
+/// `inside`. The node is found again from its parent.
 #[derive(Clone, Copy, Default)]
 struct Visit {
-    /// The merge is at this level.
+    /// The merge, or planning, is at this level.
     active: bool,
     /// The operations and ranges that fall in the children it hasn't reached.
     ops: Span,
@@ -627,70 +648,141 @@ impl Tree {
 
     // Writes.
 
-    /// Lists in `touched` the leaf pages applying `batch` changes, which the write
-    /// must load before [`apply`](Self::apply). Leaves that ranges remove whole
-    /// aren't listed: the write drops them without reading them.
-    pub(crate) fn plan(&mut self, batch: &WriteBatch) {
-        self.touched.clear();
-        let (ops, ranges) = (batch.points(), batch.ranges());
-        if ops.is_empty() && ranges.is_empty() {
-            return;
-        }
-        match self.root {
-            None => {}
-            Some(root) if root.level == 0 => self.touched.push(root.page),
-            Some(root) => {
-                let level = usize::from(root.level);
-                self.ensure_level(level);
-                self.plan_internal(root.frame, level, ops, ranges, None, batch);
+    /// Normalizes `batch`, then lists in `touched` the leaf pages applying it
+    /// changes, which the write must load before [`apply`](Self::apply). Leaves
+    /// that ranges remove whole aren't listed: the write drops them without reading
+    /// them. Like `apply`, it pauses after each slice of work, returning `Pending`:
+    /// calling this again with the same batch goes on where it left off, unless
+    /// [`discard`](Self::discard) threw away how far it got.
+    pub(crate) fn plan(&mut self, batch: &mut WriteBatch) -> Poll<()> {
+        self.budget.start();
+        loop {
+            match self.phase {
+                Phase::Idle => {
+                    batch.restart();
+                    self.touched.clear();
+                    self.phase = Phase::Normalizing;
+                }
+                Phase::Normalizing => {
+                    if !batch.prepare(&mut self.budget) {
+                        return Poll::Pending;
+                    }
+                    self.ensure_level(self.root.map_or(0, |r| usize::from(r.level)));
+                    self.phase = Phase::Planning;
+                }
+                Phase::Planning => {
+                    let (ops, ranges) = (batch.points(), batch.ranges());
+                    if let Some(root) = self.root
+                        && !(ops.is_empty() && ranges.is_empty())
+                    {
+                        if root.level == 0 {
+                            self.touched.push(root.page);
+                        } else {
+                            let (level, ops, ranges) =
+                                (usize::from(root.level), Span::all(ops), Span::all(ranges));
+                            if !self.plan_internal(root.frame, level, ops, ranges, None, batch) {
+                                return Poll::Pending;
+                            }
+                        }
+                    }
+                    self.phase = Phase::Idle;
+                    return Poll::Ready(());
+                }
+                Phase::Merging | Phase::Growing { .. } => unreachable!("planning during a merge"),
             }
         }
     }
 
+    /// Lists the leaves under the internal node on `frame`, at `level`, that `ops`
+    /// and `ranges`, which all fall below `hi`, change. Returns false if it paused:
+    /// calling this again with the same node and `hi` goes on where it left off,
+    /// with the operations and ranges it kept, as a merge does.
     fn plan_internal(
         &mut self,
         frame: FrameId,
         level: usize,
-        mut ops: &[u32],
-        mut ranges: &[(u32, u32)],
+        ops: Span,
+        ranges: Span,
         hi: Option<&[u8]>,
         batch: &WriteBatch,
-    ) {
+    ) -> bool {
         // SAFETY: internal nodes of the current version stay put until it changes.
         let node = unsafe { Node::new(self.pages.pool.page_unbounded(frame)) };
+        let below = level - 1;
+        let mut v = self.visits[level];
+        if !v.active {
+            v = Visit {
+                active: true,
+                ops,
+                ranges,
+                ..Visit::default()
+            };
+            node.key_into(0, &mut self.bounds[2 * level]);
+        }
         let mut key = mem::take(&mut self.bounds[2 * level]);
         let mut next = mem::take(&mut self.bounds[2 * level + 1]);
-        node.key_into(0, &mut key);
-        for i in 0..node.count() {
+        // The operations and ranges for the children it hasn't reached, as in
+        // `merge_internal`.
+        let mut ops = v.ops.of(batch.points());
+        let mut ranges = v.ranges.of(batch.ranges());
+        while v.child < node.count() {
+            let i = v.child;
             let child_hi = if i + 1 < node.count() {
                 node.key_into(i + 1, &mut next);
                 Some(&next[..])
             } else {
                 hi
             };
-            let (child_ops, child_ranges, covered) =
-                split(batch, &mut ops, &mut ranges, &key, child_hi);
-            if !covered && !(child_ops.is_empty() && child_ranges.is_empty()) {
-                if level == 1 {
+            // Whether the child is planned.
+            let planned = if v.inside {
+                // The child's planning paused: it goes on with the operations it kept.
+                let kept = Span::default();
+                self.plan_internal(node.child(i), below, kept, kept, child_hi, batch)
+            } else if self.budget.spent() {
+                false
+            } else {
+                self.budget.work += VISIT;
+                let (child_ops, child_ranges, covered) =
+                    split(batch, &mut ops, &mut ranges, &key, child_hi);
+                if covered || (child_ops.is_empty() && child_ranges.is_empty()) {
+                    true
+                } else if level == 1 {
                     // A write never reads a value leaf.
                     if node::span(node.child_page(i)) == 0 {
                         self.touched.push(node.child_page(i));
                     }
+                    true
                 } else {
-                    self.plan_internal(
-                        node.child(i),
-                        level - 1,
-                        child_ops,
-                        child_ranges,
-                        child_hi,
-                        batch,
-                    );
+                    (v.ops, v.ranges) = (v.ops.last(ops.len()), v.ranges.last(ranges.len()));
+                    let child_ops = Span {
+                        start: v.ops.start - child_ops.len(),
+                        end: v.ops.start,
+                    };
+                    let child_ranges = Span {
+                        start: v.ranges.start,
+                        end: v.ranges.start + child_ranges.len(),
+                    };
+                    v.inside = true;
+                    let child = node.child(i);
+                    self.plan_internal(child, below, child_ops, child_ranges, child_hi, batch)
                 }
+            };
+            if !planned {
+                break;
             }
+            v.inside = false;
+            v.child += 1;
             mem::swap(&mut key, &mut next);
         }
         self.bounds[2 * level] = key;
         self.bounds[2 * level + 1] = next;
+        if v.child < node.count() {
+            (v.ops, v.ranges) = (v.ops.last(ops.len()), v.ranges.last(ranges.len()));
+            self.visits[level] = v;
+            return false;
+        }
+        self.visits[level].active = false;
+        true
     }
 
     /// Applies a prepared batch, whose touched leaves must be cached, building the
@@ -751,6 +843,7 @@ impl Tree {
                     self.phase = Phase::Idle;
                     return Poll::Ready(true);
                 }
+                Phase::Normalizing | Phase::Planning => unreachable!("merging an unplanned batch"),
             }
         }
     }
@@ -2155,6 +2248,55 @@ impl Tree {
 
     pub(crate) fn set_slice(&mut self, slice: Option<usize>) {
         self.budget.fixed = slice;
+    }
+
+    /// The leaf pages that planning a prepared `batch` lists, found as planning did
+    /// before it paused: at once, recursively.
+    pub(crate) fn plan_at_once(&self, batch: &WriteBatch) -> Vec<u64> {
+        let mut touched = Vec::new();
+        let (ops, ranges) = (batch.points(), batch.ranges());
+        if ops.is_empty() && ranges.is_empty() {
+            return touched;
+        }
+        match self.root {
+            None => {}
+            Some(root) if root.level == 0 => touched.push(root.page),
+            Some(root) => self.plan_subtree(root.frame, ops, ranges, None, batch, &mut touched),
+        }
+        touched
+    }
+
+    fn plan_subtree(
+        &self,
+        frame: FrameId,
+        mut ops: &[u32],
+        mut ranges: &[(u32, u32)],
+        hi: Option<&[u8]>,
+        batch: &WriteBatch,
+        touched: &mut Vec<u64>,
+    ) {
+        let node = self.node(frame);
+        let keys: Vec<Vec<u8>> = (0..node.count())
+            .map(|i| {
+                let mut key = Vec::new();
+                node.key_into(i, &mut key);
+                key
+            })
+            .collect();
+        for i in 0..node.count() {
+            let child_hi = keys.get(i + 1).map(Vec::as_slice).or(hi);
+            let (child_ops, child_ranges, covered) =
+                split(batch, &mut ops, &mut ranges, &keys[i], child_hi);
+            if covered || (child_ops.is_empty() && child_ranges.is_empty()) {
+                continue;
+            }
+            if node.level() > 1 {
+                let child = node.child(i);
+                self.plan_subtree(child, child_ops, child_ranges, child_hi, batch, touched);
+            } else if node::span(node.child_page(i)) == 0 {
+                touched.push(node.child_page(i));
+            }
+        }
     }
 
     /// The nodes the last write added for its changes, and those it moved.
