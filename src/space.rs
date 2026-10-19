@@ -16,7 +16,8 @@
 //!
 //! A bitmap tracks which pages are in use. Nothing about it is stored: opening a
 //! store marks the pages its tree reaches. A page that a write replaces stays in
-//! use until no reader of an older version, which might still read it, is left.
+//! use until no reader of an older version, which might still read it, is left,
+//! and a write frees it.
 //!
 //! A write takes its pages in order from runs of free pages, so that its commit
 //! writes each run with one request. Free stretches shorter than

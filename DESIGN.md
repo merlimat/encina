@@ -323,7 +323,8 @@ applied in order and atomically.
    where checking each key against every range that starts before it took 0.8 s.
 2. **Plan.** Descend the resident internal nodes to find the leaves the batch
    changes, and load the ones that aren't cached, keeping them pinned. Subtrees
-   that ranges remove whole aren't read.
+   that ranges remove whole aren't read. Then free the pages that readers held
+   back, and have let go of since (§8), so that the merge can take them.
 3. **Apply ranges** (see below).
 4. **Bulk merge.** Descend recursively, partitioning the sorted operations by child
    key range. Each touched leaf is rebuilt once from its old entries plus the
@@ -335,26 +336,27 @@ applied in order and atomically.
    and the pages of the nodes it replaced become free, subject to §8.
 
 **Pausing.** Readers keep running while a write waits for the disk, and while it
-normalizes and plans its batch, pins the leaves it changes, merges it, and, once
-published, frees the pages of the nodes it replaced. That is CPU work that grows
-with the batch, so once it has run for a millisecond, it pauses and lets the other
-tasks run; the slice in which one step ends goes on with the next. It looks at the
-clock every 4,096 units of work: operations listed, compared or moved, nodes
-visited, leaves pinned, entries copied, merged or built, and nodes freed. A node
-that planning visits counts as 64, since searching an unsorted batch's operations
-for it takes up to 2 µs, and a leaf pinned or a node freed as 16, so that it looks
-every 256 of them: about 20 µs of pinning cached leaves, and 11 µs of freeing. That
-is safe: readers keep using the old root until the swap, only one commit runs at a
-time, and the pages a write hasn't freed yet stay in use. Each step keeps its place
-in fixed state. Normalizing keeps the step it is at and how far it got: in the
-merge sort, the pass, the pair of runs it merges, and the operation it is at in
-each. Pinning keeps how many of the leaves it pinned. Planning and the merge keep
-one record per level of the path they are on: the child they are at, the operations
-left for the children after it, and how far the merge got rebuilding a leaf or
-building nodes. Freeing keeps nothing: the nodes left to free wait in the list of
-dropped ones (§8). So pausing allocates nothing, and resuming descends again to
-where it left off. A merge that pauses builds the same tree, on the same pages, as
-one that doesn't: the next commit starts once the pages are free.
+normalizes and plans its batch, pins the leaves it changes, frees the pages that
+readers let go of, merges it, and, once published, frees the pages of the nodes it
+replaced. That is CPU work that grows with the batch, so once it has run for a
+millisecond, it pauses and lets the other tasks run; the slice in which one step
+ends goes on with the next. It looks at the clock every 4,096 units of work:
+operations listed, compared or moved, nodes visited, leaves pinned, entries copied,
+merged or built, and nodes freed. A node that planning visits counts as 64, since
+searching an unsorted batch's operations for it takes up to 2 µs, and a leaf pinned
+or a node freed as 16, so that it looks every 256 of them: about 20 µs of pinning
+cached leaves, and 11 µs of freeing. That is safe: readers keep using the old root
+until the swap, only one commit runs at a time, and the pages a write hasn't freed
+yet stay in use. Each step keeps its place in fixed state. Normalizing keeps the
+step it is at and how far it got: in the merge sort, the pass, the pair of runs it
+merges, and the operation it is at in each. Pinning keeps how many of the leaves it
+pinned. Planning and the merge keep one record per level of the path they are on:
+the child they are at, the operations left for the children after it, and how far
+the merge got rebuilding a leaf or building nodes. Freeing keeps nothing: the nodes
+left to free wait in the list of dropped ones (§8). So pausing allocates nothing,
+and resuming descends again to where it left off. A merge that pauses builds the
+same tree, on the same pages, as one that doesn't: readers that end meanwhile free
+no pages (§8), and the next commit starts once the pages are free.
 
 Measured with the ignored test `read_latency_during_a_load`, on an Apple M5 Pro: a
 store of 2M BookKeeper-shaped entries on the simulated disk takes writes of 1M
@@ -386,6 +388,23 @@ updates' max 1.57 ms at the median rather than 1.50, and 16 runs rather than 5
 reached 1.6 to 2.5 ms. Checking a write's keys against the limit doesn't read its
 batch: reading 1M operations would take 1 ms, right before the first slice of
 normalizing, and make the appends' p99 1.5 ms rather than 1.0.
+
+A lookup that misses the cache pins its version while it waits for the disk (§8),
+so the lookups in flight when a commit publishes hold back the pages of the nodes
+it replaced. The ignored test `read_latency_with_misses_during_a_load` runs the
+random updates above with lookups that miss seven times in ten: they read entries
+of their own, whose values of 2 KiB take value leaves, which the cache keeps in a
+quarter of its 256 MiB, and the simulated disk's leaf reads take 100 µs. A few
+lookups are in flight whenever a commit publishes. The last of them to end frees
+none of those pages, which the next write frees before it merges, a slice at a
+time: no lookup runs longer than 0.06 ms in the poll in which it lets go of its
+version, 0.03 ms at the median of 25 runs. Freeing them then, which can't pause,
+took it 0.41 ms at the median for the 17K to 20K nodes a write replaced, and up to
+0.77 ms. The longest a lookup runs without pausing is 0.15 ms, when it misses and
+the clock hand looks for a value leaf's frame to evict, past the ordinary leaves.
+The lookups' latency is the same either way, 1.5 ms at the median, 2.5 ms at the
+p99 and 2.8 to 2.9 ms at most: a lookup that misses waits for what is left of the
+write's slice before its read, and for another slice after it.
 
 A pause is a trip through the runtime, about 15 µs on an Apple M5 Pro, which is
 why slices are measured in time: a fixed amount of work takes ten times longer in
@@ -653,11 +672,16 @@ completed write.
   published and no reader that started before the publish is still alive (such a
   reader might still need to read it). Iterators always register as readers;
   point reads register only when they have to wait for I/O. Reclaiming a node's
-  pages evicts any stale cache entry for it, under its page id. Once published, a
-  write reclaims what it can a slice at a time, as it merges (§6), and returns when
-  it is done. A reader that ends can't pause: it reclaims what it held back at
-  once, unless a write paused reclaiming, whose next slices take that too. A write
-  dropped while it reclaims reclaims the rest at once.
+  pages evicts any stale cache entry for it, under its page id. Only writes
+  reclaim, a slice at a time, as they merge (§6): once published, a write reclaims
+  what it can, and returns when it is done. A reader that ends can't pause, so it
+  reclaims nothing: what it held back waits for the next write, which reclaims it
+  before it merges, and its leaves may stay cached until then, as clean leaves the
+  cache can evict. Only a merge takes pages, so it takes the ones it would have if
+  the reader had reclaimed them as it ended, and readers that end while it pauses
+  don't change them. Leaving them to the end of the next commit instead would keep
+  them from its merge, which would take others, growing the file. A write dropped
+  while it reclaims leaves the rest to the next one too.
 - **Capacity.** On BookKeeper-shaped data, dense leaves take ~5 B/entry, so a 1 GiB
   cache holds roughly 200M entries. Slotted leaves, at ~26 B/entry, would hold
   roughly 40M.
@@ -946,8 +970,9 @@ complete without suspending.
 - **Allocation tests:** a counting global allocator asserts that `get` and iteration
   over cached pages, `get` and iteration that miss the cache (reading ahead
   included), and `write` with a reused batch, alone, pausing as it normalizes, plans
-  and merges, with ranges and keys in no order, or in a group, all on the simulated
-  disk, perform no allocations. On a real disk, compio adds one per I/O operation.
+  and merges, with ranges and keys in no order, in a group, or freeing the pages a
+  reader held back, all on the simulated disk, perform no allocations. On a real
+  disk, compio adds one per I/O operation.
 - **Sanitizers:** CI runs every test under AddressSanitizer, std included, so a
   use of freed memory or a leak fails the run even where the test's own checks
   pass, real files' io_uring path included. One test drops a store while the

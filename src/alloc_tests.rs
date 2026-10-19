@@ -150,6 +150,23 @@ fn the_data_path_does_not_allocate() {
         0,
         "a write of ranges and scattered keys allocated"
     );
+    // Nor does a reader that holds back the pages a write replaces, nor the next
+    // write, which frees them, once a first round has grown the file, and with it
+    // the simulated disk.
+    let hold_back = |batch: &mut WriteBatch, round| {
+        let reader = db.range(..);
+        fill(batch, round);
+        now(db.write(batch)).unwrap();
+        drop(reader);
+        fill(batch, round + 1);
+        now(db.write(batch)).unwrap();
+    };
+    hold_back(&mut batch, 7);
+    assert_eq!(
+        allocations(|| hold_back(&mut batch, 9)),
+        0,
+        "freeing the pages a reader held back allocated"
+    );
 }
 
 /// Fills `batch` with puts, deletes and ranges, in no order.

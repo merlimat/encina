@@ -846,6 +846,14 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
                 inner.tree.borrow_mut().resume();
             }
         }
+        // Free the pages that readers held back and have let go of since, a slice
+        // at a time: a reader that ends doesn't pause, and leaves them to the
+        // writes. The merge then takes the pages it would have, had they freed
+        // them.
+        while inner.tree.borrow_mut().reclaim().is_pending() {
+            yield_now().await;
+            inner.tree.borrow_mut().resume();
+        }
         // Build the new version, a slice of the merge at a time, letting the other
         // tasks run in between.
         let built = loop {
@@ -901,13 +909,13 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
     guard.stage = Stage::Cutting;
     shrink(inner, meta.high_water).await;
     // Free the pages of the nodes the commit replaced, unless older readers still
-    // need them, a slice at a time, as the merge goes.
-    guard.stage = Stage::Reclaiming;
+    // need them, a slice at a time, as the merge goes. If the write is dropped
+    // meanwhile, the next one frees the rest.
+    guard.stage = Stage::Done;
     while inner.tree.borrow_mut().reclaim().is_pending() {
         yield_now().await;
         inner.tree.borrow_mut().resume();
     }
-    guard.stage = Stage::Done;
     Ok(())
 }
 
@@ -1267,9 +1275,6 @@ enum Stage {
     /// The commit is published, and the file may be getting cut: a cut still in
     /// flight could cut what a later write adds.
     Cutting,
-    /// The pages of the nodes the commit replaced are being freed, a slice at a
-    /// time: those left are freed at once.
-    Reclaiming,
     Done,
 }
 
@@ -1325,7 +1330,6 @@ impl Drop for WriteGuard<'_> {
                 tree.discard();
             }
             Stage::Cutting => self.inner.failed.set(true),
-            Stage::Reclaiming => tree.reclaim_all(),
         }
         // Dropped before the group's writes had their outcome.
         if self.group && !self.delivered {
