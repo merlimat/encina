@@ -16,7 +16,8 @@
 //! one: then only what was synced survives, plus whichever pages written since
 //! happen to have landed, with the write in progress torn. It can also hold leaf
 //! reads in flight, or syncs and cuts, until a test releases them, and delay
-//! writes and syncs while the runtime runs other tasks, as a real disk's take time.
+//! writes, syncs and leaf reads while the runtime runs other tasks, as a real
+//! disk's take time.
 
 use std::cell::RefCell;
 use std::future::poll_fn;
@@ -24,6 +25,7 @@ use std::io;
 use std::rc::Rc;
 use std::slice;
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use compio::buf::IoBuf;
 
@@ -72,6 +74,8 @@ struct Disk {
     /// have finished. Syncs then keep nothing for a crash.
     delay: bool,
     finished: u64,
+    /// How long each leaf read takes, if the disk delays reads.
+    read_time: Option<Duration>,
 }
 
 impl SimDisk {
@@ -236,6 +240,12 @@ impl SimDisk {
         self.0.borrow_mut().delay = true;
     }
 
+    /// Makes each leaf read from now on take `time`, while the runtime runs other
+    /// tasks, as the thread would while a real disk read the page.
+    pub(crate) fn delay_reads(&self, time: Duration) {
+        self.0.borrow_mut().read_time = Some(time);
+    }
+
     /// Waits for the operation's turn, if writes and syncs are delayed: until the
     /// runtime has run other tasks, with no other one finishing since it last
     /// looked. One finishes per turn, as a disk works through its queue, so that the
@@ -370,13 +380,15 @@ impl SimDisk {
 }
 
 /// A leaf read on the simulated disk. It finishes when first polled, unless the
-/// disk holds it.
+/// disk holds or delays it.
 pub(crate) struct SimRead {
     disk: Rc<SimDisk>,
     offset: u64,
     buf: Option<FrameBuf>,
     /// The read's operation number and outcome, once started.
     started: Option<(u64, io::Result<()>)>,
+    /// When it finishes, if the disk delays it.
+    done: Option<Instant>,
 }
 
 impl SimRead {
@@ -386,6 +398,7 @@ impl SimRead {
             offset,
             buf: Some(buf),
             started: None,
+            done: None,
         }
     }
 
@@ -394,6 +407,13 @@ impl SimRead {
         let (op, _) = self.started.get_or_insert_with(|| disk.start_read());
         if disk.holds(*op, cx.waker()) {
             return Poll::Pending;
+        }
+        if let Some(time) = disk.0.borrow().read_time {
+            let done = *self.done.get_or_insert_with(|| Instant::now() + time);
+            if Instant::now() < done {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
         }
         let (_, res) = self.started.take().unwrap();
         let mut buf = self.buf.take().unwrap();
