@@ -161,8 +161,19 @@ impl Pool {
     pub(crate) fn slot(&self, i: usize) -> FrameId {
         match i.checked_sub(self.frames.len()) {
             None => i as FrameId,
-            Some(i) => LARGE | i as FrameId,
+            Some(i) => self.large_slot(i),
         }
+    }
+
+    /// How many large frame ids [`large_slot`](Self::large_slot) maps, the free ones
+    /// included.
+    pub(crate) fn large_slots(&self) -> usize {
+        self.large.len()
+    }
+
+    /// The `i`th large frame id.
+    pub(crate) fn large_slot(&self, i: usize) -> FrameId {
+        LARGE | i as FrameId
     }
 
     /// A free frame for `holds`, holding one reference.
@@ -381,7 +392,7 @@ impl Pool {
 }
 
 /// Whether `id` is a large frame's.
-pub(crate) fn is_large(id: FrameId) -> bool {
+fn is_large(id: FrameId) -> bool {
     id & LARGE != 0
 }
 

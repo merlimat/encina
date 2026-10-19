@@ -711,6 +711,9 @@ impl Tree {
                         }
                     }
                     self.phase = Phase::Idle;
+                    // The write holds the leaves it changes from now on, and the ones
+                    // it builds.
+                    self.pages.cache.set_writing(true);
                     return Poll::Ready(());
                 }
                 Phase::Merging | Phase::Growing { .. } => unreachable!("planning during a merge"),
@@ -1011,11 +1014,13 @@ impl Tree {
         }
     }
 
-    /// Releases the leaves the write in progress pinned.
+    /// Releases the leaves the write in progress pinned. As it publishes or
+    /// discards its version, it lets go of the ones it built too.
     pub(crate) fn unpin_touched(&mut self) {
         for frame in self.pinned.drain(..) {
             self.pages.pool.unref(frame);
         }
+        self.pages.cache.set_writing(false);
     }
 
     /// Makes room in the scratch space for a write reaching `level`.
@@ -2112,6 +2117,7 @@ impl Tree {
             assert!(space.is_used(first), "cached leaf {page} on a free page");
         }
         assert!(self.pinned.is_empty() && self.pending.is_none());
+        assert!(!cache.writing(), "a write still holds leaves");
         assert!(self.dirty.iter().all(Vec::is_empty));
         assert!(self.phase == Phase::Idle, "a merge was left halfway");
         assert!(self.values.is_empty());

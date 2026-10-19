@@ -2442,6 +2442,28 @@ fn value_leaves_take_at_most_a_quarter_of_the_cache() {
 }
 
 #[test]
+fn a_write_larger_than_the_cache_looks_at_few_frames_for_each() {
+    // A cache of 16 pages, and a write that pins hundreds of leaves, whose values
+    // differ, and builds as many. Once it holds every frame, the clock hand looks a
+    // step ahead for each frame the pool grows by, rather than at the whole pool.
+    let store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
+    let puts = |round: u32| -> Vec<_> {
+        (0..20_000u32)
+            .map(|i| Op::Put(i.to_be_bytes().to_vec(), (i ^ round).to_le_bytes().to_vec()))
+            .collect()
+    };
+    write(&store.db, &puts(0));
+    let looked = store.db.tree().pages.cache.looked;
+    write(&store.db, &puts(1));
+    let tree = store.db.tree();
+    let frames = tree.pages.pool.slots();
+    assert!(frames > 500, "the write fit in the cache");
+    assert!(tree.pages.cache.looked - looked < crate::cache::STEP * frames);
+    drop(tree);
+    store.db.check();
+}
+
+#[test]
 fn a_cached_value_leaf_leaves_the_cache_with_its_pages() {
     let store = Store::new(Options::new().page_size(256));
     let key = b"k".to_vec();
@@ -4044,6 +4066,60 @@ fn file_size_and_requests() {
             }
         });
         usage.report(name, &store);
+    }
+}
+
+/// Measures writes larger than the cache, on the simulated disk with 4 KiB pages.
+/// A write pins the leaves it changes, and the leaves it builds, until it
+/// publishes, so the frame pool grows past the cache's budget. Run it with
+/// `cargo test --release -- --ignored --nocapture writes_larger_than_the_cache`.
+///
+/// One write loads 1M random keys, and another updates 1M random keys of those,
+/// with a cache of 16 MiB, and with one that holds everything. It reports how long
+/// each write took, the frames the clock hand looked at in the update, and the
+/// frames the pool grew to.
+#[test]
+#[ignore]
+fn writes_larger_than_the_cache() {
+    use std::time::Instant;
+
+    println!(
+        "{:<8} {:>9} {:>9} {:>9} {:>11} {:>9}",
+        "cache", "leaves", "load", "update", "looked", "frames"
+    );
+    for cache in [16 << 20, 1 << 30] {
+        let store = Store::new(Options::new().cache_size(cache));
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let keys: Vec<_> = (0..1_000_000)
+            .map(|_| entry_key(rng.next(), rng.next()))
+            .collect();
+        let mut batch = WriteBatch::new();
+        for key in &keys {
+            batch.put(key, &[0; 16]);
+        }
+        let start = Instant::now();
+        now(store.db.write(&mut batch)).unwrap();
+        let load = start.elapsed();
+        batch.clear();
+        for round in 0..1_000_000 {
+            let key = &keys[(rng.next() % keys.len() as u64) as usize];
+            batch.put(key, &location(round, round));
+        }
+        let looked = store.db.tree().pages.cache.looked;
+        let start = Instant::now();
+        now(store.db.write(&mut batch)).unwrap();
+        let update = start.elapsed();
+        let tree = store.db.tree();
+        let s = |d: std::time::Duration| format!("{:.3} s", d.as_secs_f64());
+        println!(
+            "{:<8} {:>9} {:>9} {:>9} {:>11} {:>9}",
+            format!("{} MiB", cache >> 20),
+            tree.leaves().len(),
+            s(load),
+            s(update),
+            tree.pages.cache.looked - looked,
+            tree.pages.pool.slots(),
+        );
     }
 }
 
