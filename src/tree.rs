@@ -48,16 +48,17 @@ use crate::space::{Life, Space};
 /// children, so real trees stay far shallower.
 pub(crate) const MAX_HEIGHT: usize = 32;
 
-/// How long a write normalizes, plans or merges its batch before it pauses, so
-/// that it can let the other tasks run. A pause costs a trip through the runtime,
-/// about 15 µs on an Apple M5 Pro, so much shorter slices would slow writes down.
+/// How long a write normalizes, plans or merges its batch, or loads the leaves it
+/// changes, before it pauses, so that it can let the other tasks run. A pause
+/// costs a trip through the runtime, about 15 µs on an Apple M5 Pro, so much
+/// shorter slices would slow writes down.
 const SLICE: Duration = Duration::from_millis(1);
 
 /// The work a write does between looks at the clock: operations its normalizing
-/// lists, compares or moves, nodes its planning visits, and entries its merge
-/// copies, merges and builds, and nodes it visits. On an Apple M5 Pro, 4,096 units
-/// of merging take about 25 µs of a sorted load, and 180 µs of random updates,
-/// whose operations lie scattered in the batch's memory.
+/// lists, compares or moves, nodes its planning visits, leaves it pins, and
+/// entries its merge copies, merges and builds, and nodes it visits. On an Apple
+/// M5 Pro, 4,096 units of merging take about 25 µs of a sorted load, and 180 µs of
+/// random updates, whose operations lie scattered in the batch's memory.
 const CHECK: usize = 4096;
 
 /// The work planning counts for a node it visits, so that it looks at the clock
@@ -65,6 +66,11 @@ const CHECK: usize = 4096;
 /// whose keys lie scattered in the memory of an unsorted batch: on an Apple M5
 /// Pro, it takes up to 2 µs of random updates.
 const VISIT: usize = 64;
+
+/// The work a write counts for a leaf it pins once it has planned, so that it
+/// looks at the clock every 256 leaves: about 20 µs on an Apple M5 Pro, when they
+/// are cached.
+const PIN: usize = 16;
 
 /// A version's root node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -788,12 +794,15 @@ impl Tree {
     /// Applies a prepared batch, whose touched leaves must be cached, building the
     /// next version. The merge pauses after each slice of work, returning
     /// `Pending`, so that the caller can let other tasks run: calling this again
-    /// with the same batch goes on where it left off. Returns false if the batch
-    /// changes nothing. Otherwise the new version is pending until
-    /// [`publish`](Self::publish) or [`discard`](Self::discard), which also throws
-    /// away a merge that paused.
+    /// with the same batch goes on where it left off. Its first slice is what is
+    /// left of the one in which planning, and loading the leaves, ended. Returns
+    /// false if the batch changes nothing. Otherwise the new version is pending
+    /// until [`publish`](Self::publish) or [`discard`](Self::discard), which also
+    /// throws away a merge that paused.
     pub(crate) fn apply(&mut self, batch: &WriteBatch) -> Poll<bool> {
-        self.budget.start();
+        if self.phase != Phase::Idle {
+            self.budget.start();
+        }
         loop {
             match self.phase {
                 Phase::Idle => {
@@ -846,6 +855,20 @@ impl Tree {
                 Phase::Normalizing | Phase::Planning => unreachable!("merging an unplanned batch"),
             }
         }
+    }
+
+    /// Counts `n` leaves that the write in progress pinned, once planned, and
+    /// returns whether its slice is over. The write then pauses, and
+    /// [`resume`](Self::resume)s once the other tasks have run.
+    pub(crate) fn loaded(&mut self, n: usize) -> bool {
+        self.budget.work += n * PIN;
+        self.budget.spent()
+    }
+
+    /// Starts the next slice of the write in progress, which paused loading its
+    /// leaves.
+    pub(crate) fn resume(&mut self) {
+        self.budget.start();
     }
 
     /// The meta page that makes the pending version current as `generation`.
@@ -2248,6 +2271,11 @@ impl Tree {
 
     pub(crate) fn set_slice(&mut self, slice: Option<usize>) {
         self.budget.fixed = slice;
+    }
+
+    /// Whether the write in progress is merging its batch.
+    pub(crate) fn merging(&self) -> bool {
+        matches!(self.phase, Phase::Merging | Phase::Growing { .. })
     }
 
     /// The leaf pages that planning a prepared `batch` lists, found as planning did

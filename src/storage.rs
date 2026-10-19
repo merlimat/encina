@@ -134,7 +134,7 @@ impl Storage {
                 (res, buf)
             }
             #[cfg(test)]
-            Storage::Sim(disk) => disk.write(buf, offset),
+            Storage::Sim(disk) => disk.write(buf, offset).await,
         }
     }
 
@@ -154,7 +154,7 @@ impl Storage {
                 (res, bufs)
             }
             #[cfg(test)]
-            Storage::Sim(disk) => disk.write_run(bufs, offset),
+            Storage::Sim(disk) => disk.write_run(bufs, offset).await,
         }
     }
 

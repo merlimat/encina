@@ -333,39 +333,48 @@ doesn't allocate. The operations are applied in order and atomically.
    and the pages of the nodes it replaced become free, subject to §8.
 
 **Pausing.** Readers keep running while a write waits for the disk, and while it
-normalizes, plans and merges its batch. That is CPU work that grows with the
-batch, so once it has run for a millisecond, it pauses and lets the other tasks
-run. It looks at the clock every 4,096 units of work: operations listed, compared
-or moved, nodes visited, and entries copied, merged or built. A node that planning
-visits counts as 64, since searching an unsorted batch's operations for it takes up
-to 2 µs. That is safe: readers keep using the old root until the swap, and only one
-commit runs at a time. Each step keeps its place in fixed state. Normalizing keeps
-the step it is at and how far it got: in the merge sort, the pass, the pair of runs
-it merges, and the operation it is at in each. Planning and the merge keep one
-record per level of the path they are on: the child they are at, the operations
-left for the children after it, and how far the merge got rebuilding a leaf or
-building nodes. So pausing allocates nothing, and resuming descends again to where
-it left off. A merge that pauses builds the same tree, on the same pages, as one
-that doesn't.
+normalizes and plans its batch, pins the leaves it changes, and merges it. That is
+CPU work that grows with the batch, so once it has run for a millisecond, it pauses
+and lets the other tasks run; the slice in which one step ends goes on with the
+next. It looks at the clock every 4,096 units of work: operations listed, compared
+or moved, nodes visited, leaves pinned, and entries copied, merged or built. A node
+that planning visits counts as 64, since searching an unsorted batch's operations
+for it takes up to 2 µs, and a leaf pinned as 16, so that it looks every 256 leaves,
+about 20 µs when they are cached. That is safe: readers keep using the old root
+until the swap, and only one commit runs at a time. Each step keeps its place in
+fixed state. Normalizing keeps the step it is at and how far it got: in the merge
+sort, the pass, the pair of runs it merges, and the operation it is at in each.
+Pinning keeps how many of the leaves it pinned. Planning and the merge keep one
+record per level of the path they are on: the child they are at, the operations left
+for the children after it, and how far the merge got rebuilding a leaf or building
+nodes. So pausing allocates nothing, and resuming descends again to where it left
+off. A merge that pauses builds the same tree, on the same pages, as one that
+doesn't.
 
 Measured with the ignored test `read_latency_during_a_load`, on an Apple M5 Pro: a
 store of 2M BookKeeper-shaped entries on the simulated disk takes writes of 1M
 entries, while a lookup is due every 20 µs. A lookup's latency runs from when it
-was due until it returns.
+was due until it returns. The simulated disk lets the lookups run before each write
+request and sync, and finishes one request per turn of the runtime, as a real disk
+works while the thread runs other tasks: the test times the thread alone.
 
 | Write of 1M entries | Write | Lookup p50 | p99 | Max |
 |---|---|---:|---:|---:|
-| Appends to 1,000 ledgers | doesn't pause | 21.8 ms | 46.4 ms | 47.3 ms |
-| | pauses | 0.55 ms | 2.5 ms | 3.7 ms |
-| Random updates | doesn't pause | 206 ms | 407 ms | 413 ms |
-| | pauses | 0.58 ms | 16.8 ms | 22.1 ms |
+| Appends to 1,000 ledgers | doesn't pause | 20.0 ms | 42.9 ms | 43.8 ms |
+| | pauses | 0.51 ms | 1.5 ms | 2.2 ms |
+| Random updates | doesn't pause | 183 ms | 377 ms | 383 ms |
+| | pauses | 0.54 ms | 1.2 ms | 2.0 ms |
 
-Normalizing, planning and merging then never run for more than 1.3 ms at a time.
-What remains is mostly the simulated disk, which copies the pages a commit writes,
-and copies them again when it syncs, without letting other tasks run: 1 to 2 ms
-each for the appends' 3,000 pages, and 9 to 14 ms each for the random updates'
-20,000, which a disk writes while the write waits. Pinning the random updates'
-20,000 leaves, all cached, takes another 1.4 ms.
+Normalizing, planning, pinning and merging then never run for more than 1.5 ms at a
+time: the random updates' p99 comes from their merge's slices, which run up to
+1.3 ms, since 4,096 units of their merge, between two looks at the clock, take
+180 µs. The simulated disk copies a request's pages in at most 0.25 ms. What
+remains are two steps that don't pause, once per write. Before a write queues,
+checking that none of its keys is too long reads its whole batch, 1 ms for 1M
+operations, and the first slice of normalizing follows: those 2 ms set the appends'
+p99, since their writes take only 42 ms. Once the merge ends, listing the nodes the
+commit writes and sorting them by page takes another 0.7 ms after the merge's last
+slice, for the random updates' 19,700 nodes.
 
 A pause is a trip through the runtime, about 15 µs on an Apple M5 Pro, which is
 why slices are measured in time: a fixed amount of work takes ten times longer in
@@ -385,6 +394,11 @@ commits of 100 entries, within the runs' noise; pausing only the merge made it
 1M sorted operations in 7.3 ms rather than the 8.5 ms the standard library's sort
 took, four sorted batches of 250K in 11 ms rather than 50, and 1M random ones in
 155 ms rather than 140.
+
+Pinning in slices costs no more either: over 40 alternating runs of the load, the
+median time was 0.7% higher with one writer and 0.5% higher with four than when
+pinning never paused, and the median of each round's ratio 0.6% higher and 0.7%
+lower, within the runs' noise.
 
 **Split policy.** A rebuilt leaf that overflows splits right after each run of
 inserted keys that fills at least a quarter page (the per-ledger append case): the
@@ -718,8 +732,8 @@ same 282 MiB.
   keeps the reads it holds inline; and the table of reads in flight reuses its
   slots (§8). If compio's show up in profiles, the fix belongs upstream (pooled
   operation slots).
-- A large write normalizes, plans and merges its batch a slice at a time, and
-  yields to the executor in between (§6).
+- A large write normalizes and plans its batch, pins the leaves it changes, and
+  merges it, a slice at a time, and yields to the executor in between (§6).
 - **Linux with io_uring is the target.** macOS works for development, but there
   compio runs file I/O on a blocking thread pool and `fsync` is a plain `fsync`
   (no `F_FULLFSYNC`), so macOS gives no durability guarantee against power loss.
@@ -888,9 +902,10 @@ complete without suspending.
   same leaves as planning at once, in trees of four levels. Two stores, one of whose
   merges pause, build the same trees on the same pages. A write dropped at each of
   its pauses in turn, in a tree of four levels, leaves the store as it was, every
-  page and frame accounted for; so does one dropped while it normalizes or plans,
-  and its batch, reused, then writes what it holds. On a compio runtime, another
-  task's lookups run while a write merges, and see the last version.
+  page and frame accounted for; so does one dropped while it normalizes, plans,
+  or pins the leaves it changes, all of them cached, and its batch, reused, then
+  writes what it holds. On a compio runtime, another task's lookups run while a
+  write merges, and see the last version.
 - **Damage:** a flipped bit in a leaf fails the reads that need it, and one in an
   internal node fails the open, both with `Error::Corruption`, as does a child
   reference past the end of the file or to a page already used. A flipped bit in

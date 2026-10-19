@@ -822,7 +822,8 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
             inner.tree.borrow_mut().discard();
             continue;
         }
-        // Load the leaves the batch changes, keeping them in the cache.
+        // Load the leaves the batch changes, keeping them in the cache. Cached ones
+        // load without waiting, so this too pauses once it has run for a slice.
         let touched = inner.tree.borrow().touched.len();
         for start in (0..touched).step_by(IO_WINDOW) {
             let loads: [_; IO_WINDOW] = array::from_fn(|i| {
@@ -838,6 +839,11 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
             }
             if let Some(e) = error {
                 return Err(e);
+            }
+            let n = (touched - start).min(IO_WINDOW);
+            if inner.tree.borrow_mut().loaded(n) {
+                yield_now().await;
+                inner.tree.borrow_mut().resume();
             }
         }
         // Build the new version, a slice of the merge at a time, letting the other
