@@ -913,8 +913,9 @@ fn iterators_keep_their_version() {
         seen += 1;
     }
     assert_eq!(seen, 200);
+    // Dropping the iterator lets go of the old version, whose pages the next write
+    // frees.
     drop(iter);
-    // Dropping the iterator freed the old version.
     store.db.check();
     assert_eq!(scan(&store.db, ALL).len(), 100);
 }
@@ -3172,20 +3173,25 @@ fn a_write_frees_the_pages_it_replaced_a_slice_at_a_time() {
     write(&store.db, &load);
     apply(&mut model, &load);
     store.db.set_merge_slice(Some(4));
-    // One write runs to its end, the next is dropped while it frees the pages.
-    for (round, drop_it) in [(2, false), (3, true)] {
+    let left = || store.db.tree().pages.space.dropped().count();
+    // One write runs to its end, the next is dropped while it frees the pages, and
+    // the one after frees the rest before it merges.
+    for (round, drop_it) in [(2, false), (3, true), (4, false)] {
         let ops: Vec<_> = (0..2000)
             .step_by(3)
             .map(|i| scattered_put(i, round))
             .collect();
         let mut batch = batch_of(&ops);
         let mut write = Box::pin(store.db.write(&mut batch));
+        if round == 4 {
+            pause_merging(&store.db, write.as_mut());
+            assert_eq!(left(), 0);
+        }
         let start = generation(&store.db);
         while generation(&store.db) == start {
             assert!(poll_once(write.as_mut()).is_pending());
         }
         // Published, it pauses after each slice of the pages it frees.
-        let left = || store.db.tree().pages.space.dropped().count();
         let before = left();
         assert!(poll_once(write.as_mut()).is_pending());
         assert!(0 < left() && left() < before, "{} of {before} left", left());
@@ -3194,15 +3200,62 @@ fn a_write_frees_the_pages_it_replaced_a_slice_at_a_time() {
         drop(store.db.range(..));
         assert_eq!(left(), before);
         if drop_it {
-            // It frees what is left at once.
             drop(write);
+            assert_eq!(left(), before);
         } else {
             now(write).unwrap();
+            assert_eq!(left(), 0);
         }
         store.db.check();
         apply(&mut model, &ops);
         assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
     }
+}
+
+#[test]
+fn a_reader_leaves_the_pages_it_held_back_to_the_next_write() {
+    // On 256-byte pages, each write replaces hundreds of leaves. A twin store takes
+    // the same writes, with no reader to hold pages back.
+    let opts = Options::new().page_size(256);
+    let (store, twin) = (Store::new(opts.clone()), Store::new(opts));
+    let load: Vec<_> = (0..2000).map(|i| scattered_put(i, 1)).collect();
+    let update = |round| -> Vec<_> {
+        (0..2000)
+            .step_by(3)
+            .map(|i| scattered_put(i, round))
+            .collect()
+    };
+    for db in [&store.db, &twin.db] {
+        write(db, &load);
+        db.set_merge_slice(Some(4));
+    }
+    // A reader holds back the pages of the nodes the next write replaces.
+    let reader = store.db.range(..);
+    for db in [&store.db, &twin.db] {
+        write(db, &update(2));
+    }
+    let left = || store.db.tree().pages.space.dropped().count();
+    let held = left();
+    assert!(held > 0);
+    // Ending, it frees none of them.
+    drop(reader);
+    assert_eq!(left(), held);
+    store.db.check();
+    // The next write frees them before it merges, a slice at a time.
+    let ops = update(3);
+    let mut batch = batch_of(&ops);
+    let mut next = Box::pin(store.db.write(&mut batch));
+    while left() == held {
+        assert!(poll_once(next.as_mut()).is_pending());
+    }
+    assert!(left() > 0, "freed at once");
+    pause_merging(&store.db, next.as_mut());
+    assert_eq!(left(), 0);
+    now(next).unwrap();
+    // So it takes the pages it would have if the reader had freed them.
+    write(&twin.db, &ops);
+    assert_eq!(store.db.tree().pages(), twin.db.tree().pages());
+    store.db.check();
 }
 
 /// Polls `write`, each poll stopping where it yields, until it pauses merging,
@@ -4028,7 +4081,7 @@ fn read_latency_during_a_load() {
 ///
 /// The lookups read 50K entries of their own, whose values of 2 KiB are too large
 /// for a leaf: each has a value leaf, and the cache, of 256 MiB, keeps value leaves
-/// in a quarter of it, so that two lookups in three miss. The disk's leaf reads
+/// in a quarter of it, so that seven lookups in ten miss. The disk's leaf reads
 /// take 100 µs, and the next lookups don't wait for one that waits for the disk.
 #[test]
 #[ignore]
