@@ -368,7 +368,7 @@ works while the thread runs other tasks: the test times the thread alone.
 | Appends to 1,000 ledgers | doesn't pause | 20.0 ms | 42.9 ms | 43.8 ms |
 | | pauses | 0.50 ms | 1.0 ms | 1.1 ms |
 | Random updates | doesn't pause | 183 ms | 377 ms | 383 ms |
-| | pauses | 0.55 ms | 1.2 ms | 1.5 ms |
+| | pauses | 0.54 ms | 1.1 ms | 1.5 ms |
 
 Normalizing, planning, pinning, merging and freeing then never run for much more
 than 1.5 ms at a time, and a lookup waits for what is left of the slice in which it
