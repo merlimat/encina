@@ -27,6 +27,10 @@ use crate::tree::Budget;
 pub struct WriteBatch {
     bytes: Vec<u8>,
     ops: Vec<Op>,
+    // The length of the longest key put since the last `clear`, in this batch or
+    // one appended to it. Withdrawing operations doesn't lower it, but a write
+    // checks only its own batch.
+    longest_put: usize,
     // Set by `prepare`: the surviving puts and deletes sorted by key, and the
     // ranges merged into disjoint intervals sorted by start.
     points: Vec<u32>,
@@ -114,6 +118,7 @@ impl WriteBatch {
     /// stays under 4 GiB. An entry too large for a leaf gets pages of its own.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         self.push(Kind::Put, key, value);
+        self.longest_put = self.longest_put.max(key.len());
     }
 
     /// Removes `key`, if present.
@@ -130,6 +135,7 @@ impl WriteBatch {
     pub fn clear(&mut self) {
         self.bytes.clear();
         self.ops.clear();
+        self.longest_put = 0;
     }
 
     fn push(&mut self, kind: Kind, a: &[u8], b: &[u8]) {
@@ -183,13 +189,15 @@ impl WriteBatch {
         &self.ranges
     }
 
-    /// Checks that no put's key exceeds `max_key` bytes.
+    /// Checks that no put's key exceeds `max_key` bytes. It compares the longest
+    /// key put, so it takes no longer for a large batch: reading the operations
+    /// would take 1 ms per million, while the store's other tasks wait.
     pub(crate) fn check(&self, max_key: usize) -> Result<()> {
-        for op in &self.ops {
-            let size = op.a_len as usize;
-            if op.kind == Kind::Put && size > max_key {
-                return Err(Error::KeyTooLarge { size, max: max_key });
-            }
+        if self.longest_put > max_key {
+            return Err(Error::KeyTooLarge {
+                size: self.longest_put,
+                max: max_key,
+            });
         }
         Ok(())
     }
@@ -214,6 +222,7 @@ impl WriteBatch {
             b: op.b + shift,
             ..*op
         }));
+        self.longest_put = self.longest_put.max(other.longest_put);
         (first, self.ops.len() as u32)
     }
 
@@ -238,6 +247,7 @@ impl WriteBatch {
         let WriteBatch {
             bytes,
             ops,
+            longest_put: _,
             points,
             ranges,
             by_start,
@@ -933,9 +943,20 @@ mod tests {
     fn oversized_keys_are_rejected() {
         let mut batch = WriteBatch::new();
         batch.put(&[0; 13], b"");
+        batch.put(&[0; 15], b"");
+        batch.put(&[0; 14], b"");
+        // The error reports the longest key, and so does a group that the batch
+        // joins.
         assert!(matches!(
             batch.check(12),
-            Err(Error::KeyTooLarge { size: 13, max: 12 })
+            Err(Error::KeyTooLarge { size: 15, max: 12 })
+        ));
+        let mut group = WriteBatch::new();
+        group.put(&[0; 1], b"");
+        group.append(&batch);
+        assert!(matches!(
+            group.check(12),
+            Err(Error::KeyTooLarge { size: 15, max: 12 })
         ));
         // Values, and the keys of deletes and ranges, may be longer.
         batch.clear();
