@@ -346,7 +346,10 @@ for it takes up to 2 µs, and a leaf pinned or a node freed as 16, so that it lo
 every 256 of them: about 20 µs of pinning cached leaves, and 11 µs of freeing. An
 operation the merge applies counts as 32 when the first two operations of its leaf
 don't come one after the other in the batch, as a sorted batch's do: an unsorted
-batch's operations lie scattered, and reading each one misses the cache. That
+batch's operations lie scattered, and reading each one misses the cache.
+Normalizing a batch larger than any it held before takes room for all its points
+at once, rather than growing their array as it lists them, and zeroes the sort's
+new scratch space a page at a time, counting a unit per item. That
 is safe: readers keep using the old root until the swap, only one commit runs at a
 time, and the pages a write hasn't freed yet stay in use. Each step keeps its place
 in fixed state. Normalizing keeps the step it is at and how far it got: in the
@@ -369,9 +372,9 @@ works while the thread runs other tasks: the test times the thread alone.
 | Write of 1M entries | Write | Lookup p50 | p99 | Max |
 |---|---|---:|---:|---:|
 | Appends to 1,000 ledgers | doesn't pause | 20.0 ms | 42.9 ms | 43.8 ms |
-| | pauses | 0.50 ms | 1.03 ms | 1.09 ms |
+| | pauses | 0.50 ms | 1.02 ms | 1.08 ms |
 | Random updates | doesn't pause | 183 ms | 377 ms | 383 ms |
-| | pauses | 0.52 ms | 1.07 ms | 1.47 ms |
+| | pauses | 0.52 ms | 1.06 ms | 1.22 ms |
 
 Normalizing, planning, pinning, merging and freeing then never run for much more
 than 1.5 ms at a time, and a lookup waits for what is left of the slice in which it
@@ -382,8 +385,12 @@ looks at the clock, took 180 µs on an idle machine and up to 0.5 ms on a busy o
 and their merge slices ran up to 1.3 and 1.5 ms. Over 48 alternating runs on a
 machine kept busy by other work, counting them as 32 made the random updates' p99
 1.07 ms at the median rather than 1.20, lower in 47 runs, and their max 1.47 ms
-rather than 1.54, lower in 32. Their max now comes from normalizing a new batch,
-whose arrays grow by megabytes at once, in up to 0.65 ms.
+rather than 1.54, lower in 32. Their max then came from normalizing a new batch,
+whose arrays grew by megabytes at once, in up to 0.65 ms. Over 40 alternating runs
+against the build before both changes, normalizing in slices too made the random
+updates' p99 1.06 ms rather than 1.18, and their max 1.22 ms rather than 1.49, lower
+in 35 runs. Planning sets it now, looking at the clock every 150 to 200 µs of a busy
+machine, along with the standard library's sorts of 4,096 operations, 0.2 ms each.
 The simulated disk copies a request's pages in at most 0.25 ms. The rest of a
 commit is short: the merge lists the nodes it builds as it goes, in page order, so
 the commit needn't find them in the new version and sort them by page, which took
