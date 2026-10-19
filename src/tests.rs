@@ -372,6 +372,10 @@ fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
             }
             Step::Paused(ops, polls, finish) => {
                 let before = expected_scan(&model, ALL);
+                let mut after = model.clone();
+                apply(&mut after, ops);
+                let after = expected_scan(&after, ALL);
+                let start = generation(&store.db);
                 let mut batch = batch_of(ops);
                 let mut write = Box::pin(store.db.write(&mut batch));
                 let mut finished = false;
@@ -381,9 +385,12 @@ fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
                         finished = true;
                         break;
                     }
+                    // Once published, the write pauses only to free the pages it
+                    // replaced.
+                    let published = generation(&store.db) > start;
                     assert_eq!(
-                        scan(&store.db, ALL),
-                        before,
+                        &scan(&store.db, ALL),
+                        if published { &after } else { &before },
                         "a scan saw a write in progress"
                     );
                 }
@@ -393,7 +400,7 @@ fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
                 } else {
                     drop(write);
                 }
-                if finished {
+                if finished || generation(&store.db) > start {
                     apply(&mut model, ops);
                 }
                 store.db.check();
@@ -2017,6 +2024,37 @@ fn commits_write_each_run_of_pages_with_one_request() {
 }
 
 #[test]
+fn adjacent_runs_of_pages_of_both_lives_take_one_request() {
+    node::slotted_only();
+    let store = Store::new(Options::new().page_size(256));
+    let max_run = crate::db::max_run(256);
+    // Ledgers 1,000 keys apart, so that appends to one go between its last entry
+    // and the next ledger's first.
+    let ledgers = |entries: std::ops::Range<u32>| -> Vec<Op> {
+        (0..400)
+            .flat_map(|ledger| entries.clone().map(move |e| ledger * 1000 + e))
+            .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![1; 8]))
+            .collect()
+    };
+    write(&store.db, &ledgers(0..1));
+    // The appends fill long-lived leaves, and leave each ledger's last leaf
+    // short-lived: the file grows by runs of pages of both lives, in turns.
+    let before = store.db.tree().pages();
+    let ops_before = store.disk.ops();
+    write(&store.db, &ledgers(1..30));
+    let written: Vec<_> = store
+        .db
+        .tree()
+        .pages()
+        .into_iter()
+        .filter(|page| before.binary_search(page).is_err())
+        .collect();
+    let requests = requests_for(&written, max_run);
+    assert_eq!(store.disk.ops() - ops_before, requests + 3);
+    store.db.check();
+}
+
+#[test]
 fn a_failed_page_write_leaves_its_pages_to_the_next_write() {
     // A store whose write fails once, and a twin that takes the same writes.
     let opts = Options::new().page_size(256);
@@ -3125,6 +3163,48 @@ fn a_write_dropped_while_it_loads_its_leaves_changes_nothing() {
     store.db.check();
 }
 
+#[test]
+fn a_write_frees_the_pages_it_replaced_a_slice_at_a_time() {
+    // On 256-byte pages, the write replaces hundreds of leaves.
+    let store = Store::new(Options::new().page_size(256));
+    let mut model = Model::new();
+    let load: Vec<_> = (0..2000).map(|i| scattered_put(i, 1)).collect();
+    write(&store.db, &load);
+    apply(&mut model, &load);
+    store.db.set_merge_slice(Some(4));
+    // One write runs to its end, the next is dropped while it frees the pages.
+    for (round, drop_it) in [(2, false), (3, true)] {
+        let ops: Vec<_> = (0..2000)
+            .step_by(3)
+            .map(|i| scattered_put(i, round))
+            .collect();
+        let mut batch = batch_of(&ops);
+        let mut write = Box::pin(store.db.write(&mut batch));
+        let start = generation(&store.db);
+        while generation(&store.db) == start {
+            assert!(poll_once(write.as_mut()).is_pending());
+        }
+        // Published, it pauses after each slice of the pages it frees.
+        let left = || store.db.tree().pages.space.dropped().count();
+        let before = left();
+        assert!(poll_once(write.as_mut()).is_pending());
+        assert!(0 < left() && left() < before, "{} of {before} left", left());
+        // A reader that ends meanwhile leaves them to the write.
+        let before = left();
+        drop(store.db.range(..));
+        assert_eq!(left(), before);
+        if drop_it {
+            // It frees what is left at once.
+            drop(write);
+        } else {
+            now(write).unwrap();
+        }
+        store.db.check();
+        apply(&mut model, &ops);
+        assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    }
+}
+
 /// Polls `write`, each poll stopping where it yields, until it pauses merging,
 /// which it does once it holds the leaves its batch changes.
 fn pause_merging<F: Future + ?Sized>(db: &Db, mut write: Pin<&mut F>) {
@@ -3181,7 +3261,9 @@ fn a_write_dropped_at_any_pause_changes_nothing() {
             Poll::Pending => false,
         });
         drop(write);
-        if finished {
+        // Once published, it pauses only to free the pages of the nodes it
+        // replaced, and frees the rest at once when dropped.
+        if finished || generation(&store.db) > start {
             break;
         }
         drops += 1;
@@ -3296,10 +3378,16 @@ async fn other_tasks_run_while_a_write_merges() {
         let (db, writing, lookups) = (db.clone(), writing.clone(), lookups.clone());
         async move {
             let key = 100u32.to_be_bytes();
+            let mut published = false;
             while writing.get() {
                 let found = db.get(&key, Comparison::Equal, |_, v| v[0]).await;
-                assert_eq!(found.unwrap(), Some(1));
-                lookups.set(lookups.get() + 1);
+                // The old value until the write publishes, then the new one, while
+                // it frees the pages it replaced.
+                match found.unwrap() {
+                    Some(1) if !published => lookups.set(lookups.get() + 1),
+                    Some(7) => published = true,
+                    found => panic!("found {found:?}"),
+                }
                 yield_once().await;
             }
         }

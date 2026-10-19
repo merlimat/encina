@@ -878,7 +878,6 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
         return Ok(());
     }
     let generation = inner.tree.borrow().current().generation + 1;
-    inner.tree.borrow_mut().collect_pending();
 
     // Commit: write the new nodes, sync, then switch the meta page and sync.
     let meta = inner.tree.borrow().pending_meta(generation);
@@ -901,6 +900,13 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
     guard.deliver(&Ok(()));
     guard.stage = Stage::Cutting;
     shrink(inner, meta.high_water).await;
+    // Free the pages of the nodes the commit replaced, unless older readers still
+    // need them, a slice at a time, as the merge goes.
+    guard.stage = Stage::Reclaiming;
+    while inner.tree.borrow_mut().reclaim().is_pending() {
+        yield_now().await;
+        inner.tree.borrow_mut().resume();
+    }
     guard.stage = Stage::Done;
     Ok(())
 }
@@ -1067,31 +1073,27 @@ fn finish(pages: &mut Pages, page: u64, claim: Claim, generation: u64) -> Result
     Ok(frame)
 }
 
-/// Writes the pending version's dirty nodes: each run of adjacent pages with one
-/// vectored write, up to `MAX_WRITE` bytes, `IO_WINDOW` writes at a time. Every
-/// write completes before this returns, even when one fails.
+/// Writes the pending version's dirty nodes, in page order: each run of adjacent
+/// pages with one vectored write, up to `MAX_WRITE` bytes, `IO_WINDOW` writes at a
+/// time. Every write completes before this returns, even when one fails.
 async fn write_dirty(inner: &Inner) -> Result<()> {
-    let total = {
-        let mut tree = inner.tree.borrow_mut();
-        tree.dirty.sort_unstable_by_key(|&(_, page)| page);
-        tree.dirty.len()
-    };
     let max_run = max_run(inner.page_size);
     let mut error = None;
-    let mut next = 0;
-    while next < total {
+    // How many of the nodes of each life the writes took.
+    let mut next = [0; 2];
+    while inner.tree.borrow().next_dirty(next).is_some() {
         let writes: [_; IO_WINDOW] = {
             let tree = inner.tree.borrow();
             let mut runs = inner.runs.borrow_mut();
             array::from_fn(|_| {
-                let &(_, first) = tree.dirty.get(next)?;
+                let (_, _, first) = tree.next_dirty(next)?;
                 let mut bufs = runs.pop().unwrap_or_else(|| Vec::with_capacity(max_run));
-                while let Some(&(frame, page)) = tree.dirty.get(next)
+                while let Some((life, frame, page)) = tree.next_dirty(next)
                     && page == first + bufs.len() as u64
                     && bufs.len() < max_run
                 {
                     bufs.push(tree.pages.pool.buf(frame));
-                    next += 1;
+                    next[life] += 1;
                 }
                 Some(inner.storage.write_run(bufs, inner.offset(first)))
             })
@@ -1265,6 +1267,9 @@ enum Stage {
     /// The commit is published, and the file may be getting cut: a cut still in
     /// flight could cut what a later write adds.
     Cutting,
+    /// The pages of the nodes the commit replaced are being freed, a slice at a
+    /// time: those left are freed at once.
+    Reclaiming,
     Done,
 }
 
@@ -1320,6 +1325,7 @@ impl Drop for WriteGuard<'_> {
                 tree.discard();
             }
             Stage::Cutting => self.inner.failed.set(true),
+            Stage::Reclaiming => tree.reclaim_all(),
         }
         // Dropped before the group's writes had their outcome.
         if self.group && !self.delivered {

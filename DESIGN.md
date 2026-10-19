@@ -335,23 +335,26 @@ applied in order and atomically.
    and the pages of the nodes it replaced become free, subject to §8.
 
 **Pausing.** Readers keep running while a write waits for the disk, and while it
-normalizes and plans its batch, pins the leaves it changes, and merges it. That is
-CPU work that grows with the batch, so once it has run for a millisecond, it pauses
-and lets the other tasks run; the slice in which one step ends goes on with the
-next. It looks at the clock every 4,096 units of work: operations listed, compared
-or moved, nodes visited, leaves pinned, and entries copied, merged or built. A node
+normalizes and plans its batch, pins the leaves it changes, merges it, and, once
+published, frees the pages of the nodes it replaced. That is CPU work that grows
+with the batch, so once it has run for a millisecond, it pauses and lets the other
+tasks run; the slice in which one step ends goes on with the next. It looks at the
+clock every 4,096 units of work: operations listed, compared or moved, nodes
+visited, leaves pinned, entries copied, merged or built, and nodes freed. A node
 that planning visits counts as 64, since searching an unsorted batch's operations
-for it takes up to 2 µs, and a leaf pinned as 16, so that it looks every 256 leaves,
-about 20 µs when they are cached. That is safe: readers keep using the old root
-until the swap, and only one commit runs at a time. Each step keeps its place in
-fixed state. Normalizing keeps the step it is at and how far it got: in the merge
-sort, the pass, the pair of runs it merges, and the operation it is at in each.
-Pinning keeps how many of the leaves it pinned. Planning and the merge keep one
-record per level of the path they are on: the child they are at, the operations left
-for the children after it, and how far the merge got rebuilding a leaf or building
-nodes. So pausing allocates nothing, and resuming descends again to where it left
-off. A merge that pauses builds the same tree, on the same pages, as one that
-doesn't.
+for it takes up to 2 µs, and a leaf pinned or a node freed as 16, so that it looks
+every 256 of them: about 20 µs of pinning cached leaves, and 11 µs of freeing. That
+is safe: readers keep using the old root until the swap, only one commit runs at a
+time, and the pages a write hasn't freed yet stay in use. Each step keeps its place
+in fixed state. Normalizing keeps the step it is at and how far it got: in the
+merge sort, the pass, the pair of runs it merges, and the operation it is at in
+each. Pinning keeps how many of the leaves it pinned. Planning and the merge keep
+one record per level of the path they are on: the child they are at, the operations
+left for the children after it, and how far the merge got rebuilding a leaf or
+building nodes. Freeing keeps nothing: the nodes left to free wait in the list of
+dropped ones (§8). So pausing allocates nothing, and resuming descends again to
+where it left off. A merge that pauses builds the same tree, on the same pages, as
+one that doesn't: the next commit starts once the pages are free.
 
 Measured with the ignored test `read_latency_during_a_load`, on an Apple M5 Pro: a
 store of 2M BookKeeper-shaped entries on the simulated disk takes writes of 1M
@@ -365,21 +368,24 @@ works while the thread runs other tasks: the test times the thread alone.
 | Appends to 1,000 ledgers | doesn't pause | 20.0 ms | 42.9 ms | 43.8 ms |
 | | pauses | 0.50 ms | 1.0 ms | 1.1 ms |
 | Random updates | doesn't pause | 183 ms | 377 ms | 383 ms |
-| | pauses | 0.54 ms | 1.2 ms | 1.8 ms |
+| | pauses | 0.55 ms | 1.2 ms | 1.5 ms |
 
-Normalizing, planning, pinning and merging then never run for more than 1.5 ms at a
-time, and a lookup waits for what is left of the slice in which it comes due: half
-of one at the median, and about a whole one at the p99. The appends' slices run 1.0
-to 1.1 ms; the random updates' p99 comes from their merge's slices, which run up to
-1.3 ms, since 4,096 units of their merge, between two looks at the clock, take
-180 µs. The simulated disk copies a request's pages in at most 0.25 ms. What
-remains are two steps that don't pause, once per write, for the random updates'
-19,700 nodes: once the merge ends, listing the nodes the commit writes and sorting
-them by page takes another 0.7 ms after the merge's last slice, and once the commit
-is durable, freeing the nodes it replaced takes 0.8 ms. Checking a write's keys
-against the limit doesn't read its batch: reading 1M operations would take 1 ms,
-right before the first slice of normalizing, and make the appends' p99 1.5 ms
-rather than 1.0.
+Normalizing, planning, pinning, merging and freeing then never run for much more
+than 1.5 ms at a time, and a lookup waits for what is left of the slice in which it
+comes due: half of one at the median, and about a whole one at the p99. The
+appends' slices run 1.0 to 1.1 ms; the random updates' p99 and max come from their
+merge's slices, which run up to 1.3 ms on an idle machine, since 4,096 units of
+their merge, between two looks at the clock, take 180 µs, and up to 1.5 ms on a busy
+one. The simulated disk copies a request's pages in at most 0.25 ms. The rest of a
+commit is short: the merge lists the nodes it builds as it goes, in page order, so
+the commit needn't find them in the new version and sort them by page, which took
+the random updates' 19,700 nodes another 0.7 ms after the merge's last slice; and
+freeing the nodes the commit replaced, 0.8 ms of work, pauses. Over 35 alternating
+runs on a machine kept busy by other work, doing both at once made the random
+updates' max 1.57 ms at the median rather than 1.50, and 16 runs rather than 5
+reached 1.6 to 2.5 ms. Checking a write's keys against the limit doesn't read its
+batch: reading 1M operations would take 1 ms, right before the first slice of
+normalizing, and make the appends' p99 1.5 ms rather than 1.0.
 
 A pause is a trip through the runtime, about 15 µs on an Apple M5 Pro, which is
 why slices are measured in time: a fixed amount of work takes ten times longer in
@@ -482,13 +488,15 @@ nothing.
 Every `write()` ends with a commit, its own or its group's (§6), that makes its
 batch durable in one atomic step.
 
-1. List the new version's dirty nodes. The merge sealed each as it built it,
-   stamping the generation and the checksum, and gave it its page, so they can be
-   written in any order.
-2. Sort them by page, and write each run of adjacent pages with one vectored write
-   of up to 1 MiB, 16 writes at a time. Await every write, then `sync_data`.
-   Allocation hands a write its pages in runs (see below), so a commit takes a few
-   large requests rather than one per page.
+1. Take the new version's dirty nodes, which the merge listed as it built them. It
+   sealed each, stamping the generation and the checksum, and gave it its page, so
+   they can be written in any order. It keeps one list for the pages likely to be
+   replaced soon and one for those likely to stay (see below), each in the order
+   it built them, which is page order: each kind takes its pages in order.
+2. Write them in page order, merging the two lists: each run of adjacent pages with
+   one vectored write of up to 1 MiB, 16 writes at a time. Await every write, then
+   `sync_data`. Allocation hands a write its pages in runs (see below), so a commit
+   takes a few large requests rather than one per page.
 3. Write the meta page into slot `(gen + 1) % 2`, then `sync_data`. The commit is
    durable.
 4. Publish the new root. The written leaves become evictable, and the pages this
@@ -498,6 +506,8 @@ batch durable in one atomic step.
    durable, still matters, and no version a reader holds uses a page past the
    mark. If the cut fails, the file stays longer than it needs to be until a later
    commit cuts it.
+6. Free the pages that no reader needs any more, a slice at a time (§6, §8). Then
+   the write returns.
 
 A write keeps the leaves it changes and the ones it builds in memory until it
 publishes, so a batch larger than the cache budget grows the pool past it. Writing
@@ -643,7 +653,11 @@ completed write.
   published and no reader that started before the publish is still alive (such a
   reader might still need to read it). Iterators always register as readers;
   point reads register only when they have to wait for I/O. Reclaiming a node's
-  pages evicts any stale cache entry for it, under its page id.
+  pages evicts any stale cache entry for it, under its page id. Once published, a
+  write reclaims what it can a slice at a time, as it merges (§6), and returns when
+  it is done. A reader that ends can't pause: it reclaims what it held back at
+  once, unless a write paused reclaiming, whose next slices take that too. A write
+  dropped while it reclaims reclaims the rest at once.
 - **Capacity.** On BookKeeper-shaped data, dense leaves take ~5 B/entry, so a 1 GiB
   cache holds roughly 200M entries. Slotted leaves, at ~26 B/entry, would hold
   roughly 40M.

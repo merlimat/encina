@@ -48,17 +48,18 @@ use crate::space::{Life, Space};
 /// children, so real trees stay far shallower.
 pub(crate) const MAX_HEIGHT: usize = 32;
 
-/// How long a write normalizes, plans or merges its batch, or loads the leaves it
-/// changes, before it pauses, so that it can let the other tasks run. A pause
-/// costs a trip through the runtime, about 15 µs on an Apple M5 Pro, so much
-/// shorter slices would slow writes down.
+/// How long a write normalizes, plans or merges its batch, loads the leaves it
+/// changes, or frees the pages of the nodes it replaced, before it pauses, so that
+/// it can let the other tasks run. A pause costs a trip through the runtime, about
+/// 15 µs on an Apple M5 Pro, so much shorter slices would slow writes down.
 const SLICE: Duration = Duration::from_millis(1);
 
 /// The work a write does between looks at the clock: operations its normalizing
-/// lists, compares or moves, nodes its planning visits, leaves it pins, and
-/// entries its merge copies, merges and builds, and nodes it visits. On an Apple
-/// M5 Pro, 4,096 units of merging take about 25 µs of a sorted load, and 180 µs of
-/// random updates, whose operations lie scattered in the batch's memory.
+/// lists, compares or moves, nodes its planning visits, leaves it pins, entries
+/// its merge copies, merges and builds, nodes the merge visits, and nodes whose
+/// pages it frees. On an Apple M5 Pro, 4,096 units of merging take about 25 µs of a
+/// sorted load, and 180 µs of random updates, whose operations lie scattered in the
+/// batch's memory.
 const CHECK: usize = 4096;
 
 /// The work planning counts for a node it visits, so that it looks at the clock
@@ -71,6 +72,11 @@ const VISIT: usize = 64;
 /// looks at the clock every 256 leaves: about 20 µs on an Apple M5 Pro, when they
 /// are cached.
 const PIN: usize = 16;
+
+/// The work a write counts for a node it replaced whose pages it frees once it has
+/// published, so that it looks at the clock every 256 nodes: about 11 µs on an
+/// Apple M5 Pro.
+const FREE: usize = 16;
 
 /// A version's root node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,8 +105,8 @@ impl Pages {
     /// Builds entries `a..b` of `src` into a new node at `level`, on a new page,
     /// sealed as written by `generation`. The node is dirty until its write
     /// publishes. A leaf goes into the cache, holding a reference until then; an
-    /// internal node's one reference goes to the caller. Returns the node's frame
-    /// ([`NO_FRAME`] for a leaf), page, and bytes used.
+    /// internal node's one reference goes to the caller. Returns the node's frame,
+    /// page, and bytes used.
     fn build(
         &mut self,
         level: u8,
@@ -120,11 +126,10 @@ impl Pages {
         let used = node::build(self.pool.page_mut(frame), level, src, a, b);
         node::seal(self.pool.page_mut(frame), generation);
         self.pool.frame_mut(frame).dirty = true;
-        if level > 0 {
-            return (frame, page, used);
+        if level == 0 {
+            self.cache.insert(page, frame);
         }
-        self.cache.insert(page, frame);
-        (NO_FRAME, page, used)
+        (frame, page, used)
     }
 
     /// The cached frame of a leaf page.
@@ -164,8 +169,10 @@ pub(crate) struct Tree {
     pub(crate) pinned: Vec<FrameId>,
     /// Pages the version the write in progress builds no longer uses.
     dropped: Vec<u64>,
-    /// The nodes of that version that need writing: frame and page.
-    pub(crate) dirty: Vec<(FrameId, u64)>,
+    /// The nodes of that version that need writing, frame and page, for each
+    /// [`Life`] of their pages: in the order the write built them, which is page
+    /// order, since each life takes its pages in order.
+    pub(crate) dirty: [Vec<(FrameId, u64)>; 2],
     /// The value leaves of that version that need writing: page id, and the put
     /// in the batch that holds the entry.
     pub(crate) values: Vec<(u64, u32)>,
@@ -181,6 +188,9 @@ pub(crate) struct Tree {
     visits: [Visit; MAX_HEIGHT],
     leaf: LeafMerge,
     budget: Budget,
+    /// Whether the write in progress paused freeing the pages of the nodes it
+    /// replaced: a reader that ends meanwhile leaves the pages it held back to it.
+    reclaiming: bool,
 }
 
 enum Outcome {
@@ -399,7 +409,7 @@ impl Tree {
             touched: Vec::new(),
             pinned: Vec::new(),
             dropped: Vec::new(),
-            dirty: Vec::new(),
+            dirty: [Vec::new(), Vec::new()],
             values: Vec::new(),
             pending: None,
             added: 0,
@@ -408,6 +418,7 @@ impl Tree {
             visits: [Visit::default(); MAX_HEIGHT],
             leaf: LeafMerge::default(),
             budget: Budget::new(),
+            reclaiming: false,
         }
     }
 
@@ -442,7 +453,11 @@ impl Tree {
             self.release(root.frame);
         }
         self.pages.space.remove_reader(version.generation);
-        self.reclaim();
+        // A reader doesn't pause: the pages it held back are freed at once, unless
+        // a write paused freeing pages, whose next slices free them too.
+        if !self.reclaiming {
+            self.reclaim_all();
+        }
     }
 
     /// Drops a reference to an internal node's frame. A frame that loses its last
@@ -471,15 +486,35 @@ impl Tree {
     }
 
     /// Frees the pages replaced by versions no reader needs any more, evicting
-    /// any copies cached, value leaves' included.
-    fn reclaim(&mut self) {
+    /// any copies cached, value leaves' included. A commit ends with this, once it
+    /// has published its version: like [`apply`](Self::apply), it pauses after each
+    /// slice of work, returning `Pending`, and calling it again goes on, once the
+    /// write [`resume`](Self::resume)s. Its first slice goes on with the one in
+    /// which the write published.
+    pub(crate) fn reclaim(&mut self) -> Poll<()> {
         let Pages { pool, cache, space } = &mut self.pages;
-        space.reclaim(|page| {
-            if let Some(frame) = cache.remove(page) {
-                debug_assert_eq!(pool.refs(frame), 0, "reclaimed leaf {page} in use");
-                pool.free(frame);
+        let mut reclaimed = space.reclaim();
+        loop {
+            if self.budget.spent() {
+                self.reclaiming = true;
+                return Poll::Pending;
             }
-        });
+            let Some(page) = reclaimed.next() else {
+                self.reclaiming = false;
+                return Poll::Ready(());
+            };
+            self.budget.work += FREE;
+            uncache(pool, cache, page);
+        }
+    }
+
+    /// Like [`reclaim`](Self::reclaim), but at once.
+    pub(crate) fn reclaim_all(&mut self) {
+        self.reclaiming = false;
+        let Pages { pool, cache, space } = &mut self.pages;
+        for page in space.reclaim() {
+            uncache(pool, cache, page);
+        }
     }
 
     // Reads.
@@ -866,7 +901,7 @@ impl Tree {
     }
 
     /// Starts the next slice of the write in progress, which paused loading its
-    /// leaves.
+    /// leaves, or freeing the pages of the nodes it replaced.
     pub(crate) fn resume(&mut self) {
         self.budget.start();
     }
@@ -883,55 +918,28 @@ impl Tree {
         }
     }
 
-    /// Lists in `dirty` the nodes of the pending version that need writing: those
-    /// it doesn't share with the current one. They are sealed already.
-    pub(crate) fn collect_pending(&mut self) {
-        self.dirty.clear();
-        if let Some(Some(root)) = self.pending {
-            self.collect_built(usize::from(root.level), root.frame, root.page);
-        }
-    }
-
-    /// Lists in `dirty` the node at `level`, on `frame` and `page`, if the write in
-    /// progress built it, and the nodes it built below it.
-    fn collect_built(&mut self, level: usize, frame: FrameId, page: u64) {
-        if level > 0 {
-            if self.pages.pool.frame(frame).dirty {
-                self.collect_dirty(frame, page);
+    /// The node that the pending version needs written with the lowest page, of
+    /// those past the first `next[l]` of each [`Life`] `l`: its life, frame and
+    /// page.
+    pub(crate) fn next_dirty(&self, next: [usize; 2]) -> Option<(usize, FrameId, u64)> {
+        let [short, long] = [0, 1].map(|life| self.dirty[life].get(next[life]));
+        match (short, long) {
+            (Some(&(frame, page)), long) if long.is_none_or(|&(_, other)| page < other) => {
+                Some((0, frame, page))
             }
-        } else if let Some(leaf) = self.pages.cached(page)
-            && self.pages.pool.frame(leaf).dirty
-        {
-            // Leaves this write built are cached until it ends, so an uncached leaf
-            // is one it kept.
-            self.dirty.push((leaf, page));
+            (_, Some(&(frame, page))) => Some((1, frame, page)),
+            _ => None,
         }
     }
 
-    fn collect_dirty(&mut self, frame: FrameId, page: u64) {
-        self.dirty.push((frame, page));
-        // SAFETY: the nodes this write built stay put until it ends.
-        let node = unsafe { Node::new(self.pages.pool.page_unbounded(frame)) };
-        for i in 0..node.count() {
-            let page = node.child_page(i);
-            if node.level() == 1 {
-                if let Some(leaf) = self.pages.cached(page)
-                    && self.pages.pool.frame(leaf).dirty
-                {
-                    self.dirty.push((leaf, page));
-                }
-            } else if self.pages.pool.frame(node.child(i)).dirty {
-                self.collect_dirty(node.child(i), page);
-            }
-        }
-    }
-
-    /// Makes the pending version current, as `generation`, once committed.
+    /// Makes the pending version current, as `generation`, once committed. Then
+    /// [`reclaim`](Self::reclaim) frees the pages of the nodes it replaced.
     pub(crate) fn publish(&mut self, generation: u64) {
+        self.budget.start();
         self.unpin_touched();
         let root = self.pending.take().expect("no pending version");
         let pool = &mut self.pages.pool;
-        for &(frame, _) in &self.dirty {
+        for &(frame, _) in self.dirty.iter().flatten() {
             let info = pool.frame_mut(frame);
             info.dirty = false;
             if info.holds == Holds::Leaf {
@@ -939,7 +947,7 @@ impl Tree {
                 pool.unref(frame);
             }
         }
-        self.dirty.clear();
+        self.dirty.iter_mut().for_each(Vec::clear);
         self.values.clear();
         if let Some(old) = mem::replace(&mut self.root, root)
             && old.frame != NO_FRAME
@@ -950,7 +958,6 @@ impl Tree {
             self.pages.space.drop_node(generation, page);
         }
         self.generation = generation;
-        self.reclaim();
     }
 
     /// Throws away the version the write in progress builds, whether pending or
@@ -960,7 +967,6 @@ impl Tree {
         self.abort_merge();
         self.unpin_touched();
         self.dropped.clear();
-        self.collect_pending();
         let Some(root) = self.pending.take() else {
             return;
         };
@@ -970,29 +976,14 @@ impl Tree {
         }
     }
 
-    /// Throws away a merge that paused, if any. The nodes it built are in its lists,
-    /// or below the nodes there, and so are its references to internal nodes.
+    /// Throws away a merge that paused, if any. The nodes it built are in `dirty`,
+    /// and its references to internal nodes are in its lists, or below the nodes
+    /// there.
     fn abort_merge(&mut self) {
         if self.phase == Phase::Idle {
             return;
         }
-        // Collect the nodes it built.
-        self.dirty.clear();
-        for level in 0..self.lists.len() {
-            for k in 0..self.lists[level].len() {
-                let item = self.lists[level].items[k];
-                if item.is_built() {
-                    self.collect_built(level, item.frame, item.page);
-                } else if item.fresh && level > 0 {
-                    for e in item.start as usize..item.end as usize {
-                        let child = self.lists[level].entries.value(e);
-                        let (frame, page) = (node::child_frame(child), node::child_page(child));
-                        self.collect_built(level - 1, frame, page);
-                    }
-                }
-            }
-        }
-        // Free the leaves among them. Letting go of the references frees the
+        // Free the leaves it built. Letting go of the references frees the
         // internal nodes.
         self.free_built_leaves();
         for level in 1..self.lists.len() {
@@ -1016,10 +1007,10 @@ impl Tree {
     }
 
     /// Frees the leaves the write in progress built: those listed in `dirty`, and
-    /// its value leaves. Empties both lists.
+    /// its value leaves. Empties those lists.
     fn free_built_leaves(&mut self) {
         let Pages { pool, cache, space } = &mut self.pages;
-        for &(frame, page) in &self.dirty {
+        for &(frame, page) in self.dirty.iter().flatten() {
             if pool.frame(frame).holds == Holds::Leaf {
                 cache.remove(page);
                 pool.unref(frame);
@@ -1027,7 +1018,7 @@ impl Tree {
                 space.free(page);
             }
         }
-        self.dirty.clear();
+        self.dirty.iter_mut().for_each(Vec::clear);
         for (page, _) in self.values.drain(..) {
             let first = node::first_page(page);
             for page in first..first + node::span(page) {
@@ -1560,7 +1551,8 @@ impl Tree {
     }
 
     /// Builds node `i` of `lists[level]`, which this write added, into a page of its
-    /// own. An internal node takes over the references its entries hold.
+    /// own, and lists it in `dirty`. An internal node takes over the references its
+    /// entries hold.
     fn build_node(&mut self, level: usize, i: usize) {
         let list = &mut self.lists[level];
         let item = list.items[i];
@@ -1579,7 +1571,14 @@ impl Tree {
             self.pages
                 .build(level as u8, &list.entries, a, b, item.life, generation);
         debug_assert_eq!(used, item.used as usize);
-        list.built(i, frame, page);
+        // A leaf is found through the cache.
+        list.built(i, if level > 0 { frame } else { NO_FRAME }, page);
+        let built = &mut self.dirty[item.life as usize];
+        debug_assert!(
+            built.last().is_none_or(|&(_, last)| last < page),
+            "page {page} taken out of order"
+        );
+        built.push((frame, page));
         self.budget.work += b - a;
     }
 
@@ -1807,13 +1806,28 @@ impl Tree {
             if child.frame != NO_FRAME {
                 self.pages.pool.retain(child.frame);
             }
-            if !self.pages.pool.frame(root.frame).dirty {
+            if self.pages.pool.frame(root.frame).dirty {
+                // This write built it, short-lived as internal nodes are: releasing
+                // it frees its page, and it isn't written.
+                let built = &mut self.dirty[Life::Short as usize];
+                let at = built.iter().rposition(|&(_, page)| page == root.page);
+                built.remove(at.expect("a node built but not listed"));
+            } else {
                 self.dropped.push(root.page);
             }
             self.release(root.frame);
             root = child;
         }
         Some(Some(root))
+    }
+}
+
+/// Evicts the copy cached, if any, of the node with page id `page`, whose pages
+/// were reclaimed.
+fn uncache(pool: &mut Pool, cache: &mut Cache, page: u64) {
+    if let Some(frame) = cache.remove(page) {
+        debug_assert_eq!(pool.refs(frame), 0, "reclaimed leaf {page} in use");
+        pool.free(frame);
     }
 }
 
@@ -2113,7 +2127,8 @@ impl Tree {
             let first = node::first_page(page);
             assert!(space.is_used(first), "cached leaf {page} on a free page");
         }
-        assert!(self.pinned.is_empty() && self.dirty.is_empty() && self.pending.is_none());
+        assert!(self.pinned.is_empty() && self.pending.is_none() && !self.reclaiming);
+        assert!(self.dirty.iter().all(Vec::is_empty));
         assert!(self.phase == Phase::Idle, "a merge was left halfway");
         assert!(self.values.is_empty());
     }
