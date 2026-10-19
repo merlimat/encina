@@ -13,8 +13,9 @@
 // limitations under the License.
 
 //! Checks that reads and iteration over cached pages, and writes from a reused
-//! batch, don't allocate. The simulated disk doesn't either, once warm; compio
-//! allocates per operation on a real one.
+//! batch, don't allocate, and that a new batch takes room for its points at once.
+//! The simulated disk doesn't allocate either, once warm; compio allocates per
+//! operation on a real one.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -22,6 +23,7 @@ use std::pin::pin;
 
 use crate::sim::SimDisk;
 use crate::tests::{now, poll};
+use crate::tree::Budget;
 use crate::{Comparison, Db, Options, WriteBatch};
 
 struct CountingAllocator;
@@ -318,4 +320,17 @@ fn reading_a_value_leaf_too_large_to_cache_allocates_its_buffer_only() {
     // An iterator reuses its buffer for the next value leaf no larger.
     scan_values(&db, 20_000);
     assert_eq!(allocations(|| scan_values(&db, 20_000)), 1);
+}
+
+#[test]
+fn a_new_batch_takes_room_for_its_points_at_once() {
+    // Sorted, so that normalizing it needs no scratch buffer: room for the points,
+    // and for the end of their one run.
+    let mut batch = WriteBatch::new();
+    for i in 0..100_000u64 {
+        batch.put(&i.to_be_bytes(), &[1]);
+    }
+    let mut budget = Budget::fixed(usize::MAX);
+    budget.start();
+    assert_eq!(allocations(|| assert!(batch.prepare(&mut budget))), 2);
 }

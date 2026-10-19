@@ -268,6 +268,9 @@ impl WriteBatch {
             match step {
                 Step::Start => {
                     points.clear();
+                    // Room for all the points at once: growing as it lists them would
+                    // copy those listed so far, up to megabytes within a slice.
+                    points.reserve(ops.len());
                     ranges.clear();
                     by_start.clear();
                     covering.clear();
@@ -391,6 +394,10 @@ fn slice(bytes: &[u8], at: u32, len: u32) -> &[u8] {
 /// unsorted.
 const MIN_RUN: usize = 4096;
 
+/// How many items of its scratch buffer a sort zeroes at a time: 16 KiB, a page of
+/// memory on an Apple M5 Pro.
+const ZEROED: usize = 4096;
+
 /// Sorts `items`, operations in the order they were added, by `key`, keeping that
 /// order among equal keys, with `scratch` and `run_ends` as scratch space. It
 /// finds the runs of items sorted already, extending short ones to `min_run`
@@ -447,11 +454,24 @@ fn sort<'k>(
         }
         if s.j < n {
             run_ends.push(n as u32);
+            s.j = n;
         }
         if run_ends.len() == 1 {
             return true;
         }
-        scratch.resize(n, 0);
+        // The scratch buffer takes `n` items. Those past its length are zeroed a
+        // page at a time: a new batch's memory takes most of a slice to zero by the
+        // megabyte.
+        scratch.truncate(n);
+        scratch.reserve(n - scratch.len());
+        while scratch.len() < n {
+            if budget.spent() {
+                return false;
+            }
+            let len = n.min(scratch.len() + ZEROED);
+            budget.work += len - scratch.len();
+            scratch.resize(len, 0);
+        }
         (s.merging, s.i, s.j) = (true, 0, run_ends[0] as usize);
     }
     loop {
@@ -824,6 +844,34 @@ mod tests {
             prepare_in_slices(&mut group, slice);
             assert_eq!((group.points().to_vec(), group.ranges().to_vec()), expected);
         }
+    }
+
+    #[test]
+    fn a_new_batch_zeroes_its_scratch_buffer_a_page_at_a_time() {
+        // A new batch of 20,000 points out of order: the sort zeroes the scratch
+        // buffer it merges them into a slice at a time.
+        let n = 20_000;
+        let mut batch = WriteBatch::new();
+        for i in 0..n as u32 {
+            batch.put(&i.wrapping_mul(0x9e37_79b9).to_be_bytes(), &[1]);
+        }
+        let expected = prepared_at_once(&batch);
+        let mut budget = Budget::fixed(ZEROED);
+        let mut zeroing = 0;
+        loop {
+            budget.start();
+            if batch.prepare(&mut budget) {
+                break;
+            }
+            if let Step::SortPoints(s) = batch.step
+                && !s.merging
+                && s.i == n
+            {
+                zeroing += 1;
+            }
+        }
+        assert!(zeroing >= n / ZEROED, "paused {zeroing} times zeroing");
+        assert_eq!((batch.points().to_vec(), batch.ranges().to_vec()), expected);
     }
 
     fn points(batch: &WriteBatch) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {

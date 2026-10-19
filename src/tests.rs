@@ -3115,6 +3115,37 @@ fn a_write_dropped_while_its_merge_pauses_changes_nothing() {
 }
 
 #[test]
+fn a_merge_counts_scattered_operations_as_more_work() {
+    // The same updates, in key order, then put in an order that scatters each
+    // leaf's operations in the batch. In slices of 32 units, the second merge
+    // pauses after each operation.
+    let n = 2000;
+    let orders: [Vec<u32>; 2] = [(0..n).collect(), (0..n).map(|i| i * 7 % n).collect()];
+    let mut pauses = [0; 2];
+    for (order, pauses) in orders.iter().zip(&mut pauses) {
+        let (store, mut model) = store_of(n);
+        store.db.set_merge_slice(Some(32));
+        let ops: Vec<_> = order.iter().map(|&i| put_op(i, 2)).collect();
+        let mut batch = batch_of(&ops);
+        let mut write = Box::pin(store.db.write(&mut batch));
+        pause_merging(&store.db, write.as_mut());
+        while store.db.tree().merging() {
+            assert!(poll_once(write.as_mut()).is_pending());
+            *pauses += 1;
+        }
+        while poll_once(write.as_mut()).is_pending() {}
+        apply(&mut model, &ops);
+        assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+        store.db.check();
+    }
+    let [sorted, scattered] = pauses;
+    assert!(
+        sorted < n / 4 && scattered >= n,
+        "{sorted} and {scattered} pauses"
+    );
+}
+
+#[test]
 fn a_write_dropped_while_it_plans_changes_nothing() {
     // Three levels of 256-byte pages, whose planning pauses.
     let store = Store::new(Options::new().page_size(256));
