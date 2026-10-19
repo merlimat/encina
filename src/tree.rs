@@ -58,8 +58,8 @@ const SLICE: Duration = Duration::from_millis(1);
 /// lists, compares or moves, nodes its planning visits, leaves it pins, entries
 /// its merge copies, merges and builds, nodes the merge visits, and nodes whose
 /// pages it frees. On an Apple M5 Pro, 4,096 units of merging take about 25 µs of a
-/// sorted load, and 180 µs of random updates, whose operations lie scattered in the
-/// batch's memory.
+/// sorted load, and no longer of random updates, whose operations count as
+/// [`SCATTERED`] units each.
 const CHECK: usize = 4096;
 
 /// The work planning counts for a node it visits, so that it looks at the clock
@@ -67,6 +67,13 @@ const CHECK: usize = 4096;
 /// whose keys lie scattered in the memory of an unsorted batch: on an Apple M5
 /// Pro, it takes up to 2 µs of random updates.
 const VISIT: usize = 64;
+
+/// The work a merge counts for an operation it applies to a leaf whose operations
+/// don't come one after another in the batch, as a sorted batch's do, judging by
+/// the first two. Those of an unsorted batch lie scattered in its memory, and
+/// reading each one misses the cache: on an Apple M5 Pro, that takes as long as
+/// about 20 units of a sorted load, and 30 on a busy machine.
+const SCATTERED: usize = 32;
 
 /// The work a write counts for a leaf it pins once it has planned, so that it
 /// looks at the clock every 256 leaves: about 20 µs on an Apple M5 Pro, when they
@@ -1318,6 +1325,12 @@ impl Tree {
     fn merge_entries(&mut self, m: &mut LeafMerge, node: Option<Node>, batch: &WriteBatch) -> bool {
         let old = node.map_or(0, |n| n.count());
         let (ops, ranges) = (m.ops.of(batch.points()), m.ranges.of(batch.ranges()));
+        // An operation counts as `SCATTERED` units rather than one, unless the first
+        // two come one after the other in the batch, as a sorted batch's do.
+        let weight = match ops {
+            [a, b, ..] if a.abs_diff(*b) != 1 => SCATTERED,
+            _ => 1,
+        };
         let max_entry = node::max_entry(self.page_size);
         // The rebuilt leaf's entries go after those of its rebuilt siblings, until
         // the parent builds them all.
@@ -1338,7 +1351,6 @@ impl Tree {
             if self.budget.spent() {
                 return false;
             }
-            self.budget.work += 1;
             let ord = match (*i < old, *j < ops.len()) {
                 (false, false) => break,
                 (true, false) => Ordering::Less,
@@ -1351,6 +1363,7 @@ impl Tree {
                     *r += 1;
                 }
                 if *r < ranges.len() && n.cmp_key(*i, batch.range_start(ranges[*r].0)).is_ge() {
+                    self.budget.work += 1;
                     *changed = true;
                     *i += 1;
                     continue;
@@ -1372,11 +1385,12 @@ impl Tree {
                 for k in *i..end {
                     leaf.push_from(&n, k);
                 }
-                self.budget.work += end - *i;
+                self.budget.work += 1 + end - *i;
                 *i = end;
                 continue;
             }
             let op = ops[*j];
+            self.budget.work += weight;
             *j += 1;
             if ord == Ordering::Equal {
                 // The existing entry is replaced or deleted.
