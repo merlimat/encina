@@ -31,6 +31,7 @@
 //! ends earlier.
 
 use std::collections::VecDeque;
+use std::iter;
 
 use crate::node;
 
@@ -304,22 +305,24 @@ impl Space {
         self.readers.swap_remove(i);
     }
 
-    /// Frees the pages of the dropped nodes that no reader can still need, passing
-    /// each node's page id to `freed`. A node dropped by generation `g` is needed by
-    /// readers of earlier generations.
-    pub(crate) fn reclaim(&mut self, mut freed: impl FnMut(u64)) {
+    /// The dropped nodes that no reader can still need, by page id, oldest first:
+    /// each node's pages are freed as it is yielded, and those not yielded stay
+    /// dropped. A node dropped by generation `g` is needed by readers of earlier
+    /// generations.
+    pub(crate) fn reclaim(&mut self) -> impl Iterator<Item = u64> + '_ {
         let oldest = self.readers.iter().copied().min().unwrap_or(u64::MAX);
-        while let Some(&(generation, id)) = self.dropped.front() {
+        iter::from_fn(move || {
+            let &(generation, id) = self.dropped.front()?;
             if generation > oldest {
-                break;
+                return None;
             }
             self.dropped.pop_front();
             let first = node::first_page(id);
             for page in first..first + node::pages(id) {
                 self.unmark(page);
             }
-            freed(id);
-        }
+            Some(id)
+        })
     }
 
     /// Pages dropped but not reclaimed yet.
@@ -491,14 +494,18 @@ mod tests {
         space.drop_node(6, value_leaf);
         space.drop_node(6, 8);
         let mut freed = Vec::new();
-        space.reclaim(|id| freed.push(id));
+        freed.extend(space.reclaim());
         assert!(freed.is_empty());
         space.remove_reader(4);
         space.add_reader(5);
-        space.reclaim(|id| freed.push(id));
+        freed.extend(space.reclaim());
         assert_eq!(freed, [7]);
         space.remove_reader(5);
-        space.reclaim(|id| freed.push(id));
+        // Those not taken stay dropped.
+        freed.extend(space.reclaim().take(1));
+        assert_eq!(freed, [7, value_leaf]);
+        assert!(space.is_used(8));
+        freed.extend(space.reclaim());
         assert_eq!(freed, [7, value_leaf, 8]);
         assert!([2, 3, 7, 8].iter().all(|&page| !space.is_used(page)));
     }
