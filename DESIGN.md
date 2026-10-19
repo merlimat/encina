@@ -312,7 +312,13 @@ doesn't allocate. The operations are applied in order and atomically.
    so sorted input (BookKeeper's write cache is sorted) costs one linear check, and
    a group of k sorted batches log2(k) passes. A run shorter than 4,096
    operations, as unsorted batches have, is first extended by sorting 4,096 at once
-   with the standard library's sort.
+   with the standard library's sort. The ranges are sorted by start the same way,
+   and the pass that keeps the last operation per key finds the later range that
+   covers it, if any: the ranges that start at or before the key and end after it
+   wait on a heap kept in the batch, the one added last on top, which comes off
+   once it ends at or before the key. For a group that appends 1M entries to 1,000
+   ledgers and deletes 500 older ones, normalizing takes 6 ms on an Apple M5 Pro,
+   where checking each key against every range that starts before it took 0.8 s.
 2. **Plan.** Descend the resident internal nodes to find the leaves the batch
    changes, and load the ones that aren't cached, keeping them pinned. Subtrees
    that ranges remove whole aren't read.
