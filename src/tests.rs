@@ -4004,7 +4004,8 @@ fn file_size_and_requests() {
 /// lookup of a random key is due every 20 µs: a lookup's latency runs from when it
 /// was due until it returns. Writes that never pause show what a merge costs them.
 /// It also counts the lookups that missed the cache, and reports the longest a
-/// lookup ran without pausing: its stretch.
+/// lookup ran without pausing (stretch), and the longest it ran in its last poll
+/// (last), in which it lets go of the version it pinned, if it did.
 ///
 /// - append: each write appends 1,000 entries to each of 1,000 ledgers.
 /// - random: each write updates 1M random keys.
@@ -4038,8 +4039,18 @@ fn read_latency_with_misses_during_a_load() {
 
 fn latency_header() {
     println!(
-        "{:<8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
-        "workload", "slice", "write", "lookups", "missed", "p50", "p99", "p99.9", "max", "stretch"
+        "{:<8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "workload",
+        "slice",
+        "write",
+        "lookups",
+        "missed",
+        "p50",
+        "p99",
+        "p99.9",
+        "max",
+        "stretch",
+        "last"
     );
 }
 
@@ -4089,15 +4100,17 @@ fn latency_during_writes(workload: &str, pause: bool, misses: bool) {
             let mut due = Instant::now();
             // The lookups waiting for the disk, with when each was due.
             let mut waiting: Vec<(Instant, Lookup)> = Vec::new();
-            let (mut missed, mut stretch) = (0u64, Duration::ZERO);
+            let (mut missed, mut stretch, mut last) = (0u64, Duration::ZERO, Duration::ZERO);
             while !done.get() || !waiting.is_empty() {
                 std::future::poll_fn(|cx| {
                     // Polls a lookup, and returns whether it waits.
                     let mut poll_lookup = |due: Instant, lookup: &mut Lookup| {
                         let start = Instant::now();
                         let polled = lookup.as_mut().poll(cx);
-                        stretch = stretch.max(start.elapsed());
+                        let ran = start.elapsed();
+                        stretch = stretch.max(ran);
                         if polled.is_ready() {
+                            last = last.max(ran);
                             latencies.borrow_mut().push(due.elapsed());
                         }
                         polled.is_pending()
@@ -4124,7 +4137,7 @@ fn latency_during_writes(workload: &str, pause: bool, misses: bool) {
                 .await;
                 yield_once().await;
             }
-            (missed, stretch)
+            (missed, stretch, last)
         }
     };
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -4150,7 +4163,7 @@ fn latency_during_writes(workload: &str, pause: bool, misses: bool) {
             batch
         })
         .collect();
-    let (elapsed, (missed, stretch)) = runtime.block_on(async {
+    let (elapsed, (missed, stretch, last)) = runtime.block_on(async {
         let reader = compio::runtime::spawn(reader);
         let mut elapsed = Duration::ZERO;
         for batch in &mut batches {
@@ -4169,7 +4182,7 @@ fn latency_during_writes(workload: &str, pause: bool, misses: bool) {
     let ms = |d: Duration| format!("{:.3} ms", d.as_secs_f64() * 1e3);
     let slice = if pause { "1 ms" } else { "never" };
     println!(
-        "{:<8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "{:<8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
         workload,
         slice,
         ms(elapsed),
@@ -4180,6 +4193,7 @@ fn latency_during_writes(workload: &str, pause: bool, misses: bool) {
         ms(at(0.999)),
         ms(*latencies.last().unwrap()),
         ms(stretch),
+        ms(last),
     );
 }
 
