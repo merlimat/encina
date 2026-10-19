@@ -245,14 +245,18 @@ pages count against the budget like any frame's, and the clock hand evicts it li
 any leaf. Value leaves take at most a quarter of the budget in all, so a large
 value never evicts the whole cache, and one larger than that quarter isn't cached:
 each read of it reads it into a buffer that the read allocates, or that an iterator
-keeps for the next one. Otherwise value leaves go through the table of reads in
-flight like any leaf (§8): concurrent misses share one read, iterators read value
-leaves ahead, and a cached one is read without allocating. The page frames a large
-frame evicts stay in the pool, which never shrinks, so memory can reach 1.25 times
-the budget when the pool has grown to it before value leaves take their quarter.
-A large frame's memory goes back to the allocator once it is evicted. A value leaf
-is cached under its page id, whose span bits set it apart from any ordinary leaf,
-and reclaiming its pages evicts it (§8).
+keeps for the next one. Keeping them within that quarter takes another value leaf's
+frame, which a clock hand of their own finds: it goes over the large frames only.
+With one hand over every frame, a lookup that missed on a value leaf walked it past
+all the others each time it came round, which, with 16K value leaves cached among
+40K other frames, took up to 0.15 ms (§6). Otherwise value leaves go through the
+table of reads in flight like any leaf (§8): concurrent misses share one read,
+iterators read value leaves ahead, and a cached one is read without allocating. The
+page frames a large frame evicts stay in the pool, which never shrinks, so memory
+can reach 1.25 times the budget when the pool has grown to it before value leaves
+take their quarter. A large frame's memory goes back to the allocator once it is
+evicted. A value leaf is cached under its page id, whose span bits set it apart from
+any ordinary leaf, and reclaiming its pages evicts it (§8).
 
 **Costs.** A value leaf rounds its entry up to whole pages: an entry just over the
 limit fills a bit more than a quarter of its page, and on average half a page per
@@ -282,20 +286,20 @@ apart.
 **Testing.** Format tests round-trip value leaves a page at a time, and spans in
 page ids. Cache tests check that concurrent misses on a value leaf share one read,
 that a cold scan reads value leaves ahead within the window and the value leaves'
-quarter of the budget, that a value leaf larger than that quarter is read each time,
-and that a value leaf whose pages are reclaimed leaves the cache, though the next
-one on those pages has the same page id. The model-based tests write values on both
-sides of the limit, alone, in groups and during scans, overwrite small values with
-large ones and back, cover value leaves with `delete_range`, and land every
-comparison on and beside them; the invariant checker counts each span's pages as
-live or free. A store whose value leaves are all damaged still takes writes around
-them, over them and across them, which shows that writes don't read them. A value of
-17 MiB takes 18 write requests. The failure tests inject an error at each operation
-of a scenario with value leaves, one of them larger than a request, and crash there.
-A read-only view whose value leaves the owner reuses gets `Error::Stale`. The
-allocation tests check that reading a cached value leaf allocates nothing, and that
-reading one too large to cache allocates its buffer and nothing else, which an
-iterator then reuses.
+quarter of the budget, that making room within that quarter passes no other frame,
+that a value leaf larger than that quarter is read each time, and that a value leaf
+whose pages are reclaimed leaves the cache, though the next one on those pages has
+the same page id. The model-based tests write values on both sides of the limit,
+alone, in groups and during scans, overwrite small values with large ones and back,
+cover value leaves with `delete_range`, and land every comparison on and beside
+them; the invariant checker counts each span's pages as live or free. A store whose
+value leaves are all damaged still takes writes around them, over them and across
+them, which shows that writes don't read them. A value of 17 MiB takes 18 write
+requests. The failure tests inject an error at each operation of a scenario with
+value leaves, one of them larger than a request, and crash there. A read-only view
+whose value leaves the owner reuses gets `Error::Stale`. The allocation tests check
+that reading a cached value leaf allocates nothing, and that reading one too large
+to cache allocates its buffer and nothing else, which an iterator then reuses.
 
 ## 6. Operations
 
@@ -400,11 +404,15 @@ none of those pages, which the next write frees before it merges, a slice at a
 time: no lookup runs longer than 0.06 ms in the poll in which it lets go of its
 version, 0.03 ms at the median of 25 runs. Freeing them then, which can't pause,
 took it 0.41 ms at the median for the 17K to 20K nodes a write replaced, and up to
-0.77 ms. The longest a lookup runs without pausing is 0.15 ms, when it misses and
-the clock hand looks for a value leaf's frame to evict, past the ordinary leaves.
-The lookups' latency is the same either way, 1.5 ms at the median, 2.5 ms at the
-p99 and 2.8 to 2.9 ms at most: a lookup that misses waits for what is left of the
-write's slice before its read, and for another slice after it.
+0.77 ms. The longest a lookup runs without pausing is 0.08 ms at the median of 25
+runs, down from 0.15 ms when the clock hand that looks for a value leaf's frame to
+evict went past the ordinary leaves' frames too (§5). What is left is the first time
+that hand goes round the value leaves, once they fill their quarter: each of the 16K
+is still marked as used from when it was read, so the hand clears them all before it
+finds one, in 70 µs; and the allocator, which now and then takes as long to give a
+large frame its memory. The lookups' latency is the same either way, 1.5 ms at the
+median, 2.5 ms at the p99 and 2.8 to 2.9 ms at most: a lookup that misses waits for
+what is left of the write's slice before its read, and for another slice after it.
 
 A pause is a trip through the runtime, about 15 µs on an Apple M5 Pro, which is
 why slices are measured in time: a fixed amount of work takes ten times longer in
@@ -663,7 +671,21 @@ completed write.
   eviction. Only clean, unpinned leaves can be evicted: a write pins the leaves it
   changes and the ones it builds until it publishes, and a reader pins the leaf it
   is on. Exposing cache numbers is left to a later metrics design. Value leaves
-  take at most a quarter of the budget (§5).
+  take at most a quarter of the budget, and have a clock hand of their own (§5).
+- **Writes larger than the cache** leave the clock hand nothing to evict, and the
+  pool grows past the budget (§7). Once a sweep has found nothing while a write
+  holds leaves, the hand looks at no more than 64 frames for each frame taken, until
+  the write publishes or is discarded: then it sweeps the whole pool again. It
+  still finds the leaves that readers let go of meanwhile, a step at a time.
+  Sweeping the whole pool twice for every frame made such a write quadratic in its
+  leaves. In the ignored test `writes_larger_than_the_cache`, a write of 1M random
+  updates to a store of 1M keys, through a cache of 16 MiB, looked at 664M frames
+  and took 2.50 s, against 0.33 s with a cache that holds everything. Now it looks
+  at 1.4M and takes 0.34 s, at the median of 6 runs. Either way, the pool grows to
+  26K frames: the 4K leaves the write changes, and the 22K it builds. With no write
+  in progress, every sweep looks at the whole pool: one finds nothing then only when
+  readers and internal nodes fill the cache, and stepping until the next write would
+  let the pool grow while there are leaves to evict.
 - **Misses** read the page straight into a free frame (direct I/O) and verify the
   checksum. Concurrent misses on the same page share one read, and iterators read
   ahead (below). A frame left behind by a cancelled read is reclaimed by the clock
@@ -918,6 +940,13 @@ complete without suspending.
   reused once the read finishes. They also hold a write's leaf read while a second
   write queues up: when the first then fails its commit, the second gets
   `Error::Failed`.
+- **Leaf cache:** tests drive the clock hands over a pool directly. Making room
+  for a value leaf passes no other frame. While a write holds every frame, the hand
+  looks a step ahead for each frame taken, still finds a leaf that a reader lets go
+  of, and sweeps the whole pool again once the write lets go; with no write in
+  progress, every sweep looks at the whole pool. A write larger than a cache of 16
+  pages looks at fewer than 64 frames for each frame of the pool, and the invariant
+  checker asserts that no write holds leaves once writes are done.
 - **Group commit:** the simulated disk can also hold syncs and cuts, so that writes
   queue up behind a commit. Tests check that a group commits once, applying its
   batches in order, a later batch's puts and ranges overriding an earlier one's;
@@ -981,7 +1010,8 @@ complete without suspending.
 - **Benchmarks** against RocksDB on the BookKeeper workload: sorted batches over
   *A* active ledgers, random point reads, floor lookups, and `delete_range` of old
   ledgers. On the simulated disk, an ignored test measures the file's size and the
-  write requests per commit of that load and of random updates (§7).
+  write requests per commit of that load and of random updates (§7), and another
+  writes larger than the cache (§8).
 
 ## 12. Milestones
 
