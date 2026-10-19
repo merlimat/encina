@@ -913,8 +913,9 @@ fn iterators_keep_their_version() {
         seen += 1;
     }
     assert_eq!(seen, 200);
+    // Dropping the iterator lets go of the old version, whose pages the next write
+    // frees.
     drop(iter);
-    // Dropping the iterator freed the old version.
     store.db.check();
     assert_eq!(scan(&store.db, ALL).len(), 100);
 }
@@ -2441,6 +2442,28 @@ fn value_leaves_take_at_most_a_quarter_of_the_cache() {
 }
 
 #[test]
+fn a_write_larger_than_the_cache_looks_at_few_frames_for_each() {
+    // A cache of 16 pages, and a write that pins hundreds of leaves, whose values
+    // differ, and builds as many. Once it holds every frame, the clock hand looks a
+    // step ahead for each frame the pool grows by, rather than at the whole pool.
+    let store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
+    let puts = |round: u32| -> Vec<_> {
+        (0..20_000u32)
+            .map(|i| Op::Put(i.to_be_bytes().to_vec(), (i ^ round).to_le_bytes().to_vec()))
+            .collect()
+    };
+    write(&store.db, &puts(0));
+    let looked = store.db.tree().pages.cache.looked;
+    write(&store.db, &puts(1));
+    let tree = store.db.tree();
+    let frames = tree.pages.pool.slots();
+    assert!(frames > 500, "the write fit in the cache");
+    assert!(tree.pages.cache.looked - looked < crate::cache::STEP * frames);
+    drop(tree);
+    store.db.check();
+}
+
+#[test]
 fn a_cached_value_leaf_leaves_the_cache_with_its_pages() {
     let store = Store::new(Options::new().page_size(256));
     let key = b"k".to_vec();
@@ -3203,20 +3226,25 @@ fn a_write_frees_the_pages_it_replaced_a_slice_at_a_time() {
     write(&store.db, &load);
     apply(&mut model, &load);
     store.db.set_merge_slice(Some(4));
-    // One write runs to its end, the next is dropped while it frees the pages.
-    for (round, drop_it) in [(2, false), (3, true)] {
+    let left = || store.db.tree().pages.space.dropped().count();
+    // One write runs to its end, the next is dropped while it frees the pages, and
+    // the one after frees the rest before it merges.
+    for (round, drop_it) in [(2, false), (3, true), (4, false)] {
         let ops: Vec<_> = (0..2000)
             .step_by(3)
             .map(|i| scattered_put(i, round))
             .collect();
         let mut batch = batch_of(&ops);
         let mut write = Box::pin(store.db.write(&mut batch));
+        if round == 4 {
+            pause_merging(&store.db, write.as_mut());
+            assert_eq!(left(), 0);
+        }
         let start = generation(&store.db);
         while generation(&store.db) == start {
             assert!(poll_once(write.as_mut()).is_pending());
         }
         // Published, it pauses after each slice of the pages it frees.
-        let left = || store.db.tree().pages.space.dropped().count();
         let before = left();
         assert!(poll_once(write.as_mut()).is_pending());
         assert!(0 < left() && left() < before, "{} of {before} left", left());
@@ -3225,15 +3253,62 @@ fn a_write_frees_the_pages_it_replaced_a_slice_at_a_time() {
         drop(store.db.range(..));
         assert_eq!(left(), before);
         if drop_it {
-            // It frees what is left at once.
             drop(write);
+            assert_eq!(left(), before);
         } else {
             now(write).unwrap();
+            assert_eq!(left(), 0);
         }
         store.db.check();
         apply(&mut model, &ops);
         assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
     }
+}
+
+#[test]
+fn a_reader_leaves_the_pages_it_held_back_to_the_next_write() {
+    // On 256-byte pages, each write replaces hundreds of leaves. A twin store takes
+    // the same writes, with no reader to hold pages back.
+    let opts = Options::new().page_size(256);
+    let (store, twin) = (Store::new(opts.clone()), Store::new(opts));
+    let load: Vec<_> = (0..2000).map(|i| scattered_put(i, 1)).collect();
+    let update = |round| -> Vec<_> {
+        (0..2000)
+            .step_by(3)
+            .map(|i| scattered_put(i, round))
+            .collect()
+    };
+    for db in [&store.db, &twin.db] {
+        write(db, &load);
+        db.set_merge_slice(Some(4));
+    }
+    // A reader holds back the pages of the nodes the next write replaces.
+    let reader = store.db.range(..);
+    for db in [&store.db, &twin.db] {
+        write(db, &update(2));
+    }
+    let left = || store.db.tree().pages.space.dropped().count();
+    let held = left();
+    assert!(held > 0);
+    // Ending, it frees none of them.
+    drop(reader);
+    assert_eq!(left(), held);
+    store.db.check();
+    // The next write frees them before it merges, a slice at a time.
+    let ops = update(3);
+    let mut batch = batch_of(&ops);
+    let mut next = Box::pin(store.db.write(&mut batch));
+    while left() == held {
+        assert!(poll_once(next.as_mut()).is_pending());
+    }
+    assert!(left() > 0, "freed at once");
+    pause_merging(&store.db, next.as_mut());
+    assert_eq!(left(), 0);
+    now(next).unwrap();
+    // So it takes the pages it would have if the reader had freed them.
+    write(&twin.db, &ops);
+    assert_eq!(store.db.tree().pages(), twin.db.tree().pages());
+    store.db.check();
 }
 
 /// Polls `write`, each poll stopping where it yields, until it pauses merging,
@@ -4025,6 +4100,60 @@ fn file_size_and_requests() {
     }
 }
 
+/// Measures writes larger than the cache, on the simulated disk with 4 KiB pages.
+/// A write pins the leaves it changes, and the leaves it builds, until it
+/// publishes, so the frame pool grows past the cache's budget. Run it with
+/// `cargo test --release -- --ignored --nocapture writes_larger_than_the_cache`.
+///
+/// One write loads 1M random keys, and another updates 1M random keys of those,
+/// with a cache of 16 MiB, and with one that holds everything. It reports how long
+/// each write took, the frames the clock hand looked at in the update, and the
+/// frames the pool grew to.
+#[test]
+#[ignore]
+fn writes_larger_than_the_cache() {
+    use std::time::Instant;
+
+    println!(
+        "{:<8} {:>9} {:>9} {:>9} {:>11} {:>9}",
+        "cache", "leaves", "load", "update", "looked", "frames"
+    );
+    for cache in [16 << 20, 1 << 30] {
+        let store = Store::new(Options::new().cache_size(cache));
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let keys: Vec<_> = (0..1_000_000)
+            .map(|_| entry_key(rng.next(), rng.next()))
+            .collect();
+        let mut batch = WriteBatch::new();
+        for key in &keys {
+            batch.put(key, &[0; 16]);
+        }
+        let start = Instant::now();
+        now(store.db.write(&mut batch)).unwrap();
+        let load = start.elapsed();
+        batch.clear();
+        for round in 0..1_000_000 {
+            let key = &keys[(rng.next() % keys.len() as u64) as usize];
+            batch.put(key, &location(round, round));
+        }
+        let looked = store.db.tree().pages.cache.looked;
+        let start = Instant::now();
+        now(store.db.write(&mut batch)).unwrap();
+        let update = start.elapsed();
+        let tree = store.db.tree();
+        let s = |d: std::time::Duration| format!("{:.3} s", d.as_secs_f64());
+        println!(
+            "{:<8} {:>9} {:>9} {:>9} {:>11} {:>9}",
+            format!("{} MiB", cache >> 20),
+            tree.leaves().len(),
+            s(load),
+            s(update),
+            tree.pages.cache.looked - looked,
+            tree.pages.pool.slots(),
+        );
+    }
+}
+
 /// Measures how long lookups wait while large writes merge, on the simulated disk
 /// with 4 KiB pages and a cache that holds everything, so that lookups only ever
 /// wait for the thread. The disk delays writes and syncs while the lookups run, as
@@ -4034,29 +4163,67 @@ fn file_size_and_requests() {
 /// A store of 2M BookKeeper-shaped entries takes writes of 1M entries each, while a
 /// lookup of a random key is due every 20 µs: a lookup's latency runs from when it
 /// was due until it returns. Writes that never pause show what a merge costs them.
+/// It also counts the lookups that missed the cache, and reports the longest a
+/// lookup ran without pausing (stretch), and the longest it ran in its last poll
+/// (last), in which it lets go of the version it pinned, if it did.
 ///
 /// - append: each write appends 1,000 entries to each of 1,000 ledgers.
 /// - random: each write updates 1M random keys.
 #[test]
 #[ignore]
 fn read_latency_during_a_load() {
-    println!(
-        "{:<8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
-        "workload", "slice", "write", "lookups", "p50", "p99", "p99.9", "max"
-    );
+    latency_header();
     for workload in ["append", "random"] {
         for pause in [false, true] {
-            latency_during_writes(workload, pause);
+            latency_during_writes(workload, pause, false);
         }
     }
 }
 
-fn latency_during_writes(workload: &str, pause: bool) {
+/// Like [`read_latency_during_a_load`]'s random updates that pause, with lookups
+/// that miss the cache. A lookup that misses pins the version it reads while it
+/// waits for the disk, and the pages that a write replaces meanwhile stay in use
+/// until it ends. Run it with
+/// `cargo test --release -- --ignored --nocapture read_latency_with_misses`.
+///
+/// The lookups read 50K entries of their own, whose values of 2 KiB are too large
+/// for a leaf: each has a value leaf, and the cache, of 256 MiB, keeps value leaves
+/// in a quarter of it, so that seven lookups in ten miss. The disk's leaf reads
+/// take 100 µs, and the next lookups don't wait for one that waits for the disk.
+#[test]
+#[ignore]
+fn read_latency_with_misses_during_a_load() {
+    latency_header();
+    latency_during_writes("random", true, true);
+}
+
+fn latency_header() {
+    println!(
+        "{:<8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "workload",
+        "slice",
+        "write",
+        "lookups",
+        "missed",
+        "p50",
+        "p99",
+        "p99.9",
+        "max",
+        "stretch",
+        "last"
+    );
+}
+
+/// Runs [`read_latency_during_a_load`]'s `workload`, with writes that `pause`, and
+/// lookups that read the ledgers' entries, or else, if they are to miss the
+/// cache, their own.
+fn latency_during_writes(workload: &str, pause: bool, misses: bool) {
     use std::cell::RefCell;
     use std::time::{Duration, Instant};
 
-    let (ledgers, preload, writes) = (1000u64, 2000u64, 3u64);
-    let store = Store::new(Options::new().cache_size(4 << 30));
+    let (ledgers, preload, writes, cold) = (1000u64, 2000u64, 3u64, 50_000u64);
+    let cache = if misses { 256 << 20 } else { 4 << 30 };
+    let store = Store::new(Options::new().cache_size(cache));
     store.disk.delay_writes();
     let db = store.db.clone();
     let mut batch = WriteBatch::new();
@@ -4069,6 +4236,15 @@ fn latency_during_writes(workload: &str, pause: bool) {
         }
         now(db.write(&mut batch)).unwrap();
     }
+    if misses {
+        // After the ledgers' entries.
+        batch.clear();
+        for i in 0..cold {
+            batch.put(&entry_key(ledgers, i), &[i as u8; 2048]);
+        }
+        now(db.write(&mut batch)).unwrap();
+        store.disk.delay_reads(Duration::from_micros(100));
+    }
     if !pause {
         db.set_merge_slice(Some(usize::MAX));
     }
@@ -4078,18 +4254,50 @@ fn latency_during_writes(workload: &str, pause: bool) {
     let reader = {
         let (db, done, latencies) = (db.clone(), done.clone(), latencies.clone());
         async move {
+            type Lookup = Pin<Box<dyn Future<Output = ()>>>;
             let mut rng = Rng(0x2545_f491_4f6c_dd1d);
             let interval = Duration::from_micros(20);
             let mut due = Instant::now();
-            while !done.get() {
-                while due <= Instant::now() {
-                    let key = entry_key(rng.next() % ledgers, rng.next() % preload);
-                    db.get(&key, Comparison::Equal, |_, _| ()).await.unwrap();
-                    latencies.borrow_mut().push(due.elapsed());
-                    due += interval;
-                }
+            // The lookups waiting for the disk, with when each was due.
+            let mut waiting: Vec<(Instant, Lookup)> = Vec::new();
+            let (mut missed, mut stretch, mut last) = (0u64, Duration::ZERO, Duration::ZERO);
+            while !done.get() || !waiting.is_empty() {
+                std::future::poll_fn(|cx| {
+                    // Polls a lookup, and returns whether it waits.
+                    let mut poll_lookup = |due: Instant, lookup: &mut Lookup| {
+                        let start = Instant::now();
+                        let polled = lookup.as_mut().poll(cx);
+                        let ran = start.elapsed();
+                        stretch = stretch.max(ran);
+                        if polled.is_ready() {
+                            last = last.max(ran);
+                            latencies.borrow_mut().push(due.elapsed());
+                        }
+                        polled.is_pending()
+                    };
+                    waiting.retain_mut(|(due, lookup)| poll_lookup(*due, lookup));
+                    while due <= Instant::now() {
+                        let key = if misses {
+                            entry_key(ledgers, rng.next() % cold)
+                        } else {
+                            entry_key(rng.next() % ledgers, rng.next() % preload)
+                        };
+                        let db = db.clone();
+                        let mut lookup: Lookup = Box::pin(async move {
+                            db.get(&key, Comparison::Equal, |_, _| ()).await.unwrap();
+                        });
+                        if poll_lookup(due, &mut lookup) {
+                            missed += 1;
+                            waiting.push((due, lookup));
+                        }
+                        due += interval;
+                    }
+                    Poll::Ready(())
+                })
+                .await;
                 yield_once().await;
             }
+            (missed, stretch, last)
         }
     };
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -4115,7 +4323,7 @@ fn latency_during_writes(workload: &str, pause: bool) {
             batch
         })
         .collect();
-    let elapsed = runtime.block_on(async {
+    let (elapsed, (missed, stretch, last)) = runtime.block_on(async {
         let reader = compio::runtime::spawn(reader);
         let mut elapsed = Duration::ZERO;
         for batch in &mut batches {
@@ -4126,8 +4334,7 @@ fn latency_during_writes(workload: &str, pause: bool) {
             yield_once().await;
         }
         done.set(true);
-        let _ = reader.await;
-        elapsed / writes as u32
+        (elapsed / writes as u32, reader.await.unwrap())
     });
     let mut latencies = latencies.take();
     latencies.sort_unstable();
@@ -4135,15 +4342,18 @@ fn latency_during_writes(workload: &str, pause: bool) {
     let ms = |d: Duration| format!("{:.3} ms", d.as_secs_f64() * 1e3);
     let slice = if pause { "1 ms" } else { "never" };
     println!(
-        "{:<8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "{:<8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
         workload,
         slice,
         ms(elapsed),
         latencies.len(),
+        missed,
         ms(at(0.5)),
         ms(at(0.99)),
         ms(at(0.999)),
         ms(*latencies.last().unwrap()),
+        ms(stretch),
+        ms(last),
     );
 }
 

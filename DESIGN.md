@@ -245,14 +245,18 @@ pages count against the budget like any frame's, and the clock hand evicts it li
 any leaf. Value leaves take at most a quarter of the budget in all, so a large
 value never evicts the whole cache, and one larger than that quarter isn't cached:
 each read of it reads it into a buffer that the read allocates, or that an iterator
-keeps for the next one. Otherwise value leaves go through the table of reads in
-flight like any leaf (§8): concurrent misses share one read, iterators read value
-leaves ahead, and a cached one is read without allocating. The page frames a large
-frame evicts stay in the pool, which never shrinks, so memory can reach 1.25 times
-the budget when the pool has grown to it before value leaves take their quarter.
-A large frame's memory goes back to the allocator once it is evicted. A value leaf
-is cached under its page id, whose span bits set it apart from any ordinary leaf,
-and reclaiming its pages evicts it (§8).
+keeps for the next one. Keeping them within that quarter takes another value leaf's
+frame, which a clock hand of their own finds: it goes over the large frames only.
+With one hand over every frame, a lookup that missed on a value leaf walked it past
+all the others each time it came round, which, with 16K value leaves cached among
+40K other frames, took up to 0.15 ms (§6). Otherwise value leaves go through the
+table of reads in flight like any leaf (§8): concurrent misses share one read,
+iterators read value leaves ahead, and a cached one is read without allocating. The
+page frames a large frame evicts stay in the pool, which never shrinks, so memory
+can reach 1.25 times the budget when the pool has grown to it before value leaves
+take their quarter. A large frame's memory goes back to the allocator once it is
+evicted. A value leaf is cached under its page id, whose span bits set it apart from
+any ordinary leaf, and reclaiming its pages evicts it (§8).
 
 **Costs.** A value leaf rounds its entry up to whole pages: an entry just over the
 limit fills a bit more than a quarter of its page, and on average half a page per
@@ -282,20 +286,20 @@ apart.
 **Testing.** Format tests round-trip value leaves a page at a time, and spans in
 page ids. Cache tests check that concurrent misses on a value leaf share one read,
 that a cold scan reads value leaves ahead within the window and the value leaves'
-quarter of the budget, that a value leaf larger than that quarter is read each time,
-and that a value leaf whose pages are reclaimed leaves the cache, though the next
-one on those pages has the same page id. The model-based tests write values on both
-sides of the limit, alone, in groups and during scans, overwrite small values with
-large ones and back, cover value leaves with `delete_range`, and land every
-comparison on and beside them; the invariant checker counts each span's pages as
-live or free. A store whose value leaves are all damaged still takes writes around
-them, over them and across them, which shows that writes don't read them. A value of
-17 MiB takes 18 write requests. The failure tests inject an error at each operation
-of a scenario with value leaves, one of them larger than a request, and crash there.
-A read-only view whose value leaves the owner reuses gets `Error::Stale`. The
-allocation tests check that reading a cached value leaf allocates nothing, and that
-reading one too large to cache allocates its buffer and nothing else, which an
-iterator then reuses.
+quarter of the budget, that making room within that quarter passes no other frame,
+that a value leaf larger than that quarter is read each time, and that a value leaf
+whose pages are reclaimed leaves the cache, though the next one on those pages has
+the same page id. The model-based tests write values on both sides of the limit,
+alone, in groups and during scans, overwrite small values with large ones and back,
+cover value leaves with `delete_range`, and land every comparison on and beside
+them; the invariant checker counts each span's pages as live or free. A store whose
+value leaves are all damaged still takes writes around them, over them and across
+them, which shows that writes don't read them. A value of 17 MiB takes 18 write
+requests. The failure tests inject an error at each operation of a scenario with
+value leaves, one of them larger than a request, and crash there. A read-only view
+whose value leaves the owner reuses gets `Error::Stale`. The allocation tests check
+that reading a cached value leaf allocates nothing, and that reading one too large
+to cache allocates its buffer and nothing else, which an iterator then reuses.
 
 ## 6. Operations
 
@@ -323,7 +327,8 @@ applied in order and atomically.
    where checking each key against every range that starts before it took 0.8 s.
 2. **Plan.** Descend the resident internal nodes to find the leaves the batch
    changes, and load the ones that aren't cached, keeping them pinned. Subtrees
-   that ranges remove whole aren't read.
+   that ranges remove whole aren't read. Then free the pages that readers held
+   back, and have let go of since (§8), so that the merge can take them.
 3. **Apply ranges** (see below).
 4. **Bulk merge.** Descend recursively, partitioning the sorted operations by child
    key range. Each touched leaf is rebuilt once from its old entries plus the
@@ -335,32 +340,33 @@ applied in order and atomically.
    and the pages of the nodes it replaced become free, subject to §8.
 
 **Pausing.** Readers keep running while a write waits for the disk, and while it
-normalizes and plans its batch, pins the leaves it changes, merges it, and, once
-published, frees the pages of the nodes it replaced. That is CPU work that grows
-with the batch, so once it has run for a millisecond, it pauses and lets the other
-tasks run; the slice in which one step ends goes on with the next. It looks at the
-clock every 4,096 units of work: operations listed, compared or moved, nodes
-visited, leaves pinned, entries copied, merged or built, and nodes freed. A node
-that planning visits counts as 64, since searching an unsorted batch's operations
-for it takes up to 2 µs, and a leaf pinned or a node freed as 16, so that it looks
-every 256 of them: about 20 µs of pinning cached leaves, and 11 µs of freeing. An
-operation the merge applies counts as 32 when the first two operations of its leaf
-don't come one after the other in the batch, as a sorted batch's do: an unsorted
-batch's operations lie scattered, and reading each one misses the cache.
-Normalizing a batch larger than any it held before takes room for all its points
-at once, rather than growing their array as it lists them, and zeroes the sort's
-new scratch space a page at a time, counting a unit per item. That
-is safe: readers keep using the old root until the swap, only one commit runs at a
-time, and the pages a write hasn't freed yet stay in use. Each step keeps its place
-in fixed state. Normalizing keeps the step it is at and how far it got: in the
-merge sort, the pass, the pair of runs it merges, and the operation it is at in
-each. Pinning keeps how many of the leaves it pinned. Planning and the merge keep
-one record per level of the path they are on: the child they are at, the operations
-left for the children after it, and how far the merge got rebuilding a leaf or
-building nodes. Freeing keeps nothing: the nodes left to free wait in the list of
-dropped ones (§8). So pausing allocates nothing, and resuming descends again to
-where it left off. A merge that pauses builds the same tree, on the same pages, as
-one that doesn't: the next commit starts once the pages are free.
+normalizes and plans its batch, pins the leaves it changes, frees the pages that
+readers let go of, merges it, and, once published, frees the pages of the nodes it
+replaced. That is CPU work that grows with the batch, so once it has run for a
+millisecond, it pauses and lets the other tasks run; the slice in which one step
+ends goes on with the next. It looks at the clock every 4,096 units of work:
+operations listed, compared or moved, nodes visited, leaves pinned, entries copied,
+merged or built, and nodes freed. A node that planning visits counts as 64, since
+searching an unsorted batch's operations for it takes up to 2 µs, and a leaf pinned
+or a node freed as 16, so that it looks every 256 of them: about 20 µs of pinning
+cached leaves, and 11 µs of freeing. An operation the merge applies counts as 32
+when the first two operations of its leaf don't come one after the other in the
+batch, as a sorted batch's do: an unsorted batch's operations lie scattered, and
+reading each one misses the cache. Normalizing a batch larger than any it held
+before takes room for all its points at once, rather than growing their array as
+it lists them, and zeroes the sort's new scratch space a page at a time, counting
+a unit per item. That is safe: readers keep using the old root
+until the swap, only one commit runs at a time, and the pages a write hasn't freed
+yet stay in use. Each step keeps its place in fixed state. Normalizing keeps the
+step it is at and how far it got: in the merge sort, the pass, the pair of runs it
+merges, and the operation it is at in each. Pinning keeps how many of the leaves it
+pinned. Planning and the merge keep one record per level of the path they are on:
+the child they are at, the operations left for the children after it, and how far
+the merge got rebuilding a leaf or building nodes. Freeing keeps nothing: the nodes
+left to free wait in the list of dropped ones (§8). So pausing allocates nothing,
+and resuming descends again to where it left off. A merge that pauses builds the
+same tree, on the same pages, as one that doesn't: readers that end meanwhile free
+no pages (§8), and the next commit starts once the pages are free.
 
 Measured with the ignored test `read_latency_during_a_load`, on an Apple M5 Pro: a
 store of 2M BookKeeper-shaped entries on the simulated disk takes writes of 1M
@@ -401,6 +407,27 @@ updates' max 1.57 ms at the median rather than 1.50, and 16 runs rather than 5
 reached 1.6 to 2.5 ms. Checking a write's keys against the limit doesn't read its
 batch: reading 1M operations would take 1 ms, right before the first slice of
 normalizing, and make the appends' p99 1.5 ms rather than 1.0.
+
+A lookup that misses the cache pins its version while it waits for the disk (§8),
+so the lookups in flight when a commit publishes hold back the pages of the nodes
+it replaced. The ignored test `read_latency_with_misses_during_a_load` runs the
+random updates above with lookups that miss seven times in ten: they read entries
+of their own, whose values of 2 KiB take value leaves, which the cache keeps in a
+quarter of its 256 MiB, and the simulated disk's leaf reads take 100 µs. A few
+lookups are in flight whenever a commit publishes. The last of them to end frees
+none of those pages, which the next write frees before it merges, a slice at a
+time: no lookup runs longer than 0.06 ms in the poll in which it lets go of its
+version, 0.03 ms at the median of 25 runs. Freeing them then, which can't pause,
+took it 0.41 ms at the median for the 17K to 20K nodes a write replaced, and up to
+0.77 ms. The longest a lookup runs without pausing is 0.08 ms at the median of 25
+runs, down from 0.15 ms when the clock hand that looks for a value leaf's frame to
+evict went past the ordinary leaves' frames too (§5). What is left is the first time
+that hand goes round the value leaves, once they fill their quarter: each of the 16K
+is still marked as used from when it was read, so the hand clears them all before it
+finds one, in 70 µs; and the allocator, which now and then takes as long to give a
+large frame its memory. The lookups' latency is the same either way, 1.5 ms at the
+median, 2.5 ms at the p99 and 2.8 to 2.9 ms at most: a lookup that misses waits for
+what is left of the write's slice before its read, and for another slice after it.
 
 A pause is a trip through the runtime, about 15 µs on an Apple M5 Pro, which is
 why slices are measured in time: a fixed amount of work takes ten times longer in
@@ -662,7 +689,21 @@ completed write.
   eviction. Only clean, unpinned leaves can be evicted: a write pins the leaves it
   changes and the ones it builds until it publishes, and a reader pins the leaf it
   is on. Exposing cache numbers is left to a later metrics design. Value leaves
-  take at most a quarter of the budget (§5).
+  take at most a quarter of the budget, and have a clock hand of their own (§5).
+- **Writes larger than the cache** leave the clock hand nothing to evict, and the
+  pool grows past the budget (§7). Once a sweep has found nothing while a write
+  holds leaves, the hand looks at no more than 64 frames for each frame taken, until
+  the write publishes or is discarded: then it sweeps the whole pool again. It
+  still finds the leaves that readers let go of meanwhile, a step at a time.
+  Sweeping the whole pool twice for every frame made such a write quadratic in its
+  leaves. In the ignored test `writes_larger_than_the_cache`, a write of 1M random
+  updates to a store of 1M keys, through a cache of 16 MiB, looked at 664M frames
+  and took 2.50 s, against 0.33 s with a cache that holds everything. Now it looks
+  at 1.4M and takes 0.34 s, at the median of 6 runs. Either way, the pool grows to
+  26K frames: the 4K leaves the write changes, and the 22K it builds. With no write
+  in progress, every sweep looks at the whole pool: one finds nothing then only when
+  readers and internal nodes fill the cache, and stepping until the next write would
+  let the pool grow while there are leaves to evict.
 - **Misses** read the page straight into a free frame (direct I/O) and verify the
   checksum. Concurrent misses on the same page share one read, and iterators read
   ahead (below). A frame left behind by a cancelled read is reclaimed by the clock
@@ -671,11 +712,16 @@ completed write.
   published and no reader that started before the publish is still alive (such a
   reader might still need to read it). Iterators always register as readers;
   point reads register only when they have to wait for I/O. Reclaiming a node's
-  pages evicts any stale cache entry for it, under its page id. Once published, a
-  write reclaims what it can a slice at a time, as it merges (§6), and returns when
-  it is done. A reader that ends can't pause: it reclaims what it held back at
-  once, unless a write paused reclaiming, whose next slices take that too. A write
-  dropped while it reclaims reclaims the rest at once.
+  pages evicts any stale cache entry for it, under its page id. Only writes
+  reclaim, a slice at a time, as they merge (§6): once published, a write reclaims
+  what it can, and returns when it is done. A reader that ends can't pause, so it
+  reclaims nothing: what it held back waits for the next write, which reclaims it
+  before it merges, and its leaves may stay cached until then, as clean leaves the
+  cache can evict. Only a merge takes pages, so it takes the ones it would have if
+  the reader had reclaimed them as it ended, and readers that end while it pauses
+  don't change them. Leaving them to the end of the next commit instead would keep
+  them from its merge, which would take others, growing the file. A write dropped
+  while it reclaims leaves the rest to the next one too.
 - **Capacity.** On BookKeeper-shaped data, dense leaves take ~5 B/entry, so a 1 GiB
   cache holds roughly 200M entries. Slotted leaves, at ~26 B/entry, would hold
   roughly 40M.
@@ -912,6 +958,13 @@ complete without suspending.
   reused once the read finishes. They also hold a write's leaf read while a second
   write queues up: when the first then fails its commit, the second gets
   `Error::Failed`.
+- **Leaf cache:** tests drive the clock hands over a pool directly. Making room
+  for a value leaf passes no other frame. While a write holds every frame, the hand
+  looks a step ahead for each frame taken, still finds a leaf that a reader lets go
+  of, and sweeps the whole pool again once the write lets go; with no write in
+  progress, every sweep looks at the whole pool. A write larger than a cache of 16
+  pages looks at fewer than 64 frames for each frame of the pool, and the invariant
+  checker asserts that no write holds leaves once writes are done.
 - **Group commit:** the simulated disk can also hold syncs and cuts, so that writes
   queue up behind a commit. Tests check that a group commits once, applying its
   batches in order, a later batch's puts and ranges overriding an earlier one's;
@@ -964,8 +1017,9 @@ complete without suspending.
 - **Allocation tests:** a counting global allocator asserts that `get` and iteration
   over cached pages, `get` and iteration that miss the cache (reading ahead
   included), and `write` with a reused batch, alone, pausing as it normalizes, plans
-  and merges, with ranges and keys in no order, or in a group, all on the simulated
-  disk, perform no allocations. On a real disk, compio adds one per I/O operation.
+  and merges, with ranges and keys in no order, in a group, or freeing the pages a
+  reader held back, all on the simulated disk, perform no allocations. On a real
+  disk, compio adds one per I/O operation.
 - **Sanitizers:** CI runs every test under AddressSanitizer, std included, so a
   use of freed memory or a leak fails the run even where the test's own checks
   pass, real files' io_uring path included. One test drops a store while the
@@ -974,7 +1028,8 @@ complete without suspending.
 - **Benchmarks** against RocksDB on the BookKeeper workload: sorted batches over
   *A* active ledgers, random point reads, floor lookups, and `delete_range` of old
   ledgers. On the simulated disk, an ignored test measures the file's size and the
-  write requests per commit of that load and of random updates (§7).
+  write requests per commit of that load and of random updates (§7), and another
+  writes larger than the cache (§8).
 
 ## 12. Milestones
 

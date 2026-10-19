@@ -22,7 +22,8 @@
 //! frames are reference counted: every node holds a reference to each internal
 //! child, the current root holds one, and so does each pinned reader. Leaves are
 //! found by page id through the leaf cache, so they can be evicted. A page a write
-//! replaces stays allocated until no reader of an older version is left.
+//! replaces stays allocated until no reader of an older version is left, and a
+//! write frees it.
 //!
 //! Each internal key equals the smallest key in its child's subtree.
 //!
@@ -49,8 +50,8 @@ use crate::space::{Life, Space};
 pub(crate) const MAX_HEIGHT: usize = 32;
 
 /// How long a write normalizes, plans or merges its batch, loads the leaves it
-/// changes, or frees the pages of the nodes it replaced, before it pauses, so that
-/// it can let the other tasks run. A pause costs a trip through the runtime, about
+/// changes, or frees the pages of replaced nodes, before it pauses, so that it can
+/// let the other tasks run. A pause costs a trip through the runtime, about
 /// 15 µs on an Apple M5 Pro, so much shorter slices would slow writes down.
 const SLICE: Duration = Duration::from_millis(1);
 
@@ -80,9 +81,8 @@ const SCATTERED: usize = 32;
 /// are cached.
 const PIN: usize = 16;
 
-/// The work a write counts for a node it replaced whose pages it frees once it has
-/// published, so that it looks at the clock every 256 nodes: about 11 µs on an
-/// Apple M5 Pro.
+/// The work a write counts for a replaced node whose pages it frees, so that it
+/// looks at the clock every 256 nodes: about 11 µs on an Apple M5 Pro.
 const FREE: usize = 16;
 
 /// A version's root node.
@@ -195,9 +195,6 @@ pub(crate) struct Tree {
     visits: [Visit; MAX_HEIGHT],
     leaf: LeafMerge,
     budget: Budget,
-    /// Whether the write in progress paused freeing the pages of the nodes it
-    /// replaced: a reader that ends meanwhile leaves the pages it held back to it.
-    reclaiming: bool,
 }
 
 enum Outcome {
@@ -425,7 +422,6 @@ impl Tree {
             visits: [Visit::default(); MAX_HEIGHT],
             leaf: LeafMerge::default(),
             budget: Budget::new(),
-            reclaiming: false,
         }
     }
 
@@ -455,16 +451,13 @@ impl Tree {
         self.current()
     }
 
+    /// Unpins a version. The pages it held back stay in use until a write
+    /// [reclaims](Self::reclaim) them: a reader doesn't pause.
     pub(crate) fn unpin(&mut self, version: Version) {
         if let Some(root) = version.root.filter(|r| r.frame != NO_FRAME) {
             self.release(root.frame);
         }
         self.pages.space.remove_reader(version.generation);
-        // A reader doesn't pause: the pages it held back are freed at once, unless
-        // a write paused freeing pages, whose next slices free them too.
-        if !self.reclaiming {
-            self.reclaim_all();
-        }
     }
 
     /// Drops a reference to an internal node's frame. A frame that loses its last
@@ -493,33 +486,24 @@ impl Tree {
     }
 
     /// Frees the pages replaced by versions no reader needs any more, evicting
-    /// any copies cached, value leaves' included. A commit ends with this, once it
-    /// has published its version: like [`apply`](Self::apply), it pauses after each
+    /// any copies cached, value leaves' included. A write does this once it has
+    /// published its version, and before it merges, since readers that end leave
+    /// the pages they held back to it: the merge then takes the pages it would
+    /// have, had they freed them. Like [`apply`](Self::apply), it pauses after each
     /// slice of work, returning `Pending`, and calling it again goes on, once the
     /// write [`resume`](Self::resume)s. Its first slice goes on with the one in
-    /// which the write published.
+    /// which the write loaded its leaves, or published.
     pub(crate) fn reclaim(&mut self) -> Poll<()> {
         let Pages { pool, cache, space } = &mut self.pages;
         let mut reclaimed = space.reclaim();
         loop {
             if self.budget.spent() {
-                self.reclaiming = true;
                 return Poll::Pending;
             }
             let Some(page) = reclaimed.next() else {
-                self.reclaiming = false;
                 return Poll::Ready(());
             };
             self.budget.work += FREE;
-            uncache(pool, cache, page);
-        }
-    }
-
-    /// Like [`reclaim`](Self::reclaim), but at once.
-    pub(crate) fn reclaim_all(&mut self) {
-        self.reclaiming = false;
-        let Pages { pool, cache, space } = &mut self.pages;
-        for page in space.reclaim() {
             uncache(pool, cache, page);
         }
     }
@@ -734,6 +718,9 @@ impl Tree {
                         }
                     }
                     self.phase = Phase::Idle;
+                    // The write holds the leaves it changes from now on, and the ones
+                    // it builds.
+                    self.pages.cache.set_writing(true);
                     return Poll::Ready(());
                 }
                 Phase::Merging | Phase::Growing { .. } => unreachable!("planning during a merge"),
@@ -908,7 +895,7 @@ impl Tree {
     }
 
     /// Starts the next slice of the write in progress, which paused loading its
-    /// leaves, or freeing the pages of the nodes it replaced.
+    /// leaves, or freeing pages.
     pub(crate) fn resume(&mut self) {
         self.budget.start();
     }
@@ -1034,11 +1021,13 @@ impl Tree {
         }
     }
 
-    /// Releases the leaves the write in progress pinned.
+    /// Releases the leaves the write in progress pinned. As it publishes or
+    /// discards its version, it lets go of the ones it built too.
     pub(crate) fn unpin_touched(&mut self) {
         for frame in self.pinned.drain(..) {
             self.pages.pool.unref(frame);
         }
+        self.pages.cache.set_writing(false);
     }
 
     /// Makes room in the scratch space for a write reaching `level`.
@@ -2106,10 +2095,10 @@ impl Tree {
             self.check_node((root.frame, root.page), root.level, None, None, &mut stats);
         }
         let Pages { pool, cache, space } = &self.pages;
-        assert_eq!(space.dropped().count(), 0, "replaced pages not reclaimed");
+        // Pages that versions replaced stay in use until a write frees them.
         assert_eq!(
             space.used_count() as u64,
-            crate::meta::META_PAGES + stats.pages,
+            crate::meta::META_PAGES + stats.pages + space.dropped().count() as u64,
             "pages leaked"
         );
         // Frames that cancelled reads left behind wait for the clock hand.
@@ -2141,7 +2130,8 @@ impl Tree {
             let first = node::first_page(page);
             assert!(space.is_used(first), "cached leaf {page} on a free page");
         }
-        assert!(self.pinned.is_empty() && self.pending.is_none() && !self.reclaiming);
+        assert!(self.pinned.is_empty() && self.pending.is_none());
+        assert!(!cache.writing(), "a write still holds leaves");
         assert!(self.dirty.iter().all(Vec::is_empty));
         assert!(self.phase == Phase::Idle, "a merge was left halfway");
         assert!(self.values.is_empty());
