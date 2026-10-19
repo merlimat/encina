@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::mem;
 
 use crate::error::{Error, Result};
@@ -36,9 +37,11 @@ pub struct WriteBatch {
     ranges: Vec<(u32, u32)>,
     by_start: Vec<u32>,
     // Scratch space for sorting them: the buffer that merge passes alternate with,
-    // and where the runs they merge end. Then how far `prepare` got.
+    // and where the runs they merge end. Then the ranges that may cover the key
+    // `prepare` is at, the one added last on top, and how far it got.
     scratch: Vec<u32>,
     run_ends: Vec<u32>,
+    covering: BinaryHeap<u32>,
     step: Step,
 }
 
@@ -54,10 +57,12 @@ enum Step {
     SortRanges(Sort),
     SortPoints(Sort),
     /// Keeping the last operation on each key, from point `i` on: the first `kept`
-    /// are kept.
+    /// are kept. The first `started` ranges in `by_start` start at or before its
+    /// key, and `covering` holds those of them that may cover it.
     Dedup {
         i: usize,
         kept: usize,
+        started: usize,
     },
     /// Merging the ranges, from range `i` on.
     Merge(usize),
@@ -248,6 +253,7 @@ impl WriteBatch {
             by_start,
             scratch,
             run_ends,
+            covering,
             step,
         } = self;
         let a = |i: u32| {
@@ -264,6 +270,7 @@ impl WriteBatch {
                     points.clear();
                     ranges.clear();
                     by_start.clear();
+                    covering.clear();
                     *step = Step::Collect(0);
                 }
                 Step::Collect(i) => {
@@ -294,9 +301,13 @@ impl WriteBatch {
                     if !sort(points, scratch, run_ends, s, a, MIN_RUN, budget) {
                         return false;
                     }
-                    *step = Step::Dedup { i: 0, kept: 0 };
+                    *step = Step::Dedup {
+                        i: 0,
+                        kept: 0,
+                        started: 0,
+                    };
                 }
-                Step::Dedup { i, kept } => {
+                Step::Dedup { i, kept, started } => {
                     while *i < points.len() {
                         if budget.spent() {
                             return false;
@@ -304,16 +315,37 @@ impl WriteBatch {
                         budget.work += 1;
                         let op = points[*i];
                         let key = a(op);
-                        *i += 1;
-                        if *i < points.len() && a(points[*i]) == key {
+                        if *i + 1 < points.len() && a(points[*i + 1]) == key {
+                            *i += 1;
                             continue;
                         }
                         // The last operation on a key wins, unless a range added after
                         // it covers the key: then the range has the last word, and it
-                        // is applied first anyway.
-                        let candidates = &by_start[..by_start.partition_point(|&r| a(r) <= key)];
-                        budget.work += candidates.len();
-                        if !candidates.iter().any(|&r| r > op && key < b(r)) {
+                        // is applied first anyway. The ranges that start at or before
+                        // the key and end after it go on a heap, the one added last on
+                        // top, which comes off while it ends at or before the key: it
+                        // ends before the keys that follow too. Then the one on top
+                        // covers the key, and none added after it does. A push or a
+                        // pop counts a unit per level of the heap.
+                        if let Some(&r) = by_start.get(*started)
+                            && a(r) <= key
+                        {
+                            *started += 1;
+                            if key < b(r) {
+                                covering.push(r);
+                                budget.work += covering.len().ilog2() as usize;
+                            }
+                            continue;
+                        }
+                        if let Some(&r) = covering.peek()
+                            && b(r) <= key
+                        {
+                            budget.work += covering.len().ilog2() as usize;
+                            covering.pop();
+                            continue;
+                        }
+                        *i += 1;
+                        if covering.peek().is_none_or(|&r| r < op) {
                             points[*kept] = op;
                             *kept += 1;
                         }
@@ -521,8 +553,9 @@ mod tests {
         }
     }
 
-    /// The points and ranges of `batch` as `prepare` found them before it paused,
-    /// at once and with a sort that doesn't keep the order of equal keys.
+    /// The points and ranges of `batch` as `prepare` found them before it paused:
+    /// at once, with a sort that doesn't keep the order of equal keys, and checking
+    /// each key against every range that starts at or before it.
     fn prepared_at_once(batch: &WriteBatch) -> (Vec<u32>, Vec<(u32, u32)>) {
         let (bytes, ops) = (&batch.bytes, &batch.ops);
         let a = |i: u32| {
@@ -608,6 +641,20 @@ mod tests {
         })
     }
 
+    /// Operations on 2,048 two-byte keys, a third of them ranges, from one key long
+    /// to as long as all of them: short ones end under long ones added after them,
+    /// and long ones outlast short ones added after them.
+    fn range_op() -> impl Strategy<Value = TestOp> {
+        (0..2048u16, 0..12u32, 0..3u8).prop_map(|(k, span, kind)| {
+            let key = k.to_be_bytes().to_vec();
+            match kind {
+                0 => TestOp::DeleteRange(key, (k + (1 << span)).to_be_bytes().to_vec()),
+                1 => TestOp::Delete(key),
+                _ => TestOp::Put(key, kind),
+            }
+        })
+    }
+
     /// Batches appended into one, as group commit does, the marked ones then
     /// withdrawn: some in key order, as appends to ledgers are.
     fn test_group() -> impl Strategy<Value = Vec<(Vec<TestOp>, bool, bool)>> {
@@ -674,6 +721,23 @@ mod tests {
             slice in prop_oneof![1..16usize, Just(usize::MAX)],
         ) {
             let mut group = group_of(&[(ops, false, false)]);
+            let expected = prepared_at_once(&group);
+            prepare_in_slices(&mut group, slice);
+            prop_assert_eq!((group.points().to_vec(), group.ranges().to_vec()), expected);
+        }
+
+        // Groups of many ranges among many points, some in key order: ranges pile
+        // up on the heap under long ones, and come off once those end, and the
+        // pushes and pops pause too.
+        #[test]
+        fn many_ranges_among_many_points_prepare_as_at_once(
+            batches in prop::collection::vec(
+                (prop::collection::vec(range_op(), 0..1000), any::<bool>(), any::<bool>()),
+                1..4,
+            ),
+            slice in prop_oneof![1..16usize, Just(usize::MAX)],
+        ) {
+            let mut group = group_of(&batches);
             let expected = prepared_at_once(&group);
             prepare_in_slices(&mut group, slice);
             prop_assert_eq!((group.points().to_vec(), group.ranges().to_vec()), expected);
