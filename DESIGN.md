@@ -303,7 +303,9 @@ iterator then reuses.
 
 A `WriteBatch` holds `put`, `delete` and `delete_range` operations, encoded into an
 arena that `clear()` empties without releasing, so a caller that reuses its batch
-doesn't allocate. The operations are applied in order and atomically.
+doesn't allocate. It also keeps the length of the longest key put, so that a write
+checks the limit on keys (§5) without reading the operations. The operations are
+applied in order and atomically.
 
 1. **Normalize.** Drop point operations made obsolete by a later range in the same
    batch. Sort the rest by key, through an index array kept in the batch, keeping
@@ -355,20 +357,23 @@ works while the thread runs other tasks: the test times the thread alone.
 | Write of 1M entries | Write | Lookup p50 | p99 | Max |
 |---|---|---:|---:|---:|
 | Appends to 1,000 ledgers | doesn't pause | 20.0 ms | 42.9 ms | 43.8 ms |
-| | pauses | 0.51 ms | 1.5 ms | 2.2 ms |
+| | pauses | 0.50 ms | 1.0 ms | 1.1 ms |
 | Random updates | doesn't pause | 183 ms | 377 ms | 383 ms |
-| | pauses | 0.54 ms | 1.2 ms | 2.0 ms |
+| | pauses | 0.54 ms | 1.2 ms | 1.8 ms |
 
 Normalizing, planning, pinning and merging then never run for more than 1.5 ms at a
-time: the random updates' p99 comes from their merge's slices, which run up to
+time, and a lookup waits for what is left of the slice in which it comes due: half
+of one at the median, and about a whole one at the p99. The appends' slices run 1.0
+to 1.1 ms; the random updates' p99 comes from their merge's slices, which run up to
 1.3 ms, since 4,096 units of their merge, between two looks at the clock, take
 180 µs. The simulated disk copies a request's pages in at most 0.25 ms. What
-remains are two steps that don't pause, once per write. Before a write queues,
-checking that none of its keys is too long reads its whole batch, 1 ms for 1M
-operations, and the first slice of normalizing follows: those 2 ms set the appends'
-p99, since their writes take only 42 ms. Once the merge ends, listing the nodes the
-commit writes and sorting them by page takes another 0.7 ms after the merge's last
-slice, for the random updates' 19,700 nodes.
+remains are two steps that don't pause, once per write, for the random updates'
+19,700 nodes: once the merge ends, listing the nodes the commit writes and sorting
+them by page takes another 0.7 ms after the merge's last slice, and once the commit
+is durable, freeing the nodes it replaced takes 0.8 ms. Checking a write's keys
+against the limit doesn't read its batch: reading 1M operations would take 1 ms,
+right before the first slice of normalizing, and make the appends' p99 1.5 ms
+rather than 1.0.
 
 A pause is a trip through the runtime, about 15 µs on an Apple M5 Pro, which is
 why slices are measured in time: a fixed amount of work takes ten times longer in

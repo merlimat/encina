@@ -22,7 +22,7 @@ pub enum Error {
     /// A put's key exceeds [`Options::max_key_size`](crate::Options::max_key_size).
     /// The batch containing it was not applied.
     KeyTooLarge {
-        /// The key's length, in bytes.
+        /// The length of the longest key the batch puts, in bytes.
         size: usize,
         /// The longest key the store accepts, in bytes.
         max: usize,
