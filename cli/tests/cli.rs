@@ -220,7 +220,10 @@ async fn stats_and_pages() {
     assert_eq!(ok(&["pages", path_str]), "0  MM.D\n");
     let stats = ok(&["stats", path_str]);
     let summary = [
+        ("entries", 1),
+        ("entry size", 2),
         ("page size", 4096),
+        ("file size", 4 * 4096),
         ("file pages", 4),
         ("meta pages", 2),
         ("tree pages", 1),
@@ -250,6 +253,9 @@ async fn stats_and_pages() {
     let file = stat(&stats, "file pages");
     assert_eq!(file, 2 + 1 + leaves[1] + stat(&stats, "free pages"));
     assert_eq!(file as u64 * 4096, std::fs::metadata(&path).unwrap().len());
+    assert_eq!(stat(&stats, "file size"), file * 4096);
+    assert_eq!(stat(&stats, "entries"), 20_001);
+    assert_eq!(stat(&stats, "entry size"), 2 + 20_000 * 106);
 
     // The map shows the same pages, 64 to a line.
     let map = ok(&["pages", path_str]);
@@ -272,6 +278,7 @@ async fn stats_and_pages() {
     let stats = ok(&["stats", path_str]);
     let leaves = *levels(&stats).last().unwrap();
     assert_eq!((leaves[3], leaves[4]), (1, 20_002));
+    assert_eq!(stat(&stats, "entry size"), 2 + 20_000 * 106 + 10_003);
     let map = ok(&["pages", path_str]);
     let shown = |c| map.chars().filter(|&s| s == c).count();
     assert_eq!(shown('V'), 3);

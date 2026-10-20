@@ -1295,12 +1295,16 @@ fn a_read_only_view_lists_the_pages_of_its_tree() {
     let empty = Store::new(Options::new().page_size(256));
     let view = now(ReadOnlyDb::open_sim(empty.disk.clone(), empty.opts.clone())).unwrap();
     now(view.pages(|info| panic!("{info:?} in an empty store"))).unwrap();
+    assert_eq!((view.entry_count(), view.entry_size()), (0, 0));
 
     let (store, model) = deep_store();
     // A cache too small for the leaves, so that most are read from the disk.
     let opts = Options::new().page_size(256).cache_size(16 * 256);
     let view = now(ReadOnlyDb::open_sim(store.disk.clone(), opts)).unwrap();
     assert_eq!(view.page_size(), 256);
+    assert_eq!(view.entry_count(), model.len() as u64);
+    let bytes = model.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
+    assert_eq!(view.entry_size(), bytes);
     let mut found = Vec::new();
     now(view.pages(|info| found.push(info))).unwrap();
     // Every page of the tree once: the internal nodes, then the leaves in key order.

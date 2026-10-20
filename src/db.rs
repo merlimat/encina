@@ -655,6 +655,17 @@ impl ReadOnlyDb {
         self.db.inner.page_size
     }
 
+    /// The entries in the version this view reads.
+    pub fn entry_count(&self) -> u64 {
+        self.db.inner.tree.borrow().size().entries
+    }
+
+    /// The bytes of the keys and values of the entries in the version this view
+    /// reads: what the app wrote, not what the store takes on disk.
+    pub fn entry_size(&self) -> u64 {
+        self.db.inner.tree.borrow().size().bytes
+    }
+
     /// Calls `f` on each node of the tree in the version this view reads: the
     /// internal nodes first, then the leaves in key order. Leaves that aren't
     /// cached are read one at a time, so this reads most of the file.
