@@ -87,6 +87,9 @@ enum Command {
     },
     /// Prints how many pages the store's file holds, and what they hold
     ///
+    /// The summary gives the store's entries, the bytes of their keys and values as
+    /// written, and the file's size in bytes, then its pages.
+    ///
     /// The table counts the pages at each level of the tree, from the root down to
     /// the leaves, at level 0: the dense nodes and the value leaves among them, their
     /// entries (an internal node's entries are its children), and how full their
@@ -175,7 +178,13 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
             .await?;
         }
         Command::Stats { path } => {
-            let (page_size, pages) = read_pages(&path).await?;
+            let Store {
+                page_size,
+                file_size,
+                entry_count,
+                entry_size,
+                pages,
+            } = read_pages(&path).await?;
             let nodes: Vec<_> = pages
                 .iter()
                 .filter_map(|page| match page {
@@ -188,15 +197,18 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
                 .filter(|stretch| matches!(stretch[0], Page::Free))
                 .map(<[Page]>::len)
                 .collect();
-            writeln!(out, "page size       {page_size:>9}")?;
-            writeln!(out, "file pages      {:>9}", pages.len())?;
-            writeln!(out, "meta pages      {META_PAGES:>9}")?;
-            writeln!(out, "tree pages      {:>9}", nodes.len())?;
-            writeln!(out, "free pages      {:>9}", free.iter().sum::<usize>())?;
-            writeln!(out, "free stretches  {:>9}", free.len())?;
+            writeln!(out, "entries         {entry_count:>12}")?;
+            writeln!(out, "entry size      {entry_size:>12}")?;
+            writeln!(out, "page size       {page_size:>12}")?;
+            writeln!(out, "file size       {file_size:>12}")?;
+            writeln!(out, "file pages      {:>12}", pages.len())?;
+            writeln!(out, "meta pages      {META_PAGES:>12}")?;
+            writeln!(out, "tree pages      {:>12}", nodes.len())?;
+            writeln!(out, "free pages      {:>12}", free.iter().sum::<usize>())?;
+            writeln!(out, "free stretches  {:>12}", free.len())?;
             writeln!(
                 out,
-                "longest stretch {:>9}",
+                "longest stretch {:>12}",
                 free.iter().max().unwrap_or(&0)
             )?;
             if let Some(height) = nodes.iter().map(|info| info.level).max() {
@@ -226,7 +238,7 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
             }
         }
         Command::Pages { path } => {
-            let (_, pages) = read_pages(&path).await?;
+            let Store { pages, .. } = read_pages(&path).await?;
             let width = (pages.len() - 1).to_string().len();
             for (row, line) in pages.chunks(64).enumerate() {
                 write!(out, "{:>width$} ", row * 64)?;
@@ -282,23 +294,37 @@ enum Page {
     Free,
 }
 
-/// The store's page size, and what each page of its file holds. When the store's
-/// owner overwrites the version the view reads, opens a new view and starts over.
-async fn read_pages(path: &Path) -> Result<(usize, Vec<Page>), Box<dyn Error>> {
+/// A version of a store, and its file, as [`read_pages`] finds them.
+struct Store {
+    page_size: usize,
+    /// The file's length, in bytes.
+    file_size: u64,
+    /// The version's entries, and the bytes of their keys and values.
+    entry_count: u64,
+    entry_size: u64,
+    /// What each page of the file holds.
+    pages: Vec<Page>,
+}
+
+/// Reads the store's current version, and what each page of its file holds. When
+/// the store's owner overwrites the version the view reads, opens a new view and
+/// starts over.
+async fn read_pages(path: &Path) -> Result<Store, Box<dyn Error>> {
     let mut stale = 0;
-    let (page_size, nodes) = loop {
+    let (page_size, entry_count, entry_size, nodes) = loop {
         let read = async {
             let db = ReadOnlyDb::open(path, Options::default()).await?;
             let mut nodes = Vec::new();
             db.pages(|info| nodes.push(info)).await?;
-            Ok((db.page_size(), nodes))
+            Ok((db.page_size(), db.entry_count(), db.entry_size(), nodes))
         };
         match read.await {
             Err(encina::Error::Stale) if stale < MAX_STALE => stale += 1,
             result => break result.map_err(|e| at(path, e))?,
         }
     };
-    let len = fs::metadata(path)?.len() as usize;
+    let file_size = fs::metadata(path)?.len();
+    let len = file_size as usize;
     let end = nodes
         .iter()
         .map(|info| (info.page + info.pages) as usize)
@@ -318,7 +344,13 @@ async fn read_pages(path: &Path) -> Result<(usize, Vec<Page>), Box<dyn Error>> {
             pages[page as usize] = Page::Node(info);
         }
     }
-    Ok((page_size, pages))
+    Ok(Store {
+        page_size,
+        file_size,
+        entry_count,
+        entry_size,
+        pages,
+    })
 }
 
 /// Calls `print` on the entries with keys in the range, in key order. When the
