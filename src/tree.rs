@@ -593,13 +593,15 @@ impl Tree {
     }
 
     /// Looks up the entry matching `key` under `cmp` in the version rooted at
-    /// `root`, using cached leaves only. Copies the key it finds into `out`.
+    /// `root`, using cached leaves only. Copies the key it finds into `out`. If
+    /// `count`, it counts the leaves it finds cached as cache hits.
     pub(crate) fn find(
         &mut self,
         root: Option<Root>,
         key: &[u8],
         cmp: Comparison,
         out: &mut Vec<u8>,
+        count: bool,
     ) -> Find {
         let Some(root) = root else {
             return Find::NotFound;
@@ -611,7 +613,7 @@ impl Tree {
             let ord = self.cmp_leaf_key(&cur, key);
             (NO_FRAME, usize::from(ord.is_lt()), ord.is_eq(), 1)
         } else {
-            let Some(frame) = self.pages.cached(page) else {
+            let Some(frame) = self.cached_leaf(page, count) else {
                 return Find::Missing(page);
             };
             let node = self.node(frame);
@@ -635,9 +637,9 @@ impl Tree {
                     return Find::NotFound;
                 };
                 if node::span(page) > 0 {
-                    return self.find_value(page, out);
+                    return self.find_value(page, out, count);
                 }
-                let Some(frame) = self.pages.cached(page) else {
+                let Some(frame) = self.cached_leaf(page, count) else {
                     return Find::Missing(page);
                 };
                 let at = if forward {
@@ -649,7 +651,7 @@ impl Tree {
             }
         };
         if frame == NO_FRAME {
-            return self.find_value(page, out);
+            return self.find_value(page, out, count);
         }
         let node = self.node(frame);
         node.key_into(at, out);
@@ -664,18 +666,28 @@ impl Tree {
     }
 
     /// The lookup's match: the entry of the value leaf with page id `page`. Copies
-    /// its key into `out` if the leaf is cached.
-    fn find_value(&mut self, page: u64, out: &mut Vec<u8>) -> Find {
+    /// its key into `out` if the leaf is cached, a hit counted if `count`.
+    fn find_value(&mut self, page: u64, out: &mut Vec<u8>, count: bool) -> Find {
         if !self.pages.cache.caches(node::span(page)) {
             return Find::Value(page);
         }
-        let Some(frame) = self.pages.cached(page) else {
+        let Some(frame) = self.cached_leaf(page, count) else {
             return Find::Missing(page);
         };
         let leaf = ValueLeaf::new(self.pages.pool.page(frame));
         out.clear();
         out.extend_from_slice(leaf.key());
         Find::Found(leaf.value().as_ptr(), leaf.value().len())
+    }
+
+    /// The frame holding leaf `page`, if it is cached, counted as a cache hit if
+    /// `count`.
+    fn cached_leaf(&mut self, page: u64, count: bool) -> Option<FrameId> {
+        let frame = self.pages.cached(page)?;
+        if count {
+            self.pages.cache.hits.add(1);
+        }
+        Some(frame)
     }
 
     // Writes.

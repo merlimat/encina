@@ -33,6 +33,8 @@ use std::slice;
 
 use compio::buf::{IoBuf, IoBufMut, SetLen};
 
+use crate::metrics::Amount;
+
 pub(crate) type FrameId = u32;
 
 const CHUNK_FRAMES: usize = 64;
@@ -117,6 +119,9 @@ pub(crate) struct Pool {
     large: Vec<(NonNull<u8>, NonNull<Cell<u32>>, Frame)>,
     large_free: Vec<usize>,
     large_pages: usize,
+    /// The memory of the frames in use, as [`usage`] sorts them, if the store
+    /// records metrics.
+    pub(crate) usage: [Amount; 3],
 }
 
 impl Pool {
@@ -135,6 +140,7 @@ impl Pool {
             large: Vec::new(),
             large_free: Vec::new(),
             large_pages: 0,
+            usage: Default::default(),
         }
     }
 
@@ -184,6 +190,7 @@ impl Pool {
         let id = self.free.pop().unwrap();
         debug_assert_eq!(self.refs(id), 0);
         self.refs_cell(id).set(1);
+        self.usage[usage(holds, false)].add(self.page_size as i64);
         self.frames[id as usize] = Frame {
             holds,
             page,
@@ -226,6 +233,7 @@ impl Pool {
         );
         self.large[i] = (data, refs, frame);
         self.large_pages += pages;
+        self.usage[usage(holds, true)].add((pages * self.page_size) as i64);
         LARGE | i as FrameId
     }
 
@@ -314,13 +322,17 @@ impl Pool {
         debug_assert_eq!(self.refs(id), 0, "freeing a referenced frame");
         if let Some(i) = large_index(id) {
             let frame = &mut self.large[i].2;
+            let len = frame.pages as usize * self.page_size;
+            self.usage[usage(frame.holds, true)].add(-(len as i64));
             frame.holds = Holds::Nothing;
             self.large_pages -= frame.pages as usize;
             self.mem.large.borrow_mut()[i] = None;
             self.large_free.push(i);
             return;
         }
-        self.frames[id as usize].holds = Holds::Nothing;
+        let frame = &mut self.frames[id as usize];
+        self.usage[usage(frame.holds, false)].add(-(self.page_size as i64));
+        frame.holds = Holds::Nothing;
         self.free.push(id);
     }
 
@@ -399,6 +411,16 @@ fn is_large(id: FrameId) -> bool {
 /// The index of the large frame `id`, if it is one.
 fn large_index(id: FrameId) -> Option<usize> {
     is_large(id).then_some((id & !LARGE) as usize)
+}
+
+/// Which of [`Pool::usage`] counts a frame that holds `holds`: internal nodes,
+/// leaves and the pages being read or written, or the large frames of value leaves.
+fn usage(holds: Holds, large: bool) -> usize {
+    match holds {
+        _ if large => 2,
+        Holds::Internal => 0,
+        _ => 1,
+    }
 }
 
 /// An I/O buffer over one frame. It keeps the frame memory alive, and holds a
