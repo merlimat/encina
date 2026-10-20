@@ -771,31 +771,35 @@ on the simulated disk with 4 KiB pages and a cache that holds everything (the
 ignored test `file_size_and_requests`): the benchmark's load (bench/README.md: 10
 million entries in 100 batches), and 1 million random keys, loaded in batches of
 20,000, then updated at random, 2 million updates in all, in commits of the size
-shown.
+shown. The rows without moving pages were measured with `Space::should_move`
+turned off.
 
 | Workload | Allocation | File | Requests | Pages |
 |---|---|---:|---:|---:|
-| Benchmark load | lowest free page | 1.02× | 1,790 | 1,790 |
-| | runs | 1.21× | 25 | 1,790 |
-| | runs, moving pages | 1.22× | 26 | 1,807 |
-| Random, 20,000 per commit | lowest free page | 1.72× | 10,882 | 10,882 |
-| | runs | 2.73× | 433 | 10,882 |
-| | runs, moving pages | 2.63× | 316 | 11,319 |
-| Random, 1,000 per commit | lowest free page | 1.70× | 1,158 | 1,158 |
-| | runs | 3.00× | 57 | 1,158 |
-| | runs, moving pages | 2.08× | 26 | 1,420 |
-| Random, 10 per commit | lowest free page | 1.70× | 23 | 23 |
-| | runs | 4.16× | 1.8 | 23 |
-| | runs, moving pages | 2.87× | 1.9 | 29 |
+| Benchmark load | runs | 1.07× | 8.8 | 1,057 |
+| | runs, moving pages | 1.06× | 9.0 | 1,059 |
+| Random, 20,000 per commit | runs | 2.60× | 304 | 8,350 |
+| | runs, moving pages | 2.56× | 277 | 8,485 |
+| Random, 1,000 per commit | runs | 2.96× | 50 | 1,027 |
+| | runs, moving pages | 2.16× | 22 | 1,260 |
+| Random, 10 per commit | runs | 3.75× | 1.7 | 20.5 |
+| | runs, moving pages | 2.66× | 1.8 | 25.1 |
 
-Taking the lowest free page sends a request per page, and the random keys' load
-sets its file size. Moving pages costs page writes where updates are small and
-spread out, but takes fewer requests there, since the emptied windows make longer
-runs; the benchmark's load barely changes. Big commits gain little: the windows a
-commit fills still hold over a quarter of their pages after the next one, too many
-to move, and the commit after replaces most of those anyway. On the benchmark VM,
-writing in runs cut the load's requests from 169,500 of 4 KiB to 4,540 averaging
-158 KiB, and made it three times as fast.
+Moving pages keeps the file smaller where updates are small and spread out, for
+more page writes. With 1,000 updates per commit, the file drops from 2.96 to 2.16
+times the pages in use, and a commit writes 23% more pages but sends half the
+requests, since the emptied windows make longer runs. With 10 per commit, the file
+drops from 3.75 to 2.66 times, for 22% more pages. The benchmark's load barely
+changes. Big commits gain little: the windows a commit fills still hold over a
+quarter of their pages after the next one, too many to move, and the commit after
+replaces most of those anyway.
+
+Before runs, the allocator took the lowest free page, and a commit sent a request
+per page. Measured then, before dense nodes (§5), that kept the file at 1.02 times
+the pages in use for the benchmark's load, and at 1.70 to 1.72 times for the
+random updates, which their load set, but the load sent 1,790 requests per commit.
+On the benchmark VM, writing in runs cut the load's requests from 169,500 of 4 KiB
+to 4,540 averaging 158 KiB, and made it three times as fast.
 
 ### Recovery
 
