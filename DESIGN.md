@@ -172,7 +172,7 @@ benchmark's BookKeeper-shaped data, a full 4 KiB leaf holds 807 entries, 5.1 byt
 each, against about 26 for slotted leaves, as the experiment above predicted.
 Internal nodes use the same formats, with child references as fixed-size values. A
 dense internal node never shares a value prefix, since loading it rewrites the
-frame in each reference.
+frame in each reference. §7 gives the formats byte by byte.
 
 Reads never allocate. Results reach the caller as borrowed slices. The key is
 rebuilt from prefix and suffix in a buffer owned by the call. The value comes
@@ -188,7 +188,7 @@ internal node must fit four children with keys that long. Values are written and
 read whole, so a value must fit in memory, and a batch holds at most 4 GiB.
 
 **Format.** A value leaf holds one entry: a header like any node's, with a format of
-its own, then the key, the value, and zeros to the end of its last page. The
+its own, then the key, the value, and zeros to the end of its last page (§7). The
 header's checksum covers every page of the span. An entry goes to a value leaf when
 its key plus value exceeds the limit of ordinary leaves; its key alone may not.
 
@@ -582,8 +582,121 @@ fails; a read-only view, which writes nothing, takes the file's.
 
 | Pages | Content |
 |---|---|
-| 0, 1 | Meta slots: checksum, magic, format version, page size, root level, generation, root page, high-water mark. |
-| ≥ 2 | Tree pages, each with a header: crc32c, node format (slotted, dense or value leaf), level, entry count, generation written. A value leaf spans adjacent pages under one header (§5). |
+| 0, 1 | The two meta slots. |
+| ≥ 2 | Tree pages: one node per page, or a value leaf over adjacent pages (§5). |
+
+Integers are little-endian unless said otherwise, and checksums are crc32c. Nothing
+else is stored: free space is derived from the tree (below).
+
+**Meta page.** Each slot fills a page, and the commit of generation `g` writes slot
+`g % 2`. The bytes past the 48 below are zero.
+
+```text
+offset  size  field
+     0     4  checksum of bytes 4..48
+     4     8  magic: "encina\0\0"
+    12     4  format version: 1
+    16     4  page size, in bytes
+    20     1  root level: 0 when the root is a leaf
+    21     3  zero
+    24     8  generation
+    32     8  root's page id, 0 for an empty tree
+    40     8  high-water mark: no page at or above it is in use
+```
+
+**Node header.** Every node starts with 32 bytes:
+
+```text
+offset  size  field
+     0     4  checksum of bytes 4 to the end of the page
+     4     1  format: 1 slotted, 2 dense, 3 value leaf
+     5     1  level: 0 for leaves
+     6     2  entry count
+     8     2  key prefix length
+    10     2  slotted: offset of the heads; dense: key suffix length
+    12     2  slotted: offset of the slots; dense: value prefix length
+    14     2  slotted: zero; dense: value suffix length
+    16     4  bytes used, from the start of the page
+    20     8  generation that wrote it
+    28     4  zero
+```
+
+The checksum and generation are stamped when the page is written. The bytes past
+the bytes used belong to no entry, though the checksum covers them too. Every key in
+a node starts with the node's key prefix: the longest prefix its first and last keys
+share, stored once, right after the header. The rest of a key is its suffix. Entries
+are in key order.
+
+**Slotted nodes** hold keys and values of any lengths:
+
+```text
+32               key prefix
+                 zeros, to a multiple of 4
+heads offset     heads: 4 bytes per entry
+slots offset     slots: 6 bytes per entry
+slots + 6 × n    heap: a record per entry
+```
+
+- A head is the first 4 suffix bytes, zero-padded and read as a big-endian `u32`,
+  stored as a little-endian one. A binary search reads only the heads, and ties
+  fall back to the records.
+- A slot holds the record's offset from the start of the heap, the suffix length and
+  the value length, 2 bytes each.
+- A record holds the suffix bytes past the first 4, then the value.
+
+**Dense nodes** hold entries whose keys all have one length, and whose values all
+have one length:
+
+```text
+32                         key prefix
+32 + kp                    value prefix
+32 + kp + vp               key suffixes: ks bytes per entry
+32 + kp + vp + n × ks      value suffixes: vs bytes per entry
+```
+
+The value prefix is the longest prefix every value shares, in leaves; internal nodes
+have none. Key suffixes of up to 8 bytes compare as big-endian integers. A node is
+built dense whenever its entries allow it, since it is then never larger.
+
+**Internal nodes** use the same formats, at levels 1 and up. Entry `i`'s key is the
+smallest key in child `i`'s subtree, and its value is a child reference:
+
+```text
+offset  size  field
+     0     4  frame: the child's frame in memory, NO_FRAME (0xFFFFFFFF) for a leaf
+     4     8  the child's page id
+```
+
+The frame only means something in memory: it is written to disk as it stands, and
+loading the node rewrites it. So an internal node stores its references whole: a
+dense one has no value prefix, and a value suffix of 12 bytes. Leaves are found by
+page id, through the cache, so a level-1 node's frames are all `NO_FRAME`.
+
+**Page ids.** The low 40 bits hold a node's first page, and the high 24 bits a value
+leaf's span, in pages: 0 for every other node. With 4 KiB pages, 40 bits address
+4 PiB, and 24 bits give spans of up to 64 GiB.
+
+**Value leaves** hold one entry, over as many adjacent pages as it needs:
+
+```text
+offset  size  field
+     0     4  checksum of bytes 4 to the end of the last page
+     4     1  format: 3
+     5     1  level: 0
+     6     2  entry count: 1
+     8     2  key length
+    10     2  zero
+    12     4  value length
+    16     4  zero
+    20     8  generation that wrote it
+    28     4  zero
+    32        the key, the value, then zeros to the end of the last page
+```
+
+**Checks.** A node read from disk must have a known format, a matching checksum,
+entries, and a layout that stays within its page. Its level must be the one its
+parent expects, and its generation no newer than the meta page's. A value leaf's
+length must fill its span, give or take the last page's zeros.
 
 ### Free space is derived, not stored
 
