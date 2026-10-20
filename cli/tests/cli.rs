@@ -81,6 +81,30 @@ fn scan_bounds() {
 }
 
 #[test]
+fn delete_and_delete_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.db");
+    let path = path.to_str().unwrap();
+    for key in ["a", "b", "c", "d", "e"] {
+        ok(&["put", path, key, &key.to_uppercase()]);
+    }
+
+    ok(&["delete", path, "b"]);
+    assert_eq!(encina(&["get", path, "b"]).status.code(), Some(1));
+    // Deleting a key that isn't there succeeds, and changes nothing.
+    ok(&["delete", path, "b"]);
+    assert_eq!(ok(&["scan", path]), "a\tA\nc\tC\nd\tD\ne\tE\n");
+
+    ok(&["delete-range", path, "c", "e"]);
+    assert_eq!(ok(&["scan", path]), "a\tA\ne\tE\n");
+    // A range that starts at or after its end removes nothing.
+    ok(&["delete-range", path, "e", "a"]);
+    assert_eq!(ok(&["scan", path]), "a\tA\ne\tE\n");
+    ok(&["delete-range", path, "", "z"]);
+    assert_eq!(ok(&["scan", path]), "");
+}
+
+#[test]
 fn text_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.db");
@@ -121,9 +145,15 @@ fn errors_leave_no_store() {
     let path = dir.path().join("data.db");
     let path = path.to_str().unwrap();
 
-    // Reads never create the store, and a put with a bad argument doesn't open it.
+    // Reads and deletes never create the store, and a put with a bad argument
+    // doesn't open it.
     assert_eq!(encina(&["get", path, "k"]).status.code(), Some(2));
     assert_eq!(encina(&["scan", path]).status.code(), Some(2));
+    assert_eq!(encina(&["delete", path, "k"]).status.code(), Some(2));
+    assert_eq!(
+        encina(&["delete-range", path, "a", "b"]).status.code(),
+        Some(2)
+    );
     assert_eq!(encina(&["put", path, r"k\q", "v"]).status.code(), Some(2));
     assert_eq!(encina(&["put", path, r"k\x0", "v"]).status.code(), Some(2));
     assert!(!Path::new(path).exists());
@@ -135,7 +165,8 @@ fn errors_leave_no_store() {
         encina(&["scan", path, "a", "b", "c"]).status.code(),
         Some(2)
     );
-    assert!(ok(&["--help"]).starts_with("Puts, gets and scans"));
+    assert_eq!(encina(&["delete-range", path, "a"]).status.code(), Some(2));
+    assert!(ok(&["--help"]).starts_with("Puts, gets, scans and deletes"));
 }
 
 #[compio::test]
