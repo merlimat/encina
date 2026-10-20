@@ -47,6 +47,9 @@ Exit status: 0 on success, 1 if get finds no such key, 2 on errors.";
 #[derive(Parser)]
 #[command(version, after_help = AFTER_HELP)]
 struct Cli {
+    /// The store's file
+    #[arg(short = 'f', long = "file", value_name = "PATH")]
+    path: PathBuf,
     #[command(subcommand)]
     command: Command,
 }
@@ -55,8 +58,6 @@ struct Cli {
 enum Command {
     /// Writes a value under a key, creating the store if needed
     Put {
-        /// The store's file
-        path: PathBuf,
         #[arg(value_parser = unescape)]
         key: Box<[u8]>,
         #[arg(value_parser = unescape)]
@@ -64,26 +65,20 @@ enum Command {
     },
     /// Removes a key, if present
     Delete {
-        /// The store's file
-        path: PathBuf,
         #[arg(value_parser = unescape)]
         key: Box<[u8]>,
     },
     /// Removes the entries in a range of keys
     DeleteRange {
-        /// The store's file
-        path: PathBuf,
         /// The first key in the range; "" for the first key in the store
-        #[arg(value_parser = unescape)]
+        #[arg(short = 's', long, value_name = "KEY", value_parser = unescape)]
         start: Box<[u8]>,
         /// The key the range stops before
-        #[arg(value_parser = unescape)]
+        #[arg(short = 'e', long, value_name = "KEY", value_parser = unescape)]
         end: Box<[u8]>,
     },
     /// Prints the value under a key
     Get {
-        /// The store's file
-        path: PathBuf,
         #[arg(value_parser = unescape)]
         key: Box<[u8]>,
         /// Prints the value in the layout of `hexdump -C`
@@ -92,13 +87,11 @@ enum Command {
     },
     /// Prints the entries in a range of keys, one per line as key<TAB>value
     Scan {
-        /// The store's file
-        path: PathBuf,
         /// The first key in the range; by default, the first key in the store
-        #[arg(value_parser = unescape)]
+        #[arg(short = 's', long, value_name = "KEY", value_parser = unescape)]
         start: Option<Box<[u8]>>,
         /// The key the range stops before; by default, the range has no end
-        #[arg(value_parser = unescape)]
+        #[arg(short = 'e', long, value_name = "KEY", value_parser = unescape)]
         end: Option<Box<[u8]>>,
         /// Prints keys and values in the layout of `hexdump -C`
         #[arg(short = 'x', long)]
@@ -114,29 +107,23 @@ enum Command {
     /// entries (an internal node's entries are its children), and how full their
     /// pages are. A value leaf holds an entry too large for a leaf, on as many pages
     /// as it needs.
-    Stats {
-        /// The store's file
-        path: PathBuf,
-    },
+    Stats,
     /// Prints a map of the store's pages, 64 to a line
     ///
     /// Each line starts with the number of its first page. M is a meta page, L a
     /// leaf, D a dense leaf, V a page of a value leaf, a digit an internal node at
     /// that level, and . a free page.
-    Pages {
-        /// The store's file
-        path: PathBuf,
-    },
+    Pages,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result: Result<ExitCode, Box<dyn Error>> = compio::runtime::Runtime::new()
         .map_err(Box::from)
-        .and_then(|runtime| runtime.block_on(run(cli.command)));
+        .and_then(|runtime| runtime.block_on(run(&cli.path, cli.command)));
     match result {
         Ok(code) => code,
-        // The reader went away, as in `encina scan data.db | head`: stop quietly.
+        // The reader went away, as in `encina -f data.db scan | head`: stop quietly.
         Err(e)
             if e.downcast_ref::<io::Error>().map(io::Error::kind)
                 == Some(io::ErrorKind::BrokenPipe) =>
@@ -150,26 +137,26 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
+async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn Error>> {
     let mut out = BufWriter::new(io::stdout().lock());
     match command {
-        Command::Put { path, key, value } => {
+        Command::Put { key, value } => {
             let mut batch = WriteBatch::new();
             batch.put(&key, &value);
-            write(&path, &mut batch).await?;
+            write(path, &mut batch).await?;
         }
-        Command::Delete { path, key } => {
+        Command::Delete { key } => {
             let mut batch = WriteBatch::new();
             batch.delete(&key);
-            write_existing(&path, &mut batch).await?;
+            write_existing(path, &mut batch).await?;
         }
-        Command::DeleteRange { path, start, end } => {
+        Command::DeleteRange { start, end } => {
             let mut batch = WriteBatch::new();
             batch.delete_range(&start, &end);
-            write_existing(&path, &mut batch).await?;
+            write_existing(path, &mut batch).await?;
         }
-        Command::Get { path, key, hexdump } => {
-            let Some(value) = get(&path, &key).await.map_err(|e| at(&path, e))? else {
+        Command::Get { key, hexdump } => {
+            let Some(value) = get(path, &key).await.map_err(|e| at(path, e))? else {
                 eprintln!("encina: key not found");
                 return Ok(ExitCode::FAILURE);
             };
@@ -181,14 +168,13 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
             }
         }
         Command::Scan {
-            path,
             start,
             end,
             hexdump,
         } => {
             let start = start.as_deref().map_or(Bound::Unbounded, Bound::Included);
             let end = end.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
-            scan(&path, start, end, |key, value| {
+            scan(path, start, end, |key, value| {
                 if hexdump {
                     write_hexdump(&mut out, "key   ", key)?;
                     write_hexdump(&mut out, "value ", value)
@@ -201,14 +187,14 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
             })
             .await?;
         }
-        Command::Stats { path } => {
+        Command::Stats => {
             let Store {
                 page_size,
                 file_size,
                 entry_count,
                 entry_size,
                 pages,
-            } = read_pages(&path).await?;
+            } = read_pages(path).await?;
             let nodes: Vec<_> = pages
                 .iter()
                 .filter_map(|page| match page {
@@ -261,8 +247,8 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
                 }
             }
         }
-        Command::Pages { path } => {
-            let Store { pages, .. } = read_pages(&path).await?;
+        Command::Pages => {
+            let Store { pages, .. } = read_pages(path).await?;
             let width = (pages.len() - 1).to_string().len();
             for (row, line) in pages.chunks(64).enumerate() {
                 write!(out, "{:>width$} ", row * 64)?;
