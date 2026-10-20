@@ -94,6 +94,15 @@ const DISK_READ_DURATION: LatencyDef = LatencyDef::new("encina.disk.read.duratio
     .description("Time a read of a leaf or a value leaf takes");
 const DISK_SYNC_DURATION: LatencyDef =
     LatencyDef::new("encina.disk.sync.duration").description("Time a sync of the store file takes");
+const ENTRY_COUNT: UpDownCounterDef = UpDownCounterDef::new("encina.entry.count")
+    .unit("{entry}")
+    .description("Entries in the store's current version");
+const ENTRY_SIZE: UpDownCounterDef = UpDownCounterDef::new("encina.entry.size")
+    .unit("By")
+    .description("Bytes of the keys and values of the entries in the store's current version");
+const FILE_SIZE: UpDownCounterDef = UpDownCounterDef::new("encina.file.size")
+    .unit("By")
+    .description("The store file's size");
 const FILE_USAGE: UpDownCounterDef = UpDownCounterDef::new("encina.file.usage")
     .unit("By")
     .description("The store file's pages: in the current version, held back by readers, or free");
@@ -217,14 +226,17 @@ pub(crate) struct Metrics {
     pub(crate) written: Io,
     pub(crate) read_duration: Latency,
     pub(crate) sync_duration: Latency,
+    pub(crate) entry_count: Amount,
+    pub(crate) entry_size: Amount,
+    pub(crate) file_size: Amount,
     /// The file's pages: live, held back by readers, and free.
     pub(crate) file_usage: [Amount; 3],
     pub(crate) failed: Amount,
 }
 
 impl Metrics {
-    /// The handles of a store, from `meter`. A read-only view leaves out writes and
-    /// the file, which the store's owner reports.
+    /// The handles of a store, from `meter`. A read-only view leaves out writes, the
+    /// entries and the file, which the store's owner reports.
     pub(crate) fn new(meter: &Meter, read_only: bool) -> Metrics {
         let none = Meter::default();
         let owner = if read_only { &none } else { meter };
@@ -248,6 +260,9 @@ impl Metrics {
             written: Io::new(owner, "write"),
             read_duration: meter.disk_read_duration(),
             sync_duration: owner.latency(DISK_SYNC_DURATION),
+            entry_count: owner.amount(ENTRY_COUNT, &[]),
+            entry_size: owner.amount(ENTRY_SIZE, &[]),
+            file_size: owner.amount(FILE_SIZE, &[]),
             file_usage: ["live", "held", "free"]
                 .map(|state| owner.amount(FILE_USAGE, &[KeyValue::new(PAGE_STATE, state)])),
             failed: owner.amount(STORE_FAILED, &[]),

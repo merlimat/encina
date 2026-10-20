@@ -162,8 +162,9 @@ is and escapes other bytes the same way. `encina --help` has the details.
 ## Metrics
 
 A store exports metrics through OpenTelemetry when its options name a meter
-provider: write and commit latency, cache hits and misses, disk traffic, how the
-file's pages are used, and more. Each record takes a few nanoseconds, through
+provider: write and commit latency, cache hits and misses, disk traffic, the
+entries stored and their size, how the file's pages are used, and more. Each
+record takes a few nanoseconds, through
 [nanometer](https://github.com/merlimat/nanometer), and never allocates.
 
 ```rust

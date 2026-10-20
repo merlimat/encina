@@ -589,11 +589,11 @@ Integers are little-endian unless said otherwise, and checksums are crc32c. Noth
 else is stored: free space is derived from the tree (below).
 
 **Meta page.** Each slot fills a page, and the commit of generation `g` writes slot
-`g % 2`. The bytes past the 48 below are zero.
+`g % 2`. The bytes past the 64 below are zero.
 
 ```text
 offset  size  field
-     0     4  checksum of bytes 4..48
+     0     4  checksum of bytes 4..64
      4     8  magic: "encina\0\0"
     12     4  format version: 1
     16     4  page size, in bytes
@@ -602,6 +602,8 @@ offset  size  field
     24     8  generation
     32     8  root's page id, 0 for an empty tree
     40     8  high-water mark: no page at or above it is in use
+    48     8  entries in the tree
+    56     8  bytes of their keys and values
 ```
 
 **Node header.** Every node starts with 32 bytes:
@@ -663,14 +665,40 @@ smallest key in child `i`'s subtree, and its value is a child reference:
 
 ```text
 offset  size  field
-     0     4  frame: the child's frame in memory, NO_FRAME (0xFFFFFFFF) for a leaf
+     0     4  frame: the child's frame in memory
      4     8  the child's page id
+    12     4  zero
 ```
 
 The frame only means something in memory: it is written to disk as it stands, and
 loading the node rewrites it. So an internal node stores its references whole: a
-dense one has no value prefix, and a value suffix of 12 bytes. Leaves are found by
-page id, through the cache, so a level-1 node's frames are all `NO_FRAME`.
+dense one has no value prefix, and a value suffix of 16 bytes.
+
+A level-1 node's children are leaves, which are found by page id, through the
+cache. Its references hold the leaf's size where the frame would go, and in the
+last four bytes:
+
+```text
+offset  size  field
+     0     4  entries in the leaf: 1 for a value leaf
+     4     8  the leaf's page id
+    12     4  bytes of the leaf's keys and values
+```
+
+**Entry count and size.** The meta page records how many entries the tree holds,
+and the bytes of their keys and values, so a store knows both without reading its
+leaves. A commit adds the sizes of the leaves it builds, and takes out those of the
+leaves it replaces, drops or moves, as their parents' references record them. A
+range that drops whole subtrees takes their entries out from the level-1 nodes
+above their leaves, which stay in memory, so it still reads no leaf. A root leaf
+has no parent: it holds every entry. Costs:
+
+- The sizes take 4 bytes per reference: about 15% fewer children per internal node
+  with the benchmark's 16-byte keys, and 4 bytes off the longest key, 990 bytes
+  with 4 KiB pages. In `file_size_and_requests` (below), the appends' commits
+  write 0.4% more pages for it, and the random updates' commits at most 0.5% more.
+- A commit's work grows by one addition per leaf it builds, replaces, drops or
+  moves. The leaves a range drops were already visited, to free their pages.
 
 **Page ids.** The low 40 bits hold a node's first page, and the high 24 bits a value
 leaf's span, in pages: 0 for every other node. With 4 KiB pages, 40 bits address

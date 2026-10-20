@@ -19,7 +19,7 @@
 //!
 //! ```text
 //! offset  size  field
-//!      0     4  checksum (crc32c of bytes 4..48)
+//!      0     4  checksum (crc32c of bytes 4..64)
 //!      4     8  magic
 //!     12     4  format version
 //!     16     4  page size
@@ -27,6 +27,8 @@
 //!     24     8  generation
 //!     32     8  root page, 0 for an empty tree
 //!     40     8  high-water mark: no page at or above it is in use
+//!     48     8  entries in the tree
+//!     56     8  bytes of their keys and values
 //! ```
 
 /// Pages 0 and 1 hold the meta slots; nodes start at page 2.
@@ -34,7 +36,7 @@ pub(crate) const META_PAGES: u64 = 2;
 
 const MAGIC: [u8; 8] = *b"encina\0\0";
 pub(crate) const FORMAT_VERSION: u32 = 1;
-const LEN: usize = 48;
+const LEN: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Meta {
@@ -45,6 +47,9 @@ pub(crate) struct Meta {
     pub(crate) root: u64,
     pub(crate) root_level: u8,
     pub(crate) high_water: u64,
+    /// The tree's entries, and the bytes of their keys and values.
+    pub(crate) entries: u64,
+    pub(crate) entry_bytes: u64,
 }
 
 impl Meta {
@@ -57,6 +62,8 @@ impl Meta {
             root: 0,
             root_level: 0,
             high_water: META_PAGES,
+            entries: 0,
+            entry_bytes: 0,
         }
     }
 
@@ -74,6 +81,8 @@ impl Meta {
         page[24..32].copy_from_slice(&self.generation.to_le_bytes());
         page[32..40].copy_from_slice(&self.root.to_le_bytes());
         page[40..48].copy_from_slice(&self.high_water.to_le_bytes());
+        page[48..56].copy_from_slice(&self.entries.to_le_bytes());
+        page[56..64].copy_from_slice(&self.entry_bytes.to_le_bytes());
         let crc = crc32c::crc32c(&page[4..LEN]);
         page[..4].copy_from_slice(&crc.to_le_bytes());
     }
@@ -97,6 +106,8 @@ impl Meta {
             generation: u64_at(24),
             root: u64_at(32),
             high_water: u64_at(40),
+            entries: u64_at(48),
+            entry_bytes: u64_at(56),
         })
     }
 }
@@ -114,12 +125,14 @@ mod tests {
             root: 1234,
             root_level: 3,
             high_water: 99,
+            entries: 12_345,
+            entry_bytes: 1 << 40,
         };
         let mut page = vec![0xff; 4096];
         meta.encode(&mut page);
         assert_eq!(Meta::decode(&page), Some(meta));
         assert_eq!(meta.slot(), 1);
-        for at in [0, 4, 20, 47] {
+        for at in [0, 4, 20, 47, 63] {
             let mut torn = page.clone();
             torn[at] ^= 0x10;
             assert_eq!(

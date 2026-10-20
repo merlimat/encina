@@ -43,7 +43,7 @@ attributes, and across reopening the same path.
 
 A `ReadOnlyDb` reports its lookups, iterators, readers, cache and disk reads, which
 add to the owner's when both open the store by the same path. It doesn't report
-writes, commits, syncs, the file's pages or `encina.store.failed`, which the
+writes, commits, syncs, the entries, the file or `encina.store.failed`, which the
 store's owner reports.
 
 ## Writes and commits
@@ -159,13 +159,23 @@ store's owner reports.
 - **`encina.disk.sync.duration`**: how long each sync of the store file takes. A
   commit syncs twice: once its pages are written, and once its meta page is.
 
-## Space and state
+## Entries, space and state
 
 | Metric | Type | Unit | Attributes |
 |---|---|---|---|
+| `encina.entry.count` | up-down counter | `{entry}` | |
+| `encina.entry.size` | up-down counter | `By` | |
+| `encina.file.size` | up-down counter | `By` | |
 | `encina.file.usage` | up-down counter | `By` | `encina.page.state`: `live`, `held`, `free` |
 | `encina.store.failed` | up-down counter | `{store}` | |
 
+- **`encina.entry.count`**: the entries in the store's current version.
+- **`encina.entry.size`**: the bytes of their keys and values.
+  - It counts what the app wrote, not what the store takes: leaves store the
+    prefixes their keys and values share once, and value leaves round their
+    entries up to whole pages.
+  - `encina.file.usage`, state `live`, gives the bytes the entries take on disk.
+- **`encina.file.size`**: the store file's size.
 - **`encina.file.usage`**: the store file's pages, by state. The three add up to the
   file's size.
   - `live`: the current version's pages, the two meta pages included.
@@ -176,7 +186,8 @@ store's owner reports.
     freed too, and the end of the file, which is cut only once that frees an eighth
     of it.
 
-  It is updated when the store opens and after each commit.
+  These four are updated when the store opens and after each commit. The store
+  keeps the entries' count and size in its meta page, so they cost no reads.
 - **`encina.store.failed`**: 1 while the store rejects writes with `Error::Failed`. An
   I/O error during a commit left it unknown whether the commit is durable.
   Reopening the store recovers it.
