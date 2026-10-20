@@ -79,38 +79,8 @@
 //! under the scope `encina`, recorded with [nanometer](https://docs.rs/nanometer)
 //! in a few nanoseconds each. Each series has the attribute `encina.store`, the
 //! path the store was opened at, and those of [`Options::metric_attributes`].
-//!
-//! Amounts a store holds are up-down counters, so that the stores of a process add
-//! up. A store takes its share back out when it closes. A [`ReadOnlyDb`] reports
-//! neither writes nor its file, which the store's owner reports.
-//!
-//! | Metric | Type | Unit | What it measures |
-//! |---|---|---|---|
-//! | `encina.write.duration` | histogram | `s` | Each successful [`Db::write`], waiting for its commit included |
-//! | `encina.write.operations` | counter | `{operation}` | Operations written, by `encina.operation.type`: `put`, `delete`, `delete_range` |
-//! | `encina.write.size` | histogram | `By` | The keys and values of each batch written |
-//! | `encina.write.pending` | up-down counter | `{write}` | Writes waiting for their commit or committing |
-//! | `encina.write.errors` | counter | `{error}` | Failed writes, by `error.type` |
-//! | `encina.commit.duration` | histogram | `s` | Each commit, from planning its batches to publishing its version |
-//! | `encina.commit.writes` | histogram | `{write}` | The writes each commit makes durable together |
-//! | `encina.get.duration` | histogram | `s` | Each successful [`Db::get`] |
-//! | `encina.get.errors` | counter | `{error}` | Failed lookups, by `error.type` |
-//! | `encina.range.iterators` | counter | `{iterator}` | Iterators [`Db::range`] created |
-//! | `encina.range.entries` | counter | `{entry}` | Entries iterators returned, counted when they are dropped |
-//! | `encina.reader.count` | up-down counter | `{reader}` | Iterators, and lookups waiting for the disk: they pin a version |
-//! | `encina.cache.lookups` | counter | `{lookup}` | Leaves that reads and writes needed, by `encina.cache.result`: `hit`, `miss` |
-//! | `encina.cache.evictions` | counter | `{leaf}` | Leaves evicted to make room |
-//! | `encina.cache.usage` | up-down counter | `By` | Page frames in use, by `encina.page.type`: `internal`, `leaf`, `value` |
-//! | `encina.cache.limit` | up-down counter | `By` | The budget for page frames, [`Options::cache_size`] |
-//! | `encina.disk.io` | counter | `By` | Bytes read and written, by `disk.io.direction`: `read`, `write` |
-//! | `encina.disk.operations` | counter | `{operation}` | Read and write requests, by `disk.io.direction` |
-//! | `encina.disk.read.duration` | histogram | `s` | Each read of a leaf |
-//! | `encina.disk.sync.duration` | histogram | `s` | Each sync, two per commit |
-//! | `encina.file.usage` | up-down counter | `By` | The file's pages, by `encina.page.state`: `live` in the current version, `held` back for older versions' readers, or `free` |
-//! | `encina.store.failed` | up-down counter | `{store}` | 1 while the store rejects writes, after an I/O error in a commit |
-//!
-//! Histograms export only through nanometer's `Producer`, which the app registers
-//! with its metric reader.
+//! [METRICS.md](https://github.com/merlimat/encina/blob/main/METRICS.md) lists the
+//! metrics and what each one measures.
 //!
 //! # Platforms
 //!

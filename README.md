@@ -159,6 +159,20 @@ open the store again, and `scan` resumes after the last key it printed. Argument
 take `\xNN` for any byte and `\\` for a backslash, and output prints UTF-8 text as
 is and escapes other bytes the same way. `encina --help` has the details.
 
+## Metrics
+
+A store exports metrics through OpenTelemetry when its options name a meter
+provider: write and commit latency, cache hits and misses, disk traffic, how the
+file's pages are used, and more. Each record takes a few nanoseconds, through
+[nanometer](https://github.com/merlimat/nanometer), and never allocates.
+
+```rust
+let opts = Options::new().meter_provider(&provider);
+```
+
+[METRICS.md](METRICS.md) lists the metrics, their attributes, and what each one
+measures.
+
 ## Building
 
 ```sh

@@ -102,11 +102,11 @@ impl Options {
     /// Exports the store's metrics through `provider`, under the instrumentation
     /// scope `encina`. Without a provider, the store records none.
     ///
-    /// The crate docs list the [metrics](crate#metrics). Each series has the
-    /// attribute `encina.store`, the path the store was opened at, and those of
-    /// [`metric_attributes`](Self::metric_attributes). Histograms export only
-    /// through nanometer's `Producer`, which the app registers with its metric
-    /// reader: see [nanometer](https://docs.rs/nanometer).
+    /// [METRICS.md](https://github.com/merlimat/encina/blob/main/METRICS.md) lists
+    /// the metrics. Each series has the attribute `encina.store`, the path the store
+    /// was opened at, and those of [`metric_attributes`](Self::metric_attributes).
+    /// Histograms export only through nanometer's `Producer`, which the app
+    /// registers with its metric reader: see [nanometer](https://docs.rs/nanometer).
     ///
     /// The first store with metrics in a process calibrates the clock that times
     /// operations, which blocks its open for 10 to 200 ms.
