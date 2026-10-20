@@ -47,8 +47,11 @@
 //! format whenever its entries allow it, since it is then never larger.
 //!
 //! Internal nodes use the same formats. Their values are child references,
-//! [`CHILD_REF`] bytes: the child's frame, then its page id once it has one. Loading
-//! an internal node rewrites the frames, so its values are always stored whole.
+//! [`CHILD_REF`] bytes: the child's frame, its page id once it has one, and four
+//! zero bytes. Loading an internal node rewrites the frames, so its values are always
+//! stored whole. A level-1 node refers to leaves, which are found by page id: a
+//! reference to a leaf holds the leaf's entry count where the frame goes, and the
+//! bytes of its keys and values in the last four.
 //!
 //! **Value leaves** hold one entry too large for the other formats, on as many
 //! adjacent pages as it needs: the header, with the key length at offset 8 and the
@@ -58,13 +61,14 @@
 //! and its key is its parent's key for it.
 
 use std::cmp::Ordering;
+use std::ops::{AddAssign, SubAssign};
 
 use crate::pool::FrameId;
 
 pub(crate) const HEADER: usize = 32;
 const HEAD: usize = 4;
 const SLOT: usize = 6;
-pub(crate) const CHILD_REF: usize = 12;
+pub(crate) const CHILD_REF: usize = 16;
 const FORMAT_SLOTTED: u8 = 1;
 const FORMAT_DENSE: u8 = 2;
 const FORMAT_VALUE: u8 = 3;
@@ -209,24 +213,91 @@ pub(crate) fn max_entry(page_size: usize) -> usize {
 /// found by page id, through the leaf cache.
 pub(crate) const NO_FRAME: FrameId = FrameId::MAX;
 
-/// Encodes a child reference for an internal node: the child's frame, or
-/// [`NO_FRAME`] for a leaf, then its page id. Frames are only meaningful in
+/// How many entries a leaf, or a tree, holds, and the bytes of their keys and
+/// values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Size {
+    pub(crate) entries: u64,
+    pub(crate) bytes: u64,
+}
+
+impl AddAssign for Size {
+    fn add_assign(&mut self, other: Size) {
+        self.entries += other.entries;
+        self.bytes += other.bytes;
+    }
+}
+
+impl SubAssign for Size {
+    fn sub_assign(&mut self, other: Size) {
+        self.entries -= other.entries;
+        self.bytes -= other.bytes;
+    }
+}
+
+/// The node a child reference refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Child {
+    /// Its frame, or [`NO_FRAME`] for a leaf.
+    pub(crate) frame: FrameId,
+    pub(crate) page: u64,
+    /// A leaf's size; zero for an internal node.
+    pub(crate) size: Size,
+}
+
+impl Child {
+    /// A leaf on page id `page`, of `size`.
+    pub(crate) fn leaf(page: u64, size: Size) -> Child {
+        Child {
+            frame: NO_FRAME,
+            page,
+            size,
+        }
+    }
+
+    /// An internal node in `frame`, on page `page`.
+    pub(crate) fn internal(frame: FrameId, page: u64) -> Child {
+        Child {
+            frame,
+            page,
+            size: Size::default(),
+        }
+    }
+}
+
+/// Encodes a child reference for an internal node: the child's frame, its page id,
+/// and four zero bytes. For a leaf, the entry count takes the frame's place, and
+/// the bytes of its keys and values the last four. Frames are only meaningful in
 /// memory: loading an internal node rewrites them.
-pub(crate) fn child_ref(frame: FrameId, page: u64) -> [u8; CHILD_REF] {
+pub(crate) fn child_ref(child: Child) -> [u8; CHILD_REF] {
+    let (head, tail) = if child.frame == NO_FRAME {
+        let entries = u32::try_from(child.size.entries).unwrap();
+        (entries, u32::try_from(child.size.bytes).unwrap())
+    } else {
+        (child.frame, 0)
+    };
     let mut r = [0; CHILD_REF];
-    r[..4].copy_from_slice(&frame.to_le_bytes());
-    r[4..].copy_from_slice(&page.to_le_bytes());
+    r[..4].copy_from_slice(&head.to_le_bytes());
+    r[4..12].copy_from_slice(&child.page.to_le_bytes());
+    r[12..].copy_from_slice(&tail.to_le_bytes());
     r
 }
 
-/// The frame a child reference points to.
-pub(crate) fn child_frame(child_ref: &[u8]) -> FrameId {
-    u32::from_le_bytes(child_ref[..4].try_into().unwrap())
+/// Decodes a child reference: to a leaf if `leaf`, held by a level-1 node.
+pub(crate) fn decode_child(child_ref: &[u8], leaf: bool) -> Child {
+    let u32_at = |at: usize| u32::from_le_bytes(child_ref[at..at + 4].try_into().unwrap());
+    let page = child_page(child_ref);
+    if leaf {
+        let (entries, bytes) = (u32_at(0).into(), u32_at(12).into());
+        Child::leaf(page, Size { entries, bytes })
+    } else {
+        Child::internal(u32_at(0), page)
+    }
 }
 
 /// The page a child reference points to.
 pub(crate) fn child_page(child_ref: &[u8]) -> u64 {
-    u64::from_le_bytes(child_ref[4..CHILD_REF].try_into().unwrap())
+    u64::from_le_bytes(child_ref[4..12].try_into().unwrap())
 }
 
 /// Stamps `generation` and the checksum into the header of the node in `page`,
@@ -256,7 +327,8 @@ pub(crate) fn verify(page: &[u8]) -> bool {
         && (node.level() == 0 || (node.value_prefix == 0 && node.value_suffix == CHILD_REF))
 }
 
-/// Points entry `i` of the internal node in `page` at `frame`.
+/// Points entry `i` of the internal node in `page` at `frame`. A level-1 node's
+/// references hold its leaves' sizes there instead.
 pub(crate) fn set_child_frame(page: &mut [u8], i: usize, frame: FrameId) {
     let (at, _) = Node::new(page).value_span(i);
     page[at..at + 4].copy_from_slice(&frame.to_le_bytes());
@@ -645,8 +717,14 @@ impl<'a> Node<'a> {
     }
 
     /// The child an internal node's entry `i` refers to.
+    pub(crate) fn child_at(&self, i: usize) -> Child {
+        decode_child(self.value(i), self.level() == 1)
+    }
+
+    /// The frame of the child an internal node's entry `i` refers to, or
+    /// [`NO_FRAME`] for a leaf.
     pub(crate) fn child(&self, i: usize) -> FrameId {
-        child_frame(self.value(i))
+        self.child_at(i).frame
     }
 
     /// The page of the child an internal node's entry `i` refers to.
@@ -770,6 +848,14 @@ impl EntryBuf {
         self.bytes.extend_from_slice(value);
         self.items
             .push([at as u32, key.len() as u32, value.len() as u32]);
+    }
+
+    /// The bytes of the keys and values of entries `a..b`.
+    pub(crate) fn data_len(&self, a: usize, b: usize) -> usize {
+        self.items[a..b]
+            .iter()
+            .map(|&[_, key_len, len]| (key_len + len) as usize)
+            .sum()
     }
 
     /// Appends a copy of entries `a..b`.
@@ -1097,8 +1183,8 @@ mod tests {
     #[test]
     fn dense_internal_nodes_need_whole_child_refs() {
         let mut buf = EntryBuf::default();
-        buf.push(b"a", &child_ref(1, 2));
-        buf.push(b"b", &child_ref(1, 3));
+        buf.push(b"a", &child_ref(Child::internal(1, 2)));
+        buf.push(b"b", &child_ref(Child::internal(1, 3)));
         let mut page = vec![0; 4096];
         build(&mut page, 1, &buf, 0, 2);
         seal(&mut page, 1);
@@ -1115,8 +1201,14 @@ mod tests {
 
     #[test]
     fn child_refs_round_trip() {
-        let r = child_ref(7, u64::MAX - 1);
-        assert_eq!((child_frame(&r), child_page(&r)), (7, u64::MAX - 1));
+        let internal = Child::internal(7, u64::MAX - 1);
+        assert_eq!(decode_child(&child_ref(internal), false), internal);
+        let size = Size {
+            entries: 807,
+            bytes: u64::from(u32::MAX),
+        };
+        let leaf = Child::leaf(u64::MAX - 1, size);
+        assert_eq!(decode_child(&child_ref(leaf), true), leaf);
     }
 
     #[test]
@@ -1135,7 +1227,10 @@ mod tests {
             // Four internal entries with maximal keys.
             let mut internal = BTreeMap::new();
             for b in 0..4u8 {
-                internal.insert(vec![b; max - usize::from(b)], child_ref(7, 9));
+                internal.insert(
+                    vec![b; max - usize::from(b)],
+                    child_ref(Child::internal(7, 9)),
+                );
             }
             let mut buf = EntryBuf::default();
             for (k, v) in &internal {

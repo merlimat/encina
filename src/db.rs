@@ -30,7 +30,7 @@ use crate::cache::Cache;
 use crate::error::{Error, Result};
 use crate::meta::{self, FORMAT_VERSION, Meta};
 use crate::metrics::{self, Metrics};
-use crate::node::{self, NO_FRAME, Node, ValueLeaf};
+use crate::node::{self, NO_FRAME, Node, Size, ValueLeaf};
 use crate::options::{DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE, Options};
 use crate::pool::{FrameBuf, FrameId, Holds, Pool, ValueBuf};
 use crate::reads::{Claim, Reads};
@@ -170,13 +170,21 @@ impl Inner {
         self.metrics.failed.set(1);
     }
 
-    /// Reports how the file's pages are used: by the current version, held back by
-    /// older versions' readers, or free.
-    fn report_space(&self) {
-        let (used, held) = self.tree.borrow().pages.space.usage();
-        let pages = [used - held, held, self.file_end.get() - used];
+    /// Reports the current version's entries, the file's size, and how its pages
+    /// are used: by the current version, held back by older versions' readers, or
+    /// free.
+    fn report_usage(&self) {
+        let tree = self.tree.borrow();
+        let size = tree.size();
+        self.metrics.entry_count.set(size.entries as i64);
+        self.metrics.entry_size.set(size.bytes as i64);
+        let page_size = self.page_size as u64;
+        let end = self.file_end.get();
+        self.metrics.file_size.set((end * page_size) as i64);
+        let (used, held) = tree.pages.space.usage();
+        let pages = [used - held, held, end - used];
         for (amount, pages) in self.metrics.file_usage.iter().zip(pages) {
-            amount.set((pages * self.page_size as u64) as i64);
+            amount.set((pages * page_size) as i64);
         }
     }
 
@@ -269,7 +277,16 @@ impl Db {
             root => root?,
         };
         let inner = Inner {
-            tree: RefCell::new(Tree::new(pages, page_size, root, meta.generation)),
+            tree: RefCell::new(Tree::new(
+                pages,
+                page_size,
+                root,
+                meta.generation,
+                Size {
+                    entries: meta.entries,
+                    bytes: meta.entry_bytes,
+                },
+            )),
             reads: RefCell::new(reads),
             storage,
             writes: RefCell::new(Writes::new()),
@@ -283,7 +300,7 @@ impl Db {
             runs: RefCell::new(Vec::new()),
         };
         if !read_only {
-            inner.report_space();
+            inner.report_usage();
         }
         Ok(Db {
             inner: Rc::new(inner),
@@ -861,13 +878,11 @@ async fn load_internal(
                 for page in first..first + n {
                     pages.space.mark_used(page);
                 }
-                let frame = if level > 1 {
-                    pages.pool.alloc(Holds::Internal, page)
-                } else {
-                    NO_FRAME
-                };
-                node::set_child_frame(pages.pool.page_mut(parent), i, frame);
+                // Leaves are found by page id: a level-1 node's references hold
+                // their sizes where the frames go.
                 if level > 1 {
+                    let frame = pages.pool.alloc(Holds::Internal, page);
+                    node::set_child_frame(pages.pool.page_mut(parent), i, frame);
                     next.push((frame, page));
                 }
             }
@@ -974,7 +989,7 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
     };
     if !changed {
         // Planning may have freed pages that readers held back.
-        inner.report_space();
+        inner.report_usage();
         return Ok(());
     }
     let generation = inner.tree.borrow().current().generation + 1;
@@ -1015,7 +1030,7 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
         yield_now().await;
         inner.tree.borrow_mut().resume();
     }
-    inner.report_space();
+    inner.report_usage();
     Ok(())
 }
 

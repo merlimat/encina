@@ -36,7 +36,7 @@ use opentelemetry_sdk::metrics::{
 use proptest::prelude::*;
 
 use crate::meta::Meta;
-use crate::node::{self, NO_FRAME, Node};
+use crate::node::{self, Node};
 use crate::pool::Holds;
 use crate::sim::{Fault, SimDisk};
 use crate::{Comparison, Db, Error, Options, ReadOnlyDb, WriteBatch};
@@ -337,7 +337,7 @@ fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
                 let ops = step.ops();
                 write(&store.db, &ops);
                 apply(&mut model, &ops);
-                store.db.check();
+                check_tree(&store.db, &model);
             }
             Step::Get(key, cmp) => {
                 let got = get(&store.db, key, *cmp);
@@ -368,7 +368,7 @@ fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
                 }
                 assert_eq!(seen, before, "the scan saw a later write");
                 drop(iter);
-                store.db.check();
+                check_tree(&store.db, &model);
             }
             Step::Group(writes) => {
                 let applied = write_group(&store, writes);
@@ -377,7 +377,7 @@ fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
                         apply(&mut model, ops);
                     }
                 }
-                store.db.check();
+                check_tree(&store.db, &model);
             }
             Step::Paused(ops, polls, finish) => {
                 let before = expected_scan(&model, ALL);
@@ -412,16 +412,27 @@ fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
                 if finished || generation(&store.db) > start {
                     apply(&mut model, ops);
                 }
-                store.db.check();
+                check_tree(&store.db, &model);
             }
             Step::Reopen => {
                 store.reopen();
                 store.db.set_merge_slice(slice);
-                store.db.check();
+                check_tree(&store.db, &model);
             }
         }
     }
     check_reads(&store.db, &model);
+}
+
+/// Checks the tree, and that it counts the entries of `model`.
+fn check_tree(db: &Db, model: &Model) {
+    db.check();
+    let bytes = model.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
+    let size = node::Size {
+        entries: model.len() as u64,
+        bytes,
+    };
+    assert_eq!(db.tree().size(), size, "entries miscounted");
 }
 
 /// Checks a full scan, and every comparison on every key and on the gap just above
@@ -575,7 +586,7 @@ proptest! {
 /// listed before it paused.
 fn same_plans(steps: &[Step], ops: &[Op], slice: usize) {
     let store = Store::new(Options::new().page_size(256));
-    let load: Vec<_> = (0..2000u32)
+    let load: Vec<_> = (0..1500u32)
         .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![1; 40]))
         .collect();
     write(&store.db, &load);
@@ -1420,7 +1431,11 @@ fn a_bad_child_reference_fails_the_open() {
     for (i, bad) in [(0, store.disk.len() / 256), (1, first)] {
         let mut page = bytes.clone();
         let (at, _) = Node::new(&page).value_span(i);
-        page[at..at + node::CHILD_REF].copy_from_slice(&node::child_ref(NO_FRAME, bad));
+        let child = node::Child {
+            page: bad,
+            ..Node::new(&page).child_at(i)
+        };
+        page[at..at + node::CHILD_REF].copy_from_slice(&node::child_ref(child));
         let generation = Node::new(&page).generation();
         node::seal(&mut page, generation);
         let disk = store.disk.restart();
@@ -4582,6 +4597,9 @@ fn metrics_report_the_memory_and_the_file() {
     let [live, held, free] = file_usage(test);
     assert_eq!(held, 0);
     assert_eq!(live + held + free, disk.len() as i64);
+    assert_eq!(sum(test, "encina.file.size", &[]), Some(disk.len() as i64));
+    assert_eq!(sum(test, "encina.entry.count", &[]), Some(2000));
+    assert_eq!(sum(test, "encina.entry.size", &[]), Some(2000 * 12));
 
     // A reader holds back the pages that a write replaces, until a write after it.
     let reader = db.range(ALL);
@@ -4597,12 +4615,20 @@ fn metrics_report_the_memory_and_the_file() {
     assert_eq!(sum(test, "encina.reader.count", &[]), Some(0));
     write(&db, &[Op::Put(vec![0], vec![0])]);
     assert_eq!(file_usage(test)[1], 0);
+    assert_eq!(sum(test, "encina.entry.count", &[]), Some(2001));
+    assert_eq!(sum(test, "encina.entry.size", &[]), Some(2000 * 12 + 2));
+    // A range removes leaves without reading them.
+    write(&db, &[Op::DeleteRange(vec![0], vec![1])]);
+    assert_eq!(sum(test, "encina.entry.count", &[]), Some(0));
+    assert_eq!(sum(test, "encina.entry.size", &[]), Some(0));
+    assert_eq!(sum(test, "encina.file.size", &[]), Some(disk.len() as i64));
 
     // A store takes its share back out when it closes.
     drop(db);
     assert_eq!(sum(test, "encina.cache.limit", &[]), Some(0));
     assert_eq!(usage("internal") + usage("leaf") + usage("value"), 0);
     assert_eq!(file_usage(test), [0; 3]);
+    assert_eq!(sum(test, "encina.file.size", &[]), Some(0));
 }
 
 #[test]
@@ -4653,6 +4679,7 @@ fn metrics_of_a_view_leave_out_writes_and_the_file() {
     assert_eq!(lookups(test).0 + lookups(test).1, 1);
     for metric in [
         "encina.write.pending",
+        "encina.entry.count",
         "encina.file.usage",
         "encina.store.failed",
     ] {
