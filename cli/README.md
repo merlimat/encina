@@ -1,6 +1,6 @@
 # encina-cli
 
-The `encina` command puts, gets and scans the entries of an
+The `encina` command puts, gets, scans and deletes the entries of an
 [encina](https://crates.io/crates/encina) store, for inspecting a store by hand.
 
 ```sh
@@ -9,6 +9,8 @@ encina put data.db user/0001 alice
 encina get data.db user/0001         # alice
 encina scan data.db user/ user0      # one key<TAB>value line per entry
 encina scan -x data.db               # keys and values as hexdump -C shows them
+encina delete data.db user/0001
+encina delete-range data.db user/ user0
 encina stats data.db                 # entries, file size, pages level by level
 encina pages data.db                 # a map of the file's pages, 64 to a line
 ```

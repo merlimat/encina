@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `encina`: puts, gets and scans the entries of a store from the command line.
+//! `encina`: puts, gets, scans and deletes the entries of a store from the command
+//! line.
 
 use std::error::Error;
 use std::fs;
@@ -42,7 +43,7 @@ control characters and bytes that aren't UTF-8 the same way.
 
 Exit status: 0 on success, 1 if get finds no such key, 2 on errors.";
 
-/// Puts, gets and scans the entries of an encina store.
+/// Puts, gets, scans and deletes the entries of an encina store.
 #[derive(Parser)]
 #[command(version, after_help = AFTER_HELP)]
 struct Cli {
@@ -60,6 +61,24 @@ enum Command {
         key: Box<[u8]>,
         #[arg(value_parser = unescape)]
         value: Box<[u8]>,
+    },
+    /// Removes a key, if present
+    Delete {
+        /// The store's file
+        path: PathBuf,
+        #[arg(value_parser = unescape)]
+        key: Box<[u8]>,
+    },
+    /// Removes the entries in a range of keys
+    DeleteRange {
+        /// The store's file
+        path: PathBuf,
+        /// The first key in the range; "" for the first key in the store
+        #[arg(value_parser = unescape)]
+        start: Box<[u8]>,
+        /// The key the range stops before
+        #[arg(value_parser = unescape)]
+        end: Box<[u8]>,
     },
     /// Prints the value under a key
     Get {
@@ -135,14 +154,19 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
     let mut out = BufWriter::new(io::stdout().lock());
     match command {
         Command::Put { path, key, value } => {
-            // Each put is a write of its own, of a few pages: taking any free page
-            // keeps the file small, at the cost of a request or two.
-            let db = Db::open(&path, Options::default().min_run_pages(1))
-                .await
-                .map_err(|e| at(&path, e))?;
             let mut batch = WriteBatch::new();
             batch.put(&key, &value);
-            db.write(&mut batch).await.map_err(|e| at(&path, e))?;
+            write(&path, &mut batch).await?;
+        }
+        Command::Delete { path, key } => {
+            let mut batch = WriteBatch::new();
+            batch.delete(&key);
+            write_existing(&path, &mut batch).await?;
+        }
+        Command::DeleteRange { path, start, end } => {
+            let mut batch = WriteBatch::new();
+            batch.delete_range(&start, &end);
+            write_existing(&path, &mut batch).await?;
         }
         Command::Get { path, key, hexdump } => {
             let Some(value) = get(&path, &key).await.map_err(|e| at(&path, e))? else {
@@ -269,6 +293,23 @@ async fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
 /// Names the store that `e` is about.
 fn at(path: &Path, e: encina::Error) -> Box<dyn Error> {
     format!("{}: {e}", path.display()).into()
+}
+
+/// Writes `batch` to the store at `path`, creating the store if needed.
+async fn write(path: &Path, batch: &mut WriteBatch) -> Result<(), Box<dyn Error>> {
+    // Each command is a write of its own, of a few pages: taking any free page
+    // keeps the file small, at the cost of a request or two.
+    let db = Db::open(path, Options::default().min_run_pages(1))
+        .await
+        .map_err(|e| at(path, e))?;
+    db.write(batch).await.map_err(|e| at(path, e))
+}
+
+/// Writes `batch` to the existing store at `path`: a delete has nothing to remove
+/// from a store that isn't there, and doesn't create one.
+async fn write_existing(path: &Path, batch: &mut WriteBatch) -> Result<(), Box<dyn Error>> {
+    fs::metadata(path).map_err(|e| at(path, e.into()))?;
+    write(path, batch).await
 }
 
 /// Reads the value under `key`. When the store's owner overwrites the version the
