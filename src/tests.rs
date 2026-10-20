@@ -22,8 +22,17 @@ use std::ops::Bound;
 use std::pin::{Pin, pin};
 use std::ptr;
 use std::rc::Rc;
+use std::sync::{Arc, LazyLock, Weak};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::time::Duration;
 
+use opentelemetry::KeyValue;
+use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+use opentelemetry_sdk::metrics::reader::MetricReader;
+use opentelemetry_sdk::metrics::{
+    InstrumentKind, ManualReader, Pipeline, SdkMeterProvider, Temporality,
+};
 use proptest::prelude::*;
 
 use crate::meta::Meta;
@@ -4369,4 +4378,314 @@ async fn yield_once() {
         Poll::Pending
     })
     .await
+}
+
+// Metrics. nanometer's registry is process-wide, and registers a metric with the
+// provider of the first store to create it: the tests share one provider, and tell
+// their series apart by an attribute `test`. The SDK reads the clock as it
+// collects, which Miri doesn't allow.
+
+/// A `ManualReader` the tests keep a handle to: the provider takes the one it gets.
+#[derive(Clone, Debug)]
+struct MetricsReader(Arc<ManualReader>);
+
+impl MetricReader for MetricsReader {
+    fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
+        self.0.register_pipeline(pipeline)
+    }
+    fn collect(&self, rm: &mut ResourceMetrics) -> OTelSdkResult {
+        self.0.collect(rm)
+    }
+    fn force_flush(&self) -> OTelSdkResult {
+        self.0.force_flush()
+    }
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.0.shutdown_with_timeout(timeout)
+    }
+    fn temporality(&self, kind: InstrumentKind) -> Temporality {
+        self.0.temporality(kind)
+    }
+}
+
+static METRICS: LazyLock<(SdkMeterProvider, MetricsReader)> = LazyLock::new(|| {
+    let reader = MetricsReader(Arc::new(ManualReader::builder().build()));
+    let provider = SdkMeterProvider::builder()
+        .with_reader(reader.clone())
+        .build();
+    (provider, reader)
+});
+
+/// Options with 256-byte pages that export metrics, with the attribute `test` set
+/// to `test`.
+pub(crate) fn metered(test: &'static str) -> Options {
+    Options::new()
+        .page_size(256)
+        .meter_provider(&METRICS.0)
+        .metric_attributes(&[KeyValue::new("test", test)])
+}
+
+/// The sum of the points of counter or up-down counter `metric` whose attributes
+/// include `test` and `attrs`, or `None` if it has none.
+fn sum(test: &str, metric: &str, attrs: &[(&str, &str)]) -> Option<i64> {
+    let mut rm = ResourceMetrics::default();
+    METRICS.1.collect(&mut rm).unwrap();
+    let metric = rm
+        .scope_metrics()
+        .filter(|sm| sm.scope().name() == "encina")
+        .flat_map(|sm| sm.metrics())
+        .find(|m| m.name() == metric)?;
+    let points: Vec<(Vec<KeyValue>, i64)> = match metric.data() {
+        AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+            .data_points()
+            .map(|p| (p.attributes().cloned().collect(), p.value() as i64))
+            .collect(),
+        AggregatedMetrics::I64(MetricData::Sum(sum)) => sum
+            .data_points()
+            .map(|p| (p.attributes().cloned().collect(), p.value()))
+            .collect(),
+        data => panic!("{metric:?} is not a sum: {data:?}"),
+    };
+    let has = |attributes: &[KeyValue], key: &str, value: &str| {
+        attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+    };
+    points
+        .iter()
+        .filter(|(attributes, _)| {
+            has(attributes, "test", test) && attrs.iter().all(|&(k, v)| has(attributes, k, v))
+        })
+        .map(|&(_, value)| value)
+        .reduce(|a, b| a + b)
+}
+
+/// The cache's hits and misses that `test` counted.
+fn lookups(test: &str) -> (i64, i64) {
+    let lookups = |result| {
+        sum(
+            test,
+            "encina.cache.lookups",
+            &[("encina.cache.result", result)],
+        )
+        .unwrap()
+    };
+    (lookups("hit"), lookups("miss"))
+}
+
+/// How `test`'s store uses its file: live, held back, and free bytes.
+fn file_usage(test: &str) -> [i64; 3] {
+    ["live", "held", "free"]
+        .map(|state| sum(test, "encina.file.usage", &[("encina.page.state", state)]).unwrap())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn metrics_count_writes_and_reads() {
+    let test = "writes_and_reads";
+    let store = Store::new(metered(test));
+    write(
+        &store.db,
+        &[
+            Op::Put(vec![1], vec![1]),
+            Op::Put(vec![2], vec![2]),
+            Op::Delete(vec![3]),
+            Op::DeleteRange(vec![4], vec![5]),
+        ],
+    );
+    let operations = |kind| {
+        sum(
+            test,
+            "encina.write.operations",
+            &[("encina.operation.type", kind)],
+        )
+    };
+    assert_eq!(operations("put"), Some(2));
+    assert_eq!(operations("delete"), Some(1));
+    assert_eq!(operations("delete_range"), Some(1));
+    assert_eq!(sum(test, "encina.write.pending", &[]), Some(0));
+    // The new leaf and the meta page.
+    let written = |metric| sum(test, metric, &[("disk.io.direction", "write")]);
+    assert_eq!(written("encina.disk.io"), Some(2 * 256));
+    assert_eq!(written("encina.disk.operations"), Some(2));
+
+    assert_eq!(
+        get(&store.db, &[1], Comparison::Equal),
+        Some((vec![1], vec![1]))
+    );
+    assert_eq!(scan(&store.db, ALL).len(), 2);
+    assert_eq!(sum(test, "encina.range.iterators", &[]), Some(1));
+    assert_eq!(sum(test, "encina.range.entries", &[]), Some(2));
+    assert_eq!(sum(test, "encina.reader.count", &[]), Some(0));
+    // The lookup and the scan found the one leaf cached.
+    assert_eq!(lookups(test), (2, 0));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn metrics_count_cache_hits_and_misses() {
+    let test = "cache_lookups";
+    let mut store = Store::new(metered(test).cache_size(1024 * 256));
+    let puts: Vec<_> = (0..2000u32)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![i as u8; 8]))
+        .collect();
+    write(&store.db, &puts);
+    store.reopen();
+    let leaves = store.db.tree().leaves().len() as i64;
+
+    // A scan of a cold store misses every leaf, and the next one hits them all.
+    let (hits, misses) = lookups(test);
+    assert_eq!(scan(&store.db, ALL).len(), 2000);
+    assert_eq!(lookups(test), (hits, misses + leaves));
+    assert_eq!(scan(&store.db, ALL).len(), 2000);
+    assert_eq!(lookups(test), (hits + leaves, misses + leaves));
+    assert_eq!(sum(test, "encina.cache.evictions", &[]), Some(0));
+
+    // A lookup that reads its leaf counts one miss, not a hit when it looks again.
+    store.reopen();
+    let (hits, misses) = lookups(test);
+    assert!(get(&store.db, &7u32.to_be_bytes(), Comparison::Equal).is_some());
+    assert_eq!(lookups(test), (hits, misses + 1));
+    assert!(get(&store.db, &7u32.to_be_bytes(), Comparison::Equal).is_some());
+    assert_eq!(lookups(test), (hits + 1, misses + 1));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn metrics_count_evictions() {
+    let test = "evictions";
+    let mut store = Store::new(metered(test).cache_size(16 * 256));
+    let puts: Vec<_> = (0..2000u32)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![i as u8; 8]))
+        .collect();
+    write(&store.db, &puts);
+    store.reopen();
+    assert_eq!(scan(&store.db, ALL).len(), 2000);
+    assert!(sum(test, "encina.cache.evictions", &[]).unwrap() > 0);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn metrics_report_the_memory_and_the_file() {
+    let test = "memory_and_file";
+    let opts = metered(test).cache_size(64 * 256);
+    let disk = SimDisk::new();
+    let db = now(Db::open_sim(disk.clone(), opts)).unwrap();
+    let puts: Vec<_> = (0..2000u32)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![i as u8; 8]))
+        .collect();
+    write(&db, &puts);
+    assert_eq!(sum(test, "encina.cache.limit", &[]), Some(64 * 256));
+    let usage = |kind| sum(test, "encina.cache.usage", &[("encina.page.type", kind)]).unwrap();
+    let in_use = db.tree().pages.pool.in_use() as i64 * 256;
+    assert_eq!(usage("internal") + usage("leaf") + usage("value"), in_use);
+    assert!(usage("internal") > 0);
+    let [live, held, free] = file_usage(test);
+    assert_eq!(held, 0);
+    assert_eq!(live + held + free, disk.len() as i64);
+
+    // A reader holds back the pages that a write replaces, until a write after it.
+    let reader = db.range(ALL);
+    assert_eq!(sum(test, "encina.reader.count", &[]), Some(1));
+    let replaced: Vec<_> = (0..2000u32)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![!i as u8; 8]))
+        .collect();
+    write(&db, &replaced);
+    let [live, held, free] = file_usage(test);
+    assert!(held > 0);
+    assert_eq!(live + held + free, disk.len() as i64);
+    drop(reader);
+    assert_eq!(sum(test, "encina.reader.count", &[]), Some(0));
+    write(&db, &[Op::Put(vec![0], vec![0])]);
+    assert_eq!(file_usage(test)[1], 0);
+
+    // A store takes its share back out when it closes.
+    drop(db);
+    assert_eq!(sum(test, "encina.cache.limit", &[]), Some(0));
+    assert_eq!(usage("internal") + usage("leaf") + usage("value"), 0);
+    assert_eq!(file_usage(test), [0; 3]);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn metrics_count_errors_and_failures() {
+    let test = "errors";
+    let store = Store::new(metered(test));
+    let errors = |kind| sum(test, "encina.write.errors", &[("error.type", kind)]);
+    let mut batch = WriteBatch::new();
+    batch.put(&[0; 1024], &[]);
+    assert!(matches!(
+        now(store.db.write(&mut batch)),
+        Err(Error::KeyTooLarge { .. })
+    ));
+    assert_eq!(errors("key_too_large"), Some(1));
+    assert_eq!(sum(test, "encina.store.failed", &[]), Some(0));
+
+    // A write that fails to sync its leaf, the operation after writing it, leaves
+    // the store failed.
+    store.disk.inject(store.disk.ops() + 1, Fault::Error);
+    let mut batch = batch_of(&[Op::Put(vec![1], vec![1])]);
+    assert!(matches!(now(store.db.write(&mut batch)), Err(Error::Io(_))));
+    assert_eq!(errors("io"), Some(1));
+    assert_eq!(sum(test, "encina.store.failed", &[]), Some(1));
+    assert!(matches!(
+        now(store.db.write(&mut batch)),
+        Err(Error::Failed)
+    ));
+    assert_eq!(errors("failed"), Some(1));
+    assert_eq!(sum(test, "encina.write.pending", &[]), Some(0));
+    drop(store);
+    assert_eq!(sum(test, "encina.store.failed", &[]), Some(0));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn metrics_of_a_view_leave_out_writes_and_the_file() {
+    let store = Store::new(Options::new().page_size(256));
+    write(&store.db, &[Op::Put(vec![1], vec![1])]);
+    let test = "view";
+    let view = now(ReadOnlyDb::open_sim(store.disk.clone(), metered(test))).unwrap();
+    assert!(
+        now(view.get(&[1], Comparison::Equal, |_, v| v.to_vec()))
+            .unwrap()
+            .is_some()
+    );
+    assert!(sum(test, "encina.cache.limit", &[]).is_some());
+    assert_eq!(lookups(test).0 + lookups(test).1, 1);
+    for metric in [
+        "encina.write.pending",
+        "encina.file.usage",
+        "encina.store.failed",
+    ] {
+        assert_eq!(sum(test, metric, &[]), None, "{metric}");
+    }
+}
+
+#[compio::test]
+#[cfg_attr(miri, ignore)]
+async fn metrics_name_the_store_by_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let test = "store_path";
+    let store = |path: &str, attr: &str| {
+        sum(
+            test,
+            "encina.write.operations",
+            &[("encina.store", path), ("encina.operation.type", attr)],
+        )
+    };
+    // Files take pages of 4 KiB at least.
+    let opts = metered(test).page_size(4096);
+    let path = dir.path().join("a.db");
+    let db = Db::open(&path, opts.clone()).await.unwrap();
+    db.write(&mut batch_of(&[Op::Put(vec![1], vec![1])]))
+        .await
+        .unwrap();
+    assert_eq!(store(path.to_str().unwrap(), "put"), Some(1));
+
+    // The options can name it otherwise.
+    let opts = opts.metric_attributes(&[KeyValue::new("encina.store", "ledgers")]);
+    let db = Db::open(dir.path().join("b.db"), opts).await.unwrap();
+    db.write(&mut batch_of(&[Op::Delete(vec![1])]))
+        .await
+        .unwrap();
+    assert_eq!(store("ledgers", "delete"), Some(1));
 }

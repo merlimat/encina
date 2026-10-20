@@ -26,13 +26,17 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Instant;
 
+use crate::metrics::Latency;
 use crate::pool::{FrameBuf, FrameId, Pool};
 use crate::storage::PageRead;
 
 #[derive(Default)]
 pub(crate) struct Reads {
     slots: Vec<Slot>,
+    /// Times the reads, if the store records metrics.
+    pub(crate) duration: Latency,
 }
 
 struct Slot {
@@ -40,6 +44,8 @@ struct Slot {
     /// The frame being read into.
     frame: FrameId,
     state: State,
+    /// When the read started, if it is timed.
+    started: Option<Instant>,
     /// Readers holding the slot. Each claims the read or lets go of it.
     users: u32,
     waiters: Arc<Waiters>,
@@ -91,6 +97,7 @@ impl Reads {
                     page: 0,
                     frame: 0,
                     state: State::Free,
+                    started: None,
                     users: 0,
                     waiters,
                     waker,
@@ -102,6 +109,7 @@ impl Reads {
         slot.page = page;
         slot.frame = frame;
         slot.state = State::Reading(read);
+        slot.started = self.duration.now();
         slot.users = 1;
         i
     }
@@ -113,14 +121,14 @@ impl Reads {
 
     /// Sends the read in slot `i` on its way, without claiming it.
     pub(crate) fn submit(&mut self, i: usize) {
-        self.slots[i].advance();
+        self.slots[i].advance(&self.duration);
     }
 
     /// Claims the read in slot `i` once it has finished. Returns `None` if
     /// another reader claimed it first.
     pub(crate) fn poll(&mut self, i: usize, cx: &mut Context<'_>) -> Poll<Option<Claim>> {
         let slot = &mut self.slots[i];
-        if !slot.advance() {
+        if !slot.advance(&self.duration) {
             slot.waiters.add(cx.waker());
             return Poll::Pending;
         }
@@ -164,12 +172,15 @@ impl Reads {
 }
 
 impl Slot {
-    /// Polls the read, if it is in flight. Returns whether it is over: finished
-    /// or claimed.
-    fn advance(&mut self) -> bool {
+    /// Polls the read, if it is in flight, recording its time in `duration` once it
+    /// finishes. Returns whether it is over: finished or claimed.
+    fn advance(&mut self, duration: &Latency) -> bool {
         if let State::Reading(read) = &mut self.state {
             match Pin::new(read).poll(&mut Context::from_waker(&self.waker)) {
-                Poll::Ready((res, buf)) => self.state = State::Finished(res, buf),
+                Poll::Ready((res, buf)) => {
+                    duration.record_since(self.started);
+                    self.state = State::Finished(res, buf);
+                }
                 Poll::Pending => return false,
             }
         }

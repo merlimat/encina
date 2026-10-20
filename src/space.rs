@@ -84,6 +84,9 @@ pub(crate) struct Space {
     dropped: VecDeque<(u64, u64)>,
     /// The generations of readers that may still read older versions.
     readers: Vec<u64>,
+    /// How many pages are in use, and how many of them `dropped` holds.
+    in_use: u64,
+    held: u64,
 }
 
 impl Space {
@@ -102,6 +105,8 @@ impl Space {
             freed: 0,
             dropped: VecDeque::new(),
             readers: Vec::new(),
+            in_use: 0,
+            held: 0,
         }
     }
 
@@ -119,6 +124,7 @@ impl Space {
             "page {page} used twice"
         );
         self.used[(page / 64) as usize] |= 1 << (page % 64);
+        self.in_use += 1;
     }
 
     /// Makes the next allocation start over from the lowest free page: each write
@@ -285,12 +291,14 @@ impl Space {
         debug_assert!(self.is_used(page), "page {page} freed twice");
         self.used[(page / 64) as usize] &= !(1 << (page % 64));
         self.lowest_free = self.lowest_free.min(page);
+        self.in_use -= 1;
     }
 
     /// Records that the version published as `generation` no longer uses the node
     /// with page id `id`, which takes [`node::pages`] pages.
     pub(crate) fn drop_node(&mut self, generation: u64, id: u64) {
         self.dropped.push_back((generation, id));
+        self.held += node::pages(id);
     }
 
     pub(crate) fn add_reader(&mut self, generation: u64) {
@@ -318,12 +326,19 @@ impl Space {
                 return None;
             }
             self.dropped.pop_front();
+            self.held -= node::pages(id);
             let first = node::first_page(id);
             for page in first..first + node::pages(id) {
                 self.unmark(page);
             }
             Some(id)
         })
+    }
+
+    /// How many pages are in use, and how many of them were dropped but not
+    /// reclaimed yet: readers of older versions hold them back.
+    pub(crate) fn usage(&self) -> (u64, u64) {
+        (self.in_use, self.held)
     }
 
     /// Pages dropped but not reclaimed yet.

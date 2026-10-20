@@ -168,6 +168,11 @@ impl Writes {
         &mut self.current
     }
 
+    /// How many writes the current group holds.
+    pub(crate) fn group_writes(&self) -> usize {
+        self.current_writes
+    }
+
     /// Whether a write left the group since the last call.
     pub(crate) fn take_changed(&mut self) -> bool {
         mem::take(&mut self.changed)

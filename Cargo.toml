@@ -14,9 +14,14 @@ categories = ["database-implementations", "asynchronous"]
 [dependencies]
 compio = { version = "0.19.2", features = ["fs"] }
 crc32c = "0.6"
+nanometer = "0.1"
+# The version nanometer pins.
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"] }
 
 [dev-dependencies]
 compio = { version = "0.19.2", features = ["macros"] }
+# Collects the metrics the tests check, with a reader they keep a handle to.
+opentelemetry_sdk = { version = "=0.33.1", features = ["metrics", "experimental_metrics_custom_reader"] }
 proptest = "1"
 tempfile = "3"
 

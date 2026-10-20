@@ -31,6 +31,9 @@ pub struct WriteBatch {
     // one appended to it. Withdrawing operations doesn't lower it, but a write
     // checks only its own batch.
     longest_put: usize,
+    // How many puts, deletes and range deletes were added since the last `clear`,
+    // likewise: a write reports only its own batch's.
+    counts: [usize; 3],
     // Set by `prepare`: the surviving puts and deletes sorted by key, and the
     // ranges merged into disjoint intervals sorted by start.
     points: Vec<u32>,
@@ -136,6 +139,7 @@ impl WriteBatch {
         self.bytes.clear();
         self.ops.clear();
         self.longest_put = 0;
+        self.counts = [0; 3];
     }
 
     fn push(&mut self, kind: Kind, a: &[u8], b: &[u8]) {
@@ -148,6 +152,7 @@ impl WriteBatch {
         let b_at = self.bytes.len() as u32;
         self.bytes.extend_from_slice(b);
         let (a_len, b_len) = (a.len() as u32, b.len() as u32);
+        self.counts[kind as usize] += 1;
         self.ops.push(Op {
             kind,
             a: a_at,
@@ -202,6 +207,16 @@ impl WriteBatch {
         Ok(())
     }
 
+    /// How many puts, deletes and range deletes it holds.
+    pub(crate) fn counts(&self) -> [usize; 3] {
+        self.counts
+    }
+
+    /// The bytes of its keys and values.
+    pub(crate) fn data_len(&self) -> usize {
+        self.bytes.len()
+    }
+
     /// The memory its operations take.
     pub(crate) fn size(&self) -> usize {
         self.bytes.len() + self.ops.len() * mem::size_of::<Op>()
@@ -223,6 +238,9 @@ impl WriteBatch {
             ..*op
         }));
         self.longest_put = self.longest_put.max(other.longest_put);
+        for (count, other) in self.counts.iter_mut().zip(other.counts) {
+            *count += other;
+        }
         (first, self.ops.len() as u32)
     }
 
@@ -248,6 +266,7 @@ impl WriteBatch {
             bytes,
             ops,
             longest_put: _,
+            counts: _,
             points,
             ranges,
             by_start,

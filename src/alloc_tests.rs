@@ -22,7 +22,7 @@ use std::cell::Cell;
 use std::pin::pin;
 
 use crate::sim::SimDisk;
-use crate::tests::{now, poll};
+use crate::tests::{metered, now, poll};
 use crate::tree::Budget;
 use crate::{Comparison, Db, Options, WriteBatch};
 
@@ -102,7 +102,18 @@ fn fill_from(batch: &mut WriteBatch, first: u64, round: u8) {
 
 #[test]
 fn the_data_path_does_not_allocate() {
-    let db = now(Db::open_sim(SimDisk::new(), Options::default())).unwrap();
+    data_path_does_not_allocate(Options::default());
+}
+
+/// Nor does recording metrics. The SDK reads the clock, which Miri doesn't allow.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn the_data_path_does_not_allocate_recording_metrics() {
+    data_path_does_not_allocate(metered("alloc").page_size(4096));
+}
+
+fn data_path_does_not_allocate(opts: Options) {
+    let db = now(Db::open_sim(SimDisk::new(), opts)).unwrap();
     let mut batch = WriteBatch::new();
     // The first writes grow the frame pool and the scratch space.
     for value in 0..3 {

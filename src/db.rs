@@ -29,6 +29,7 @@ use crate::batch::WriteBatch;
 use crate::cache::Cache;
 use crate::error::{Error, Result};
 use crate::meta::{self, FORMAT_VERSION, Meta};
+use crate::metrics::{self, Metrics};
 use crate::node::{self, NO_FRAME, Node, ValueLeaf};
 use crate::options::{DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE, Options};
 use crate::pool::{FrameBuf, FrameId, Holds, Pool, ValueBuf};
@@ -132,6 +133,7 @@ struct Inner {
     writes: RefCell<Writes>,
     /// Set when an I/O error left it unknown whether a write reached the disk.
     failed: Cell<bool>,
+    metrics: Metrics,
     /// Pages the file may hold: it has grown to this length at most.
     file_end: Cell<u64>,
     /// Opened by a [`ReadOnlyDb`], whose version the store's owner may overwrite.
@@ -161,6 +163,23 @@ impl Inner {
         page * self.page_size as u64
     }
 
+    /// Makes writes fail until the store is reopened: an I/O error left it unknown
+    /// whether a write reached the disk.
+    fn fail(&self) {
+        self.failed.set(true);
+        self.metrics.failed.set(1);
+    }
+
+    /// Reports how the file's pages are used: by the current version, held back by
+    /// older versions' readers, or free.
+    fn report_space(&self) {
+        let (used, held) = self.tree.borrow().pages.space.usage();
+        let pages = [used - held, held, self.file_end.get() - used];
+        for (amount, pages) in self.metrics.file_usage.iter().zip(pages) {
+            amount.set((pages * self.page_size as u64) as i64);
+        }
+    }
+
     /// The error to report for `e`, which a read hit. In a read-only store it may
     /// mean the store is stale, as [`stale_or`] decides.
     async fn explain(&self, e: Error) -> Error {
@@ -186,7 +205,7 @@ impl Db {
     pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
         opts.validate()?;
         let (storage, len) = Storage::open(path.as_ref()).await?;
-        Db::open_on(storage, len, opts, false).await
+        Db::open_on(storage, len, opts, false, Some(path.as_ref())).await
     }
 
     /// Opens a store on a simulated disk.
@@ -194,10 +213,17 @@ impl Db {
     pub(crate) async fn open_sim(disk: Rc<crate::sim::SimDisk>, opts: Options) -> Result<Db> {
         opts.validate()?;
         let len = disk.len();
-        Db::open_on(Storage::Sim(disk), len, opts, false).await
+        Db::open_on(Storage::Sim(disk), len, opts, false, None).await
     }
 
-    async fn open_on(storage: Storage, len: u64, opts: Options, read_only: bool) -> Result<Db> {
+    /// Opens the store in `storage`, `len` bytes long, at `path` if it has one.
+    async fn open_on(
+        storage: Storage,
+        len: u64,
+        opts: Options,
+        read_only: bool,
+        path: Option<&Path>,
+    ) -> Result<Db> {
         let meta = if len == 0 && !read_only {
             create(&storage, &opts).await?
         } else {
@@ -218,15 +244,25 @@ impl Db {
             page_size: Some(page_size),
             ..opts
         };
+        let meter = metrics::Meter::new(&opts, path);
         let mut pages = Pages {
             pool: Pool::new(page_size),
             cache: Cache::new(opts.cache_frames()),
             space: Space::new(meta.high_water, opts.min_run_pages as u64),
         };
+        pages.pool.usage = meter.cache_usage();
+        [pages.cache.hits, pages.cache.misses] = meter.cache_lookups();
+        pages.cache.evictions = meter.cache_evictions();
+        let mut reads = Reads::default();
+        reads.duration = meter.disk_read_duration();
+        let metrics = Metrics::new(&meter, read_only);
+        metrics
+            .cache_limit
+            .set((pages.cache.budget() * page_size) as i64);
         for page in 0..meta::META_PAGES {
             pages.space.mark_used(page);
         }
-        let root = match load_internal(&storage, &mut pages, &meta).await {
+        let root = match load_internal(&storage, &mut pages, &meta, &metrics).await {
             Err(e) if read_only => {
                 return Err(stale_or(&storage, page_size, meta.generation, e).await);
             }
@@ -234,10 +270,11 @@ impl Db {
         };
         let inner = Inner {
             tree: RefCell::new(Tree::new(pages, page_size, root, meta.generation)),
-            reads: RefCell::new(Reads::default()),
+            reads: RefCell::new(reads),
             storage,
             writes: RefCell::new(Writes::new()),
             failed: Cell::new(false),
+            metrics,
             file_end: Cell::new(len.div_ceil(page_size as u64).max(meta::META_PAGES)),
             read_only,
             page_size,
@@ -245,6 +282,9 @@ impl Db {
             buffers: RefCell::new(Vec::new()),
             runs: RefCell::new(Vec::new()),
         };
+        if !read_only {
+            inner.report_space();
+        }
         Ok(Db {
             inner: Rc::new(inner),
         })
@@ -268,6 +308,24 @@ impl Db {
     /// and if this write was the one committing them, the store fails as above.
     /// The batch is left as it was, ready to be cleared and reused.
     pub async fn write(&self, batch: &mut WriteBatch) -> Result<()> {
+        let metrics = &self.inner.metrics;
+        let _pending = metrics.write_pending.hold();
+        let timing = metrics.write.start();
+        let result = self.write_batch(batch).await;
+        match &result {
+            Ok(()) => {
+                timing.stop();
+                for (counter, n) in metrics.write_operations.iter().zip(batch.counts()) {
+                    counter.add(n as u64);
+                }
+                metrics.write_size.record(batch.data_len() as u64);
+            }
+            Err(e) => metrics.write_errors.add(e),
+        }
+        result
+    }
+
+    async fn write_batch(&self, batch: &mut WriteBatch) -> Result<()> {
         let inner = &*self.inner;
         if inner.failed.get() {
             return Err(Error::Failed);
@@ -349,6 +407,22 @@ impl Db {
         cmp: Comparison,
         f: impl FnOnce(&[u8], &[u8]) -> R,
     ) -> Result<Option<R>> {
+        let metrics = &self.inner.metrics;
+        let timing = metrics.get.start();
+        let result = self.lookup(key, cmp, f).await;
+        match &result {
+            Ok(_) => timing.stop(),
+            Err(e) => metrics.get_errors.add(e),
+        }
+        result
+    }
+
+    async fn lookup<R>(
+        &self,
+        key: &[u8],
+        cmp: Comparison,
+        f: impl FnOnce(&[u8], &[u8]) -> R,
+    ) -> Result<Option<R>> {
         let inner = &*self.inner;
         let mut read = Read {
             inner,
@@ -361,7 +435,9 @@ impl Db {
             let found = {
                 let mut tree = inner.tree.borrow_mut();
                 let root = read.version.map_or(tree.current().root, |v| v.root);
-                tree.find(root, key, cmp, &mut read.key)
+                // Only the first try counts its cache hits: the lookup then pins a
+                // version, and later tries find the leaves it read, counted as misses.
+                tree.find(root, key, cmp, &mut read.key, read.version.is_none())
             };
             match found {
                 Find::Found(value, len) => {
@@ -379,6 +455,7 @@ impl Db {
                     if read.version.is_none() {
                         // Waiting on the disk lets writes run: pin this version first.
                         read.version = Some(inner.tree.borrow_mut().pin());
+                        inner.metrics.readers.add(1);
                         continue;
                     }
                     // A lookup reads at most two leaves, which stay pinned until it ends.
@@ -395,6 +472,7 @@ impl Db {
                 Find::Value(page) => {
                     if read.version.is_none() {
                         read.version = Some(inner.tree.borrow_mut().pin());
+                        inner.metrics.readers.add(1);
                         continue;
                     }
                     let buf = match read_value_leaf(inner, page, None).await {
@@ -428,6 +506,9 @@ impl Db {
         let start_len = bounds.len();
         let end = copy_bound(range.end_bound().cloned(), &mut bounds);
         let version = self.inner.tree.borrow_mut().pin();
+        let metrics = &self.inner.metrics;
+        metrics.range_iterators.add(1);
+        metrics.readers.add(1);
         Iter {
             inner: self.inner.clone(),
             version,
@@ -444,6 +525,8 @@ impl Db {
             key: self.inner.take_buffer(),
             waiting: None,
             ahead: Ahead::new(),
+            missed: false,
+            returned: 0,
         }
     }
 
@@ -519,7 +602,7 @@ impl ReadOnlyDb {
     pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<ReadOnlyDb> {
         opts.validate()?;
         let (storage, len) = Storage::open_read_only(path.as_ref()).await?;
-        let db = Db::open_on(storage, len, opts, true).await?;
+        let db = Db::open_on(storage, len, opts, true, Some(path.as_ref())).await?;
         Ok(ReadOnlyDb { db })
     }
 
@@ -531,7 +614,7 @@ impl ReadOnlyDb {
     ) -> Result<ReadOnlyDb> {
         opts.validate()?;
         let len = disk.len();
-        let db = Db::open_on(Storage::Sim(disk), len, opts, true).await?;
+        let db = Db::open_on(Storage::Sim(disk), len, opts, true, None).await?;
         Ok(ReadOnlyDb { db })
     }
 
@@ -717,7 +800,12 @@ async fn read_meta(storage: &Storage, len: usize, offset: u64) -> Result<Option<
 
 /// Loads every internal node of the tree `meta` describes, pointing each parent at
 /// its children's frames, and marks the tree's pages used. Returns the root.
-async fn load_internal(storage: &Storage, pages: &mut Pages, meta: &Meta) -> Result<Option<Root>> {
+async fn load_internal(
+    storage: &Storage,
+    pages: &mut Pages,
+    meta: &Meta,
+    metrics: &Metrics,
+) -> Result<Option<Root>> {
     if meta.root == 0 {
         return Ok(None);
     }
@@ -737,6 +825,7 @@ async fn load_internal(storage: &Storage, pages: &mut Pages, meta: &Meta) -> Res
         for chunk in level_nodes.chunks(IO_WINDOW) {
             let reads: [_; IO_WINDOW] = array::from_fn(|i| {
                 let &(frame, page) = chunk.get(i)?;
+                metrics.read.add(page_size as usize);
                 Some(storage.read(pages.pool.buf(frame), page * page_size))
             });
             let results = join(reads).await.into_iter().flatten();
@@ -798,6 +887,7 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
     if inner.failed.get() {
         return Err(Error::Failed);
     }
+    let timing = inner.metrics.commit.start();
     let group = guard.group;
     let changed = loop {
         // Normalize the batch and list the leaves it changes, a slice at a time, as
@@ -883,6 +973,8 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
         }
     };
     if !changed {
+        // Planning may have freed pages that readers held back.
+        inner.report_space();
         return Ok(());
     }
     let generation = inner.tree.borrow().current().generation + 1;
@@ -900,10 +992,17 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
     guard.stage = Stage::Building;
     written?;
     guard.stage = Stage::Committing;
-    inner.storage.sync().await?;
+    sync(inner).await?;
     write_meta(inner, &meta).await?;
-    inner.storage.sync().await?;
+    sync(inner).await?;
     inner.tree.borrow_mut().publish(generation);
+    timing.stop();
+    let writes = if group {
+        inner.writes.borrow().group_writes()
+    } else {
+        1
+    };
+    inner.metrics.commit_writes.record(writes as u64);
     // The batches are durable and visible: their writes can return.
     guard.deliver(&Ok(()));
     guard.stage = Stage::Cutting;
@@ -916,6 +1015,15 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
         yield_now().await;
         inner.tree.borrow_mut().resume();
     }
+    inner.report_space();
+    Ok(())
+}
+
+/// Makes every completed write durable.
+async fn sync(inner: &Inner) -> Result<()> {
+    let timing = inner.metrics.sync_duration.start();
+    inner.storage.sync().await?;
+    timing.stop();
     Ok(())
 }
 
@@ -950,8 +1058,12 @@ impl Drop for Queued<'_> {
 /// reach was written after the current generation.
 async fn read_value_leaf(inner: &Inner, page: u64, old: Option<ValueBuf>) -> Result<ValueBuf> {
     let first = node::first_page(page);
-    let buf = ValueBuf::new(old, node::span(page) as usize * inner.page_size);
+    let len = node::span(page) as usize * inner.page_size;
+    let buf = ValueBuf::new(old, len);
+    inner.metrics.read.add(len);
+    let timing = inner.metrics.read_duration.start();
     let (res, buf) = inner.storage.read_value(buf, inner.offset(first)).await;
+    timing.stop();
     res?;
     let generation = inner.tree.borrow().current().generation;
     if !node::verify_value_leaf(buf.bytes(), inner.page_size)
@@ -965,15 +1077,20 @@ async fn read_value_leaf(inner: &Inner, page: u64, old: Option<ValueBuf>) -> Res
 /// Pins the frame holding a leaf page, reading the page in if it isn't cached. A
 /// read of the page already in flight is waited for, not repeated.
 async fn load_leaf(inner: &Inner, page: u64) -> Result<FrameId> {
-    let mut load = Load { inner, slot: None };
+    let mut load = Load {
+        inner,
+        slot: None,
+        missed: false,
+    };
     poll_fn(|cx| load.poll(cx, page)).await
 }
 
 /// A leaf load in progress, and the read it holds, if any, which it lets go of
-/// when dropped.
+/// when dropped. It counts a cache miss once it has to read the leaf.
 struct Load<'a> {
     inner: &'a Inner,
     slot: Option<usize>,
+    missed: bool,
 }
 
 impl Load<'_> {
@@ -984,8 +1101,14 @@ impl Load<'_> {
         loop {
             if self.slot.is_none() {
                 if let Some(frame) = tree.pages.cached(page) {
+                    if !self.missed {
+                        tree.pages.cache.hits.add(1);
+                    }
                     tree.pages.pool.retain(frame);
                     return Poll::Ready(Ok(frame));
+                }
+                if !mem::replace(&mut self.missed, true) {
+                    tree.pages.cache.misses.add(1);
                 }
                 self.slot = Some(read_leaf(inner, &mut tree, &mut reads, page));
             }
@@ -1034,6 +1157,10 @@ fn start_read(inner: &Inner, pool: &Pool, frame: FrameId, page: u64) -> PageRead
     // The buffer takes the frame's only reference: if the read is cancelled, the
     // frame is reclaimed once the read completes.
     let offset = inner.offset(node::first_page(page));
+    inner
+        .metrics
+        .read
+        .add(node::pages(page) as usize * inner.page_size);
     inner.storage.start_read(pool.adopt_buf(frame), offset)
 }
 
@@ -1103,6 +1230,7 @@ async fn write_dirty(inner: &Inner) -> Result<()> {
                     bufs.push(tree.pages.pool.buf(frame));
                     next[life] += 1;
                 }
+                inner.metrics.written.add(bufs.len() * inner.page_size);
                 Some(inner.storage.write_run(bufs, inner.offset(first)))
             })
         };
@@ -1160,6 +1288,7 @@ async fn write_values(
                     (leaf, next) = (leaf + 1, 0);
                 }
                 let at = inner.offset(node::first_page(page) + first as u64);
+                inner.metrics.written.add(bufs.len() * page_size);
                 Some(inner.storage.write_run(bufs, at))
             })
         };
@@ -1211,6 +1340,7 @@ async fn write_meta(inner: &Inner, meta: &Meta) -> Result<()> {
         // The buffer takes the frame's only reference, as in `load_leaf`.
         (frame, pages.pool.adopt_buf(frame))
     };
+    inner.metrics.written.add(inner.page_size);
     let (res, buf) = inner.storage.write(buf, inner.offset(meta.slot())).await;
     drop(buf);
     inner.tree.borrow_mut().pages.pool.free(frame);
@@ -1322,14 +1452,14 @@ impl Drop for WriteGuard<'_> {
             Stage::Building => tree.discard(),
             // In-flight writes still hold the pending version's frames: leave them.
             Stage::Writing => {
-                self.inner.failed.set(true);
+                self.inner.fail();
                 tree.unpin_touched();
             }
             Stage::Committing => {
-                self.inner.failed.set(true);
+                self.inner.fail();
                 tree.discard();
             }
-            Stage::Cutting => self.inner.failed.set(true),
+            Stage::Cutting => self.inner.fail(),
         }
         // Dropped before the group's writes had their outcome.
         if self.group && !self.delivered {
@@ -1362,6 +1492,7 @@ impl Drop for Read<'_> {
             }
             if let Some(version) = self.version {
                 tree.unpin(version);
+                self.inner.metrics.readers.add(-1);
             }
         }
         self.inner.put_buffer(mem::take(&mut self.key));
@@ -1407,6 +1538,10 @@ pub struct Iter {
     /// The read of the leaf being entered, while the iterator waits for it.
     waiting: Option<usize>,
     ahead: Ahead,
+    /// Whether entering the leaf counted a cache miss, having to read it.
+    missed: bool,
+    /// The entries returned, counted when it is dropped.
+    returned: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1527,6 +1662,7 @@ impl Iter {
         if self.on_value {
             // In the range: entering it checked.
             self.state = State::Returned;
+            self.returned += 1;
             let bytes = match self.leaf {
                 // SAFETY: the iterator pins this leaf, and frames are never modified
                 // while referenced.
@@ -1551,6 +1687,7 @@ impl Iter {
             return Ok(None);
         }
         self.state = State::Returned;
+        self.returned += 1;
         let Some((offset, len)) = node.whole_value(self.at) else {
             // A dense leaf: the value goes after the key.
             let key_len = self.key.len();
@@ -1583,10 +1720,16 @@ impl Iter {
                 if self.ahead.front() == Some(page) {
                     self.waiting = self.ahead.pop();
                 } else if let Some(frame) = tree.pages.cached(page) {
+                    if !mem::take(&mut self.missed) {
+                        tree.pages.cache.hits.add(1);
+                    }
                     tree.pages.pool.retain(frame);
                     return Poll::Ready(Ok(frame));
                 } else {
                     self.waiting = Some(read_leaf(inner, &mut tree, &mut reads, page));
+                }
+                if !mem::replace(&mut self.missed, true) {
+                    tree.pages.cache.misses.add(1);
                 }
             }
             // Polling first sends this leaf's read out ahead of the others.
@@ -1594,6 +1737,7 @@ impl Iter {
             self.ahead
                 .fill(inner, &mut tree, &mut reads, &self.cursor, end);
             if let Some(loaded) = ready!(polled) {
+                self.missed = false;
                 return Poll::Ready(loaded);
             }
         }
@@ -1643,7 +1787,9 @@ impl Drop for Iter {
                 tree.pages.pool.unref(frame);
             }
             tree.unpin(self.version);
+            self.inner.metrics.readers.add(-1);
         }
+        self.inner.metrics.range_entries.add(self.returned);
         self.inner.put_buffer(mem::take(&mut self.bounds));
         self.inner.put_buffer(mem::take(&mut self.key));
     }

@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::MeterProvider;
+
 use crate::error::{Error, Result};
+use crate::metrics::SCOPE;
 use crate::node;
 
 /// The smallest cache: a write needs a few leaves in memory at once.
@@ -30,6 +34,8 @@ pub struct Options {
     pub(crate) page_size: Option<usize>,
     pub(crate) min_run_pages: usize,
     pub(crate) cache_size: usize,
+    pub(crate) meter: Option<nanometer::Meter>,
+    pub(crate) metric_attributes: Vec<KeyValue>,
 }
 
 impl Default for Options {
@@ -38,12 +44,15 @@ impl Default for Options {
             page_size: None,
             min_run_pages: 16,
             cache_size: 64 << 20,
+            meter: None,
+            metric_attributes: Vec::new(),
         }
     }
 }
 
 impl Options {
-    /// The default options: no page size, runs of 16 pages, and a 64 MiB cache.
+    /// The default options: no page size, runs of 16 pages, a 64 MiB cache, and no
+    /// metrics.
     pub fn new() -> Self {
         Self::default()
     }
@@ -87,6 +96,29 @@ impl Options {
     /// quarter of the budget, and one larger than that isn't cached.
     pub fn cache_size(mut self, bytes: usize) -> Self {
         self.cache_size = bytes;
+        self
+    }
+
+    /// Exports the store's metrics through `provider`, under the instrumentation
+    /// scope `encina`. Without a provider, the store records none.
+    ///
+    /// [METRICS.md](https://github.com/merlimat/encina/blob/main/METRICS.md) lists
+    /// the metrics. Each series has the attribute `encina.store`, the path the store
+    /// was opened at, and those of [`metric_attributes`](Self::metric_attributes).
+    /// Histograms export only through nanometer's `Producer`, which the app
+    /// registers with its metric reader: see [nanometer](https://docs.rs/nanometer).
+    ///
+    /// The first store with metrics in a process calibrates the clock that times
+    /// operations, which blocks its open for 10 to 200 ms.
+    pub fn meter_provider<P: MeterProvider + ?Sized>(mut self, provider: &P) -> Self {
+        self.meter = Some(nanometer::Meter::new(provider, SCOPE));
+        self
+    }
+
+    /// Adds `attributes` to every series of the store's metrics, after
+    /// `encina.store`: one of them with that key replaces the store's path.
+    pub fn metric_attributes(mut self, attributes: &[KeyValue]) -> Self {
+        self.metric_attributes.extend_from_slice(attributes);
         self
     }
 

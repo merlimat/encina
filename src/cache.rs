@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
+use crate::metrics::Counter;
 use crate::pool::{FrameId, Holds, Pool};
 
 /// The most frames the clock hand looks at to find one to evict, once a sweep has
@@ -48,6 +49,11 @@ pub(crate) struct Cache {
     /// evict since it began to.
     writing: bool,
     exhausted: bool,
+    /// The leaves that reads and writes found cached and had to read, which they
+    /// count themselves, and the leaves evicted, if the store records metrics.
+    pub(crate) hits: Counter,
+    pub(crate) misses: Counter,
+    pub(crate) evictions: Counter,
     /// The frames the clock hands looked at.
     #[cfg(test)]
     pub(crate) looked: usize,
@@ -63,6 +69,9 @@ impl Cache {
             budget,
             writing: false,
             exhausted: false,
+            hits: Counter::default(),
+            misses: Counter::default(),
+            evictions: Counter::default(),
             #[cfg(test)]
             looked: 0,
         }
@@ -225,6 +234,7 @@ impl Cache {
                         pool.frame_mut(id).clock = false;
                     } else {
                         self.map.remove(&frame.page);
+                        self.evictions.add(1);
                         return Some(id);
                     }
                 }

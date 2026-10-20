@@ -73,6 +73,15 @@
 //! # }).unwrap();
 //! ```
 //!
+//! # Metrics
+//!
+//! With [`Options::meter_provider`], a store exports metrics through OpenTelemetry,
+//! under the scope `encina`, recorded with [nanometer](https://docs.rs/nanometer)
+//! in a few nanoseconds each. Each series has the attribute `encina.store`, the
+//! path the store was opened at, and those of [`Options::metric_attributes`].
+//! [METRICS.md](https://github.com/merlimat/encina/blob/main/METRICS.md) lists the
+//! metrics and what each one measures.
+//!
 //! # Platforms
 //!
 //! Linux with io_uring is the target, and there the store file uses direct I/O.
@@ -88,6 +97,7 @@ mod cache;
 mod db;
 mod error;
 mod meta;
+mod metrics;
 mod node;
 mod options;
 mod pool;
