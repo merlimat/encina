@@ -40,11 +40,11 @@ fn put_get() {
     let path = dir.path().join("data.db");
     let path = path.to_str().unwrap();
 
-    ok(&["put", path, "user/1", "alice"]);
-    ok(&["put", path, "user/1", "bob"]);
-    assert_eq!(ok(&["get", path, "user/1"]), "bob\n");
+    ok(&["-f", path, "put", "user/1", "alice"]);
+    ok(&["-f", path, "put", "user/1", "bob"]);
+    assert_eq!(ok(&["-f", path, "get", "user/1"]), "bob\n");
 
-    let missing = encina(&["get", path, "user/2"]);
+    let missing = encina(&["-f", path, "get", "user/2"]);
     assert_eq!(missing.status.code(), Some(1));
     assert!(missing.stdout.is_empty());
 }
@@ -58,7 +58,7 @@ fn puts_reuse_the_pages_they_free() {
     // Each put moves the key's leaf to a new page and frees the one before, which
     // the next put takes back: the file holds the meta pages and two leaves.
     for i in 0..20 {
-        ok(&["put", path, "key", &i.to_string()]);
+        ok(&["-f", path, "put", "key", &i.to_string()]);
         let len = std::fs::metadata(path).unwrap().len();
         assert!(len <= 4 * 4096, "{len} bytes after {} puts", i + 1);
     }
@@ -70,14 +70,20 @@ fn scan_bounds() {
     let path = dir.path().join("data.db");
     let path = path.to_str().unwrap();
     for key in ["a", "b", "c", "d"] {
-        ok(&["put", path, key, &key.to_uppercase()]);
+        ok(&["-f", path, "put", key, &key.to_uppercase()]);
     }
 
-    assert_eq!(ok(&["scan", path]), "a\tA\nb\tB\nc\tC\nd\tD\n");
-    assert_eq!(ok(&["scan", path, "b"]), "b\tB\nc\tC\nd\tD\n");
-    assert_eq!(ok(&["scan", path, "b", "d"]), "b\tB\nc\tC\n");
-    assert_eq!(ok(&["scan", path, "", "c"]), "a\tA\nb\tB\n");
-    assert_eq!(ok(&["scan", path, "x"]), "");
+    assert_eq!(ok(&["-f", path, "scan"]), "a\tA\nb\tB\nc\tC\nd\tD\n");
+    assert_eq!(
+        ok(&["-f", path, "scan", "--start", "b"]),
+        "b\tB\nc\tC\nd\tD\n"
+    );
+    assert_eq!(
+        ok(&["-f", path, "scan", "-s", "b", "-e", "d"]),
+        "b\tB\nc\tC\n"
+    );
+    assert_eq!(ok(&["-f", path, "scan", "--end", "c"]), "a\tA\nb\tB\n");
+    assert_eq!(ok(&["-f", path, "scan", "--start", "x"]), "");
 }
 
 #[test]
@@ -86,22 +92,22 @@ fn delete_and_delete_range() {
     let path = dir.path().join("data.db");
     let path = path.to_str().unwrap();
     for key in ["a", "b", "c", "d", "e"] {
-        ok(&["put", path, key, &key.to_uppercase()]);
+        ok(&["-f", path, "put", key, &key.to_uppercase()]);
     }
 
-    ok(&["delete", path, "b"]);
-    assert_eq!(encina(&["get", path, "b"]).status.code(), Some(1));
+    ok(&["-f", path, "delete", "b"]);
+    assert_eq!(encina(&["-f", path, "get", "b"]).status.code(), Some(1));
     // Deleting a key that isn't there succeeds, and changes nothing.
-    ok(&["delete", path, "b"]);
-    assert_eq!(ok(&["scan", path]), "a\tA\nc\tC\nd\tD\ne\tE\n");
+    ok(&["-f", path, "delete", "b"]);
+    assert_eq!(ok(&["-f", path, "scan"]), "a\tA\nc\tC\nd\tD\ne\tE\n");
 
-    ok(&["delete-range", path, "c", "e"]);
-    assert_eq!(ok(&["scan", path]), "a\tA\ne\tE\n");
+    ok(&["-f", path, "delete-range", "-s", "c", "-e", "e"]);
+    assert_eq!(ok(&["-f", path, "scan"]), "a\tA\ne\tE\n");
     // A range that starts at or after its end removes nothing.
-    ok(&["delete-range", path, "e", "a"]);
-    assert_eq!(ok(&["scan", path]), "a\tA\ne\tE\n");
-    ok(&["delete-range", path, "", "z"]);
-    assert_eq!(ok(&["scan", path]), "");
+    ok(&["-f", path, "delete-range", "--start", "e", "--end", "a"]);
+    assert_eq!(ok(&["-f", path, "scan"]), "a\tA\ne\tE\n");
+    ok(&["-f", path, "delete-range", "--start", "", "--end", "z"]);
+    assert_eq!(ok(&["-f", path, "scan"]), "");
 }
 
 #[test]
@@ -112,11 +118,11 @@ fn text_round_trips() {
 
     // UTF-8 text prints as is; backslashes, control characters and bytes that
     // aren't UTF-8 print escaped, as arguments take them.
-    ok(&["put", path, r"\x00\xFF", r"café\x09\xc2\x85\\"]);
-    let printed = ok(&["scan", path]);
+    ok(&["-f", path, "put", r"\x00\xFF", r"café\x09\xc2\x85\\"]);
+    let printed = ok(&["-f", path, "scan"]);
     assert_eq!(printed, "\\x00\\xff\tcafé\\x09\\xc2\\x85\\\\\n");
     let (key, value) = printed.trim_end().split_once('\t').unwrap();
-    assert_eq!(ok(&["get", path, key]), format!("{value}\n"));
+    assert_eq!(ok(&["-f", path, "get", key]), format!("{value}\n"));
 }
 
 #[test]
@@ -124,16 +130,16 @@ fn hexdump() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.db");
     let path = path.to_str().unwrap();
-    ok(&["put", path, r"k\x00", "hello world, this is long"]);
-    ok(&["put", path, "z", ""]);
+    ok(&["-f", path, "put", r"k\x00", "hello world, this is long"]);
+    ok(&["-f", path, "put", "z", ""]);
 
     assert_eq!(
-        ok(&["get", "-x", path, r"k\x00"]),
+        ok(&["-f", path, "get", "-x", r"k\x00"]),
         "00000000  68 65 6c 6c 6f 20 77 6f  72 6c 64 2c 20 74 68 69  |hello world, thi|\n\
          00000010  73 20 69 73 20 6c 6f 6e  67                       |s is long|\n"
     );
     assert_eq!(
-        ok(&["scan", "--hexdump", path, "z"]),
+        ok(&["-f", path, "scan", "--hexdump", "--start", "z"]),
         "key   00000000  7a                                                |z|\n\
          value 00000000                                                    ||\n"
     );
@@ -147,25 +153,44 @@ fn errors_leave_no_store() {
 
     // Reads and deletes never create the store, and a put with a bad argument
     // doesn't open it.
-    assert_eq!(encina(&["get", path, "k"]).status.code(), Some(2));
-    assert_eq!(encina(&["scan", path]).status.code(), Some(2));
-    assert_eq!(encina(&["delete", path, "k"]).status.code(), Some(2));
+    assert_eq!(encina(&["-f", path, "get", "k"]).status.code(), Some(2));
+    assert_eq!(encina(&["-f", path, "scan"]).status.code(), Some(2));
+    assert_eq!(encina(&["-f", path, "delete", "k"]).status.code(), Some(2));
     assert_eq!(
-        encina(&["delete-range", path, "a", "b"]).status.code(),
+        encina(&["-f", path, "delete-range", "--start", "a", "--end", "b"])
+            .status
+            .code(),
         Some(2)
     );
-    assert_eq!(encina(&["put", path, r"k\q", "v"]).status.code(), Some(2));
-    assert_eq!(encina(&["put", path, r"k\x0", "v"]).status.code(), Some(2));
+    assert_eq!(
+        encina(&["-f", path, "put", r"k\q", "v"]).status.code(),
+        Some(2)
+    );
+    assert_eq!(
+        encina(&["-f", path, "put", r"k\x0", "v"]).status.code(),
+        Some(2)
+    );
     assert!(!Path::new(path).exists());
 
     assert_eq!(encina(&[]).status.code(), Some(2));
-    assert_eq!(encina(&["frob", path]).status.code(), Some(2));
-    assert_eq!(encina(&["get", path]).status.code(), Some(2));
+    // The store's file comes before the command, with -f.
+    assert_eq!(encina(&["put", path, "k", "v"]).status.code(), Some(2));
+    assert_eq!(encina(&["-f", path, "frob"]).status.code(), Some(2));
+    assert_eq!(encina(&["-f", path, "get"]).status.code(), Some(2));
+    // A range's keys come with --start and --end, and delete-range needs both.
+    assert_eq!(encina(&["-f", path, "scan", "a"]).status.code(), Some(2));
     assert_eq!(
-        encina(&["scan", path, "a", "b", "c"]).status.code(),
+        encina(&["-f", path, "delete-range", "--start", "a"])
+            .status
+            .code(),
         Some(2)
     );
-    assert_eq!(encina(&["delete-range", path, "a"]).status.code(), Some(2));
+    assert_eq!(
+        encina(&["-f", path, "delete-range", "--end", "b"])
+            .status
+            .code(),
+        Some(2)
+    );
     assert!(ok(&["--help"]).starts_with("Puts, gets, scans and deletes"));
 }
 
@@ -181,15 +206,15 @@ async fn reads_while_another_process_writes() {
 
     // `db` holds the store's lock: reads go through a read-only view, but a put
     // can't open it.
-    assert_eq!(ok(&["get", path, "k"]), "v\n");
-    assert_eq!(ok(&["scan", path]), "k\tv\n");
-    let put = encina(&["put", path, "k", "w"]);
+    assert_eq!(ok(&["-f", path, "get", "k"]), "v\n");
+    assert_eq!(ok(&["-f", path, "scan"]), "k\tv\n");
+    let put = encina(&["-f", path, "put", "k", "w"]);
     assert_eq!(put.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&put.stderr).contains("already open"));
 
     db.close().await.unwrap();
-    ok(&["put", path, "k", "w"]);
-    assert_eq!(ok(&["get", path, "k"]), "w\n");
+    ok(&["-f", path, "put", "k", "w"]);
+    assert_eq!(ok(&["-f", path, "get", "k"]), "w\n");
 }
 
 #[compio::test]
@@ -206,9 +231,9 @@ async fn works_on_any_page_size() {
     let path = path.to_str().unwrap();
 
     // The command sets no page size, so it opens the store with its own.
-    ok(&["put", path, "k", "w"]);
-    assert_eq!(ok(&["get", path, "k"]), "w\n");
-    assert_eq!(ok(&["scan", path]), "k\tw\n");
+    ok(&["-f", path, "put", "k", "w"]);
+    assert_eq!(ok(&["-f", path, "get", "k"]), "w\n");
+    assert_eq!(ok(&["-f", path, "scan"]), "k\tw\n");
 }
 
 /// The value of a line of `encina stats`, by its name.
@@ -248,8 +273,8 @@ async fn stats_and_pages() {
 
     // The second write moved the leaf to a new page, and freed the first. Both
     // commands read the store while its owner has it open.
-    assert_eq!(ok(&["pages", path_str]), "0  MM.D\n");
-    let stats = ok(&["stats", path_str]);
+    assert_eq!(ok(&["-f", path_str, "pages"]), "0  MM.D\n");
+    let stats = ok(&["-f", path_str, "stats"]);
     let summary = [
         ("entries", 1),
         ("entry size", 2),
@@ -273,7 +298,7 @@ async fn stats_and_pages() {
         batch.put(format!("{i:06}").as_bytes(), &[b'v'; 100]);
     }
     db.write(&mut batch).await.unwrap();
-    let stats = ok(&["stats", path_str]);
+    let stats = ok(&["-f", path_str, "stats"]);
     let [root, leaves] = levels(&stats)[..] else {
         panic!("{stats}");
     };
@@ -289,7 +314,7 @@ async fn stats_and_pages() {
     assert_eq!(stat(&stats, "entry size"), 2 + 20_000 * 106);
 
     // The map shows the same pages, 64 to a line.
-    let map = ok(&["pages", path_str]);
+    let map = ok(&["-f", path_str, "pages"]);
     assert_eq!(map.lines().count(), file.div_ceil(64));
     let shown = |c| {
         map.lines()
@@ -306,16 +331,16 @@ async fn stats_and_pages() {
     let mut batch = WriteBatch::new();
     batch.put(b"big", &[b'v'; 10_000]);
     db.write(&mut batch).await.unwrap();
-    let stats = ok(&["stats", path_str]);
+    let stats = ok(&["-f", path_str, "stats"]);
     let leaves = *levels(&stats).last().unwrap();
     assert_eq!((leaves[3], leaves[4]), (1, 20_002));
     assert_eq!(stat(&stats, "entry size"), 2 + 20_000 * 106 + 10_003);
-    let map = ok(&["pages", path_str]);
+    let map = ok(&["-f", path_str, "pages"]);
     let shown = |c| map.chars().filter(|&s| s == c).count();
     assert_eq!(shown('V'), 3);
     assert_eq!(shown('L') + shown('D') + shown('V'), leaves[1]);
     assert_eq!(
-        ok(&["get", path_str, "big"]),
+        ok(&["-f", path_str, "get", "big"]),
         format!("{}\n", "v".repeat(10_000))
     );
     db.close().await.unwrap();
@@ -341,7 +366,7 @@ async fn scan_resumes_on_a_new_view() {
     write_all(&db, '0').await;
 
     let mut scan = Command::new(env!("CARGO_BIN_EXE_encina"))
-        .args(["scan", path.to_str().unwrap()])
+        .args(["-f", path.to_str().unwrap(), "scan"])
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();

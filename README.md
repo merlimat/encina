@@ -141,14 +141,14 @@ inspecting a store by hand:
 
 ```sh
 cargo install encina-cli
-encina put data.db user/0001 alice
-encina get data.db user/0001         # alice
-encina scan data.db user/ user0      # one key<TAB>value line per entry
-encina scan -x data.db               # keys and values as hexdump -C shows them
-encina delete data.db user/0001
-encina delete-range data.db user/ user0
-encina stats data.db                 # pages in use and free, level by level
-encina pages data.db                 # a map of the file's pages, 64 to a line
+encina -f data.db put user/0001 alice
+encina -f data.db get user/0001            # alice
+encina -f data.db scan -s user/ -e user0   # one key<TAB>value line per entry
+encina -f data.db scan -x                  # keys and values as hexdump -C shows them
+encina -f data.db delete user/0001
+encina -f data.db delete-range -s user/ -e user0
+encina -f data.db stats                    # entries, file size, pages level by level
+encina -f data.db pages                    # a map of the file's pages, 64 to a line
 ```
 
 `cargo install encina-cli` builds the command and copies it to `~/.cargo/bin`. From a
