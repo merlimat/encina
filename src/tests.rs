@@ -1173,6 +1173,54 @@ fn damaged_pages_are_reported() {
     assert!(matches!(opened, Err(Error::Corruption { page }) if page == root));
 }
 
+#[test]
+fn nodes_whose_entries_lie_outside_them_are_reported() {
+    // A node's checksum matches, but its entries don't lie within it, as a bug or a
+    // crafted file could leave it. Keys of two lengths make slotted nodes, with no
+    // key prefix: two heads from byte 32, then slots of 6 bytes from 40, each
+    // ending with its value's length.
+    let current = |db: &Db| {
+        let tree = db.tree();
+        (tree.current().root.unwrap(), tree.current().generation)
+    };
+    // A root leaf whose second value runs on for 64 KiB fails the reads that need
+    // it, rather than lend what lies past the page.
+    let mut store = Store::new(Options::new().page_size(256));
+    write(&store.db, &[Op::Put(b"a".to_vec(), b"x".to_vec())]);
+    let (root, generation) = current(&store.db);
+    let mut buf = node::EntryBuf::default();
+    buf.push(b"a", b"x");
+    buf.push(b"bb", b"y");
+    let mut leaf = vec![0; 256];
+    node::build(&mut leaf, 0, &buf, 0, 2);
+    leaf[50..52].copy_from_slice(&u16::MAX.to_le_bytes());
+    node::seal(&mut leaf, generation);
+    store.disk.set_bytes(root.page * 256, &leaf);
+    store.reopen();
+    let found = now(store.db.get(b"bb", Comparison::Equal, |_, v| v.len()));
+    assert!(
+        matches!(found, Err(Error::Corruption { page }) if page == root.page),
+        "{found:?}"
+    );
+    let mut iter = store.db.range(..);
+    assert!(matches!(now(iter.next()), Err(Error::Corruption { page }) if page == root.page));
+    drop(iter);
+    // A root internal node whose first child reference is 3 bytes fails the open.
+    let store = Store::new(Options::new().page_size(256));
+    write(&store.db, &round_of(300, 0));
+    let (root, generation) = current(&store.db);
+    assert!(root.level > 0);
+    let mut buf = node::EntryBuf::default();
+    buf.push(b"a", &[0; 3]);
+    buf.push(b"bb", &[0; node::CHILD_REF]);
+    let mut internal = vec![0; 256];
+    node::build(&mut internal, root.level, &buf, 0, 2);
+    node::seal(&mut internal, generation);
+    store.disk.set_bytes(root.page * 256, &internal);
+    let opened = now(Db::open_sim(store.disk.restart(), store.opts.clone()));
+    assert!(matches!(opened, Err(Error::Corruption { page }) if page == root.page));
+}
+
 /// Puts keys `0..n`, each with value `round`.
 fn round_of(n: u32, round: u8) -> Vec<Op> {
     (0..n)
