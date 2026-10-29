@@ -805,12 +805,21 @@ to 4,540 averaging 158 KiB, and made it three times as fast.
 
 1. Read slot 0, which records the page size; if it is torn, look for slot 1 where
    each possible page size would put it. Then read both slots, and pick the intact
-   one with the highest generation.
+   one with the highest generation. Its high-water mark must leave the meta pages
+   in, and its root no deeper than writes take (`MAX_HEIGHT`).
 2. Load the internal pages level by level, verifying checksums, levels and
    generations, and point each parent at its children's frames. Leaves are read on
    demand, so open time scales with the internal pages, a fraction of a percent of
    the file.
 3. Build the free bitmap from the pages the tree reaches.
+
+No page past the end of the file is in use, since a commit writes its tree before
+its meta page. So the open takes the end of the file as the high-water mark if it
+comes first, which bounds the bitmap's memory by the file, and a page the tree
+lists past it is corrupt. The mark can lie past the end of a store's file: a write
+may free again the last pages it took, which it then doesn't write. A read-only
+view reads the file's length once it has read the meta page, as the owner may have
+committed past the length the view read first.
 
 Opening an empty file creates a store. It first syncs the file's directory, since a
 new file's name is durable only once its directory is: without that, a crash could
@@ -1146,14 +1155,19 @@ complete without suspending.
   reference past the end of the file or to a page already used. A flipped bit in
   meta slot 0 leaves slot 1, which the open finds where each page size would put
   it. A file of zeros, or with meta pages built from bad fields, isn't a store
-  (`Error::InvalidFile`).
+  (`Error::InvalidFile`): among them, a high-water mark that leaves out a meta page,
+  and a root deeper than writes take. A mark as high as marks go gives way to the
+  end of the file, and the store works; a tree page past the end, within the mark,
+  is `Error::Corruption`.
 - **Read-only views:** a view on the owner's simulated disk returns exactly its
   version while the owner rewrites every leaf, until its reads fail with
   `Error::Stale`, and never with other entries; so does a read of a page the owner
   cut off the end of the file. Damage in a store the owner hasn't written since is
   still `Error::Corruption`. The simulated disk can also take another disk's
   contents at a given operation, as if the owner wrote meanwhile: a view whose
-  internal nodes are overwritten that way while it opens fails with `Error::Stale`.
+  internal nodes are overwritten that way while it opens fails with `Error::Stale`,
+  and one whose owner commits a larger version after the view read the file's
+  length, and before it read the meta page, opens that version.
 - **Real files** cover what the simulated disk doesn't model: reopening, the lock
   that keeps out a second open, syncing the directory of a new store, including
   a directory that can't be synced, and a read-only view, which opens beside the
