@@ -69,9 +69,9 @@ pub(crate) const HEADER: usize = 32;
 const HEAD: usize = 4;
 const SLOT: usize = 6;
 pub(crate) const CHILD_REF: usize = 16;
-const FORMAT_SLOTTED: u8 = 1;
-const FORMAT_DENSE: u8 = 2;
-const FORMAT_VALUE: u8 = 3;
+pub(crate) const FORMAT_SLOTTED: u8 = 1;
+pub(crate) const FORMAT_DENSE: u8 = 2;
+pub(crate) const FORMAT_VALUE: u8 = 3;
 
 /// The bits of a page id that hold the page. The bits above hold a value leaf's
 /// span, in pages, and are 0 in every other node's page id.

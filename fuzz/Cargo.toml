@@ -1,0 +1,59 @@
+# The fuzz targets, which cargo fuzz builds with nightly Rust: see DESIGN.md §11.
+# Each calls its function in src/fuzz.rs, which holds what the target checks.
+[package]
+name = "encina-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not part of the encina crate's workspace, which then builds without it.
+[workspace]
+
+[dependencies]
+encina = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "meta_round_trip"
+path = "fuzz_targets/meta_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "node"
+path = "fuzz_targets/node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "node_round_trip"
+path = "fuzz_targets/node_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open"
+path = "fuzz_targets/open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value_leaf"
+path = "fuzz_targets/value_leaf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value_leaf_round_trip"
+path = "fuzz_targets/value_leaf_round_trip.rs"
+test = false
+doc = false
+bench = false
