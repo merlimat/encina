@@ -722,9 +722,13 @@ offset  size  field
 ```
 
 **Checks.** A node read from disk must have a known format, a matching checksum,
-entries, and a layout that stays within its page. Its level must be the one its
-parent expects, and its generation no newer than the meta page's. A value leaf's
-length must fill its span, give or take the last page's zeros.
+entries, and a layout that stays within its page. In a slotted node, the key
+prefix, the heads, the slots and every record lie in that order within the bytes
+used: reads lend values straight from the page, so a record past it would lend
+whatever memory follows. An internal node's values must be whole child
+references. Its level must be the one its parent expects, and its generation no
+newer than the meta page's. A value leaf's length must fill its span, give or
+take the last page's zeros.
 
 ### Free space is derived, not stored
 
@@ -1152,9 +1156,13 @@ complete without suspending.
   write merges, and see the last version.
 - **Damage:** a flipped bit in a leaf fails the reads that need it, and one in an
   internal node fails the open, both with `Error::Corruption`, as does a child
-  reference past the end of the file or to a page already used. A flipped bit in
-  meta slot 0 leaves slot 1, which the open finds where each page size would put
-  it. A file of zeros, or with meta pages built from bad fields, isn't a store
+  reference past the end of the file or to a page already used. So does a node
+  whose checksum matches but whose entries lie outside it: a slotted leaf whose
+  value runs past its page fails the reads, and an internal node whose child
+  reference is short fails the open. Format tests move each part of a slotted
+  node out of place in turn, and seal it again. A flipped bit in meta slot 0
+  leaves slot 1, which the open finds where each page size would put it. A file
+  of zeros, or with meta pages built from bad fields, isn't a store
   (`Error::InvalidFile`): among them, a high-water mark that leaves out a meta page,
   and a root deeper than writes take. A mark as high as marks go gives way to the
   end of the file, and the store works; a tree page past the end, within the mark,
