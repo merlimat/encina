@@ -16,8 +16,8 @@ updates:
         update-types: [minor, patch]
         exclude-patterns: [compio, compio-*]
 
-  # bench/ and experiments/leaf-layouts/ are workspaces of their own, each with
-  # its own Cargo.lock.
+  # bench/, experiments/leaf-layouts/ and fuzz/ are workspaces of their own, each
+  # with its own Cargo.lock.
   - package-ecosystem: cargo
     directory: /bench
     schedule:
@@ -36,6 +36,17 @@ updates:
     groups:
       crates:
         update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+    groups:
+      compio:
+        patterns: [compio, compio-*]
+      crates:
+        update-types: [minor, patch]
+        exclude-patterns: [compio, compio-*]
 
   # Covers every workflow in .github/workflows.
   - package-ecosystem: github-actions

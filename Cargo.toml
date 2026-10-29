@@ -28,6 +28,11 @@ tempfile = "3"
 [target."cfg(unix)".dependencies]
 libc = "0.2"
 
+# cargo fuzz builds with `--cfg fuzzing`, which compiles src/fuzz.rs for the
+# targets in fuzz/.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 # The encina command lives in cli/, so the library doesn't depend on its argument
 # parser. As a default member, cargo builds and tests it from here too.
 [workspace]

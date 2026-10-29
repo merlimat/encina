@@ -95,6 +95,11 @@ impl SimDisk {
         disk.current[at..at + len].to_vec()
     }
 
+    /// What reads see, byte for byte.
+    pub(crate) fn contents(&self) -> Vec<u8> {
+        self.0.borrow().current.clone()
+    }
+
     /// Operations started so far.
     pub(crate) fn ops(&self) -> u64 {
         self.0.borrow().ops

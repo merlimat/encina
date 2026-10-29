@@ -29,11 +29,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      # cargo-llvm-cov leaves out tests.rs and alloc_tests.rs; the simulated disk is
-      # test code too. A fixed seed makes the property tests, and so the numbers, the
-      # same on every run.
+      # cargo-llvm-cov leaves out tests.rs and alloc_tests.rs; the simulated disk and
+      # the fuzz targets' entry points are test code too. A fixed seed makes the
+      # property tests, and so the numbers, the same on every run.
       - name: Run the tests under cargo-llvm-cov
-        run: cargo llvm-cov --json --output-path target/coverage.json --ignore-filename-regex 'src/sim\.rs$'
+        run: cargo llvm-cov --json --output-path target/coverage.json --ignore-filename-regex 'src/(sim|fuzz)\.rs$'
         env:
           PROPTEST_RNG_SEED: 1
       - name: Summarize

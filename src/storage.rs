@@ -18,7 +18,7 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
-#[cfg(test)]
+#[cfg(any(test, fuzzing))]
 use std::rc::Rc;
 use std::task::{Context, Poll, ready};
 
@@ -39,7 +39,7 @@ const BLOCK: u64 = 4096;
 
 pub(crate) enum Storage {
     File(File),
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     Sim(Rc<crate::sim::SimDisk>),
 }
 
@@ -72,7 +72,7 @@ impl Storage {
     pub(crate) async fn len(&self) -> Result<u64> {
         match self {
             Storage::File(file) => Ok(file.metadata().await?.len()),
-            #[cfg(test)]
+            #[cfg(any(test, fuzzing))]
             Storage::Sim(disk) => Ok(disk.len()),
         }
     }
@@ -82,7 +82,7 @@ impl Storage {
     pub(crate) fn min_read(&self) -> usize {
         match self {
             Storage::File(_) => BLOCK as usize,
-            #[cfg(test)]
+            #[cfg(any(test, fuzzing))]
             Storage::Sim(_) => crate::options::MIN_PAGE_SIZE,
         }
     }
@@ -95,7 +95,7 @@ impl Storage {
                 let BufResult(res, buf) = file.read_exact_at(buf, offset).await;
                 (res, buf)
             }
-            #[cfg(test)]
+            #[cfg(any(test, fuzzing))]
             Storage::Sim(disk) => disk.read(buf, offset),
         }
     }
@@ -112,7 +112,7 @@ impl Storage {
                 let BufResult(res, buf) = file.read_exact_at(buf, offset).await;
                 (res, buf)
             }
-            #[cfg(test)]
+            #[cfg(any(test, fuzzing))]
             Storage::Sim(disk) => disk.read_value(buf, offset),
         }
     }
@@ -126,7 +126,7 @@ impl Storage {
                 debug_assert_blocks(&buf, offset);
                 PageRead::File(FileRead::new(file.to_shared_fd(), buf, offset))
             }
-            #[cfg(test)]
+            #[cfg(any(test, fuzzing))]
             Storage::Sim(disk) => {
                 PageRead::Sim(crate::sim::SimRead::new(disk.clone(), buf, offset))
             }
@@ -142,7 +142,7 @@ impl Storage {
                 let BufResult(res, buf) = file.write_all_at(buf, offset).await;
                 (res, buf)
             }
-            #[cfg(test)]
+            #[cfg(any(test, fuzzing))]
             Storage::Sim(disk) => disk.write(buf, offset).await,
         }
     }
@@ -162,7 +162,7 @@ impl Storage {
                 let BufResult(res, bufs) = file.write_vectored_all_at(bufs, offset).await;
                 (res, bufs)
             }
-            #[cfg(test)]
+            #[cfg(any(test, fuzzing))]
             Storage::Sim(disk) => disk.write_run(bufs, offset).await,
         }
     }
@@ -171,7 +171,7 @@ impl Storage {
     pub(crate) async fn set_len(&self, len: u64) -> io::Result<()> {
         match self {
             Storage::File(file) => file.set_len(len).await,
-            #[cfg(test)]
+            #[cfg(any(test, fuzzing))]
             Storage::Sim(disk) => disk.set_len(len).await,
         }
     }
@@ -180,7 +180,7 @@ impl Storage {
     pub(crate) async fn sync(&self) -> io::Result<()> {
         match self {
             Storage::File(file) => file.sync_data().await,
-            #[cfg(test)]
+            #[cfg(any(test, fuzzing))]
             Storage::Sim(disk) => disk.sync().await,
         }
     }
@@ -190,7 +190,7 @@ impl Storage {
 /// keeps the buffer until the read finishes.
 pub(crate) enum PageRead {
     File(FileRead),
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     Sim(crate::sim::SimRead),
 }
 
@@ -200,7 +200,7 @@ impl Future for PageRead {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.get_mut() {
             PageRead::File(read) => read.poll(cx),
-            #[cfg(test)]
+            #[cfg(any(test, fuzzing))]
             PageRead::Sim(read) => read.poll(cx),
         }
     }

@@ -97,13 +97,20 @@ mod batch;
 mod cache;
 mod db;
 mod error;
+// Entry points for the fuzz targets in fuzz/, which cargo fuzz builds with
+// `--cfg fuzzing`. Tests run them on their seeds.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod fuzz;
 mod meta;
 mod metrics;
 mod node;
 mod options;
 mod pool;
 mod reads;
-#[cfg(test)]
+// The fuzz targets open stores on the simulated disk, and use only some of it.
+#[cfg(any(test, fuzzing))]
+#[cfg_attr(not(test), allow(dead_code))]
 mod sim;
 mod space;
 mod storage;

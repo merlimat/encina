@@ -22,8 +22,9 @@ use crate::node;
 /// The smallest cache: a write needs a few leaves in memory at once.
 const MIN_CACHE_FRAMES: usize = 8;
 
-/// The smallest page size. Tests use tiny pages to grow deep trees from few entries.
-pub(crate) const MIN_PAGE_SIZE: usize = if cfg!(test) { 256 } else { 4096 };
+/// The smallest page size. Tests and fuzzing use tiny pages to grow deep trees from
+/// few entries.
+pub(crate) const MIN_PAGE_SIZE: usize = if cfg!(any(test, fuzzing)) { 256 } else { 4096 };
 
 /// The page size of a new store whose options don't set one.
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 4096;

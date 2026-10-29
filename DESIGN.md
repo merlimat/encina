@@ -1233,6 +1233,43 @@ complete without suspending.
   pass, real files' io_uring path included. One test drops a store while the
   simulated disk still holds its reads, which checks that their buffers keep the
   frame memory alive until the reads finish.
+- **Fuzzing:** coverage-guided, with cargo-fuzz and libFuzzer, of what encina
+  decodes from disk: whatever the bytes, a decoder must return an error, or
+  entries that lie within the bytes it read, and never panic. Each target in
+  `fuzz/` calls a function of `src/fuzz.rs`, which cargo fuzz compiles with
+  `--cfg fuzzing`, so the targets reach the decoders inside the crate. The targets
+  that read stamp checksums into their input, as a write does, so that the fuzzer
+  gets past them to the checks behind them.
+  - `node`: a page that `node::verify` accepts holds its keys, values and child
+    references within it, and searches and comparisons on it stay there too.
+  - `value_leaf`: a span that `node::verify_value_leaf` accepts, at each page size
+    that divides it, holds its key and value within it.
+  - `open`: a file opens on the simulated disk, as a read-only view and as its
+    owner, or fails with an error. An open store answers a scan, lookups with every
+    comparison and short scans from keys the scan found and keys beside them, and,
+    in the view, `pages`, with entries or errors. Writes to such a store aren't
+    fuzzed.
+  - `node_round_trip`, `value_leaf_round_trip` and `meta_round_trip`: what the
+    encoders write decodes back to what they were given. Sorted entries of any
+    lengths are built into nodes a page's worth at a time, at levels 0 to 3, with
+    child references above 0; a value leaf is copied out a page at a time over
+    other bytes, as a commit does; and a meta page has any fields.
+
+  The seeds in `fuzz/seeds/` are stores of several shapes, compacted so that their
+  pages follow each other, and the nodes and value leaves in them. Most have
+  256-byte pages, which fuzzing allows as tests do, so that a few entries make a
+  deep tree. The ignored test `write_fuzz_seeds` writes them, and needs to run
+  again when the format changes; another test runs every target on them, so
+  `cargo test` checks the targets too. Locally, with nightly Rust and
+  `cargo install cargo-fuzz`, `mkdir -p fuzz/corpus/node`, then
+  `cargo +nightly fuzz run node fuzz/corpus/node fuzz/seeds/node` fuzzes `node`
+  until it fails, and `-- -max_total_time=300` stops it after five minutes. CI
+  runs each target for a minute on every pull request (`fuzz.yml`), and for an
+  hour every night on every core of the runner (`fuzz-nightly.yml`). The nightly
+  run minimizes the corpus it grew and caches it for the next night and for pull
+  requests, which start from it. A run that fails uploads the input as the
+  artifact `fuzz-<target>`, which `cargo +nightly fuzz run <target> <file>`
+  reproduces.
 - **Benchmarks** against RocksDB on the BookKeeper workload: sorted batches over
   *A* active ledgers, random point reads, floor lookups, and `delete_range` of old
   ledgers. On the simulated disk, an ignored test measures the file's size and the
