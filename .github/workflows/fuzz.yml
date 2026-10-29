@@ -43,11 +43,14 @@ jobs:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
-      # An input that runs for 30 seconds is a hang.
+      # cargo-fuzz's release is built for musl, and builds for its own target
+      # unless told another: AddressSanitizer needs the host's, with glibc. An
+      # input that runs for 30 seconds is a hang.
       - name: Fuzz for a minute
         run: |
           mkdir -p "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET"
-          cargo fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          cargo fuzz run --target "$host" "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
             -max_total_time=60 -timeout=30
       - name: Upload the input that failed
         if: failure()

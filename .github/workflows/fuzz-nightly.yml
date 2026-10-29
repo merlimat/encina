@@ -42,17 +42,22 @@ jobs:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # cargo-fuzz's release is built for musl, and builds for its own target
+      # unless told another: AddressSanitizer needs the host's, with glibc.
+      - name: Target the host
+        run: |
+          echo "HOST=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
       # An input that runs for 30 seconds is a hang.
       - name: Fuzz for an hour
         run: |
           mkdir -p "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET"
-          cargo fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
+          cargo fuzz run --target "$HOST" "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
             -max_total_time=3600 -timeout=30 -fork="$(nproc)"
       # Keeps the inputs that reach new coverage, so the corpus doesn't grow
       # without bound. A crash leaves it as useful as before.
       - name: Minimize the corpus
         if: ${{ !cancelled() }}
-        run: cargo fuzz cmin "$TARGET" "fuzz/corpus/$TARGET" -- -timeout=30
+        run: cargo fuzz cmin --target "$HOST" "$TARGET" "fuzz/corpus/$TARGET" -- -timeout=30
       - name: Save the corpus
         if: ${{ !cancelled() }}
         uses: actions/cache/save@v6
