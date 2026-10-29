@@ -319,12 +319,22 @@ pub(crate) fn verify(page: &[u8]) -> bool {
     if node.count == 0 || node.used() > page.len() {
         return false;
     }
-    if !node.dense {
-        return node.heap_at <= node.used();
-    }
     // An internal node's values are whole child references.
+    let internal = node.level() > 0;
+    if !node.dense {
+        // The key prefix, the heads, the slots and every record, in that order,
+        // within the bytes used: reads lend values straight from the page.
+        return HEADER + node.prefix_len <= node.heads_at
+            && node.heads_at + node.count * HEAD <= node.slots_at
+            && node.heap_at <= node.used()
+            && (0..node.count).all(|i| {
+                let (at, suffix_len, value_len) = node.slot(i);
+                at + rest_len(suffix_len) + value_len <= node.used()
+                    && (!internal || value_len == CHILD_REF)
+            });
+    }
     node.used() == node.values_at + node.count * node.value_suffix
-        && (node.level() == 0 || (node.value_prefix == 0 && node.value_suffix == CHILD_REF))
+        && (!internal || (node.value_prefix == 0 && node.value_suffix == CHILD_REF))
 }
 
 /// Points entry `i` of the internal node in `page` at `frame`. A level-1 node's
@@ -1195,6 +1205,58 @@ mod tests {
         buf.push(b"a", b"12345");
         buf.push(b"b", b"12346");
         build(&mut page, 1, &buf, 0, 2);
+        seal(&mut page, 1);
+        assert!(!verify(&page));
+    }
+
+    #[test]
+    fn slotted_nodes_lay_out_their_parts_within_the_bytes_used() {
+        // Keys of two lengths make a slotted leaf, with no key prefix: two heads from
+        // byte 32, two slots of 6 bytes from 40, and records from 52 to the 54 bytes
+        // used.
+        let mut buf = EntryBuf::default();
+        buf.push(b"a", b"x");
+        buf.push(b"bb", b"y");
+        let mut page = vec![0; 256];
+        build(&mut page, 0, &buf, 0, 2);
+        let node = Node::new(&page);
+        assert_eq!(
+            (node.dense, node.heads_at, node.slots_at, node.used()),
+            (false, 32, 40, 54)
+        );
+        let mut sealed = page.clone();
+        seal(&mut sealed, 1);
+        assert!(verify(&sealed));
+        // Each damage is sealed, so that only the layout can give it away.
+        for (at, value, what) in [
+            (8, 1, "a key prefix that runs into the heads"),
+            (10, 36, "heads that run into the slots"),
+            (12, 0, "slots in the header"),
+            (40, u16::MAX, "a record past the page"),
+            (42, 300, "a key suffix past the bytes used"),
+            (50, 2, "a value past the bytes used"),
+        ] {
+            let mut damaged = page.clone();
+            put_u16(&mut damaged, at, value.into());
+            seal(&mut damaged, 1);
+            assert!(!verify(&damaged), "{what} went unnoticed");
+        }
+    }
+
+    #[test]
+    fn slotted_internal_nodes_need_whole_child_refs() {
+        // Keys of two lengths make a slotted node.
+        let mut buf = EntryBuf::default();
+        buf.push(b"a", &child_ref(Child::internal(1, 2)));
+        buf.push(b"bb", &child_ref(Child::internal(1, 3)));
+        let mut page = vec![0; 256];
+        build(&mut page, 1, &buf, 0, 2);
+        seal(&mut page, 1);
+        assert!(!Node::new(&page).dense);
+        assert!(verify(&page));
+        // The second reference a byte short, its record still within the bytes used.
+        let slot = Node::new(&page).slots_at + SLOT;
+        put_u16(&mut page, slot + 4, CHILD_REF - 1);
         seal(&mut page, 1);
         assert!(!verify(&page));
     }
