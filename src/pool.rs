@@ -440,7 +440,7 @@ impl FrameBuf {
         self.id
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: frame memory is initialized (zeroed when allocated).
         unsafe { slice::from_raw_parts_mut(self.data.as_ptr(), self.len) }
@@ -504,7 +504,7 @@ impl ValueBuf {
         unsafe { slice::from_raw_parts(self.data.as_ptr(), self.len) }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: as in `bytes`.
         unsafe { slice::from_raw_parts_mut(self.data.as_ptr(), self.len) }

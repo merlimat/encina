@@ -1,0 +1,62 @@
+name: Fuzz
+
+# Runs each fuzz target in fuzz/ for a minute (DESIGN.md §11), from the corpus the
+# nightly runs keep (fuzz-nightly.yml) and the seeds in fuzz/seeds/.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [meta_round_trip, node, node_round_trip, open, value_leaf, value_leaf_round_trip]
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # A pull request can restore what the nightly runs saved on main, and saves
+      # nothing: its inputs only matter to it.
+      - name: Restore the corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # An input that runs for 30 seconds is a hang.
+      - name: Fuzz for a minute
+        run: |
+          mkdir -p "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET"
+          cargo fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
+            -max_total_time=60 -timeout=30
+      - name: Upload the input that failed
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+      - name: Say how to reproduce it
+        if: failure()
+        run: >
+          echo "The fuzz-$TARGET artifact holds the input that failed. Reproduce it with
+          \`cargo +nightly fuzz run $TARGET <file>\`." >> "$GITHUB_STEP_SUMMARY"

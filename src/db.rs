@@ -217,7 +217,7 @@ impl Db {
     }
 
     /// Opens a store on a simulated disk.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) async fn open_sim(disk: Rc<crate::sim::SimDisk>, opts: Options) -> Result<Db> {
         opts.validate()?;
         let len = disk.len();
@@ -562,7 +562,7 @@ impl Db {
         if let Ok(inner) = Rc::try_unwrap(self.inner) {
             match inner.storage {
                 Storage::File(file) => file.close().await?,
-                #[cfg(test)]
+                #[cfg(any(test, fuzzing))]
                 Storage::Sim(_) => {}
             }
         }
@@ -631,7 +631,7 @@ impl ReadOnlyDb {
     }
 
     /// Opens a view of a store on a simulated disk.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) async fn open_sim(
         disk: Rc<crate::sim::SimDisk>,
         opts: Options,

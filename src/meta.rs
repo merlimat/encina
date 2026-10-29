@@ -34,7 +34,7 @@
 /// Pages 0 and 1 hold the meta slots; nodes start at page 2.
 pub(crate) const META_PAGES: u64 = 2;
 
-const MAGIC: [u8; 8] = *b"encina\0\0";
+pub(crate) const MAGIC: [u8; 8] = *b"encina\0\0";
 pub(crate) const FORMAT_VERSION: u32 = 1;
 const LEN: usize = 64;
 
