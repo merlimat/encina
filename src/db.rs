@@ -36,7 +36,7 @@ use crate::pool::{FrameBuf, FrameId, Holds, Pool, ValueBuf};
 use crate::reads::{Claim, Reads};
 use crate::space::Space;
 use crate::storage::{PageRead, Storage};
-use crate::tree::{Cursor, Find, Pages, Root, Tree, Version};
+use crate::tree::{Cursor, Find, MAX_HEIGHT, Pages, Root, Tree, Version};
 use crate::writes::{Turn, Writes};
 
 /// How many reads or writes a write or an open keeps in flight, and how many
@@ -252,11 +252,18 @@ impl Db {
             page_size: Some(page_size),
             ..opts
         };
+        // No page past the end of the file is in use: a commit writes its tree
+        // before its meta page. So the file bounds the pages the open marks, and the
+        // memory that takes, and a page the tree lists past its end is corrupt. A
+        // view reads the length again, after the meta page: the owner may have
+        // committed past the length the view read first.
+        let len = if read_only { storage.len().await? } else { len };
+        let file_end = len.div_ceil(page_size as u64).max(meta::META_PAGES);
         let meter = metrics::Meter::new(&opts, path);
         let mut pages = Pages {
             pool: Pool::new(page_size),
             cache: Cache::new(opts.cache_frames()),
-            space: Space::new(meta.high_water, opts.min_run_pages as u64),
+            space: Space::new(meta.high_water.min(file_end), opts.min_run_pages as u64),
         };
         pages.pool.usage = meter.cache_usage();
         [pages.cache.hits, pages.cache.misses] = meter.cache_lookups();
@@ -292,7 +299,7 @@ impl Db {
             writes: RefCell::new(Writes::new()),
             failed: Cell::new(false),
             metrics,
-            file_end: Cell::new(len.div_ceil(page_size as u64).max(meta::META_PAGES)),
+            file_end: Cell::new(file_end),
             read_only,
             page_size,
             max_key: opts.max_key_size(),
@@ -783,8 +790,14 @@ async fn recover(storage: &Storage, len: u64) -> Result<Meta> {
     if meta.version != FORMAT_VERSION {
         return Err(Error::InvalidFile("unsupported format version"));
     }
+    // The high-water mark leaves the meta pages in, and the tree is no deeper than
+    // writes take.
     let root_ok = meta.root == 0 || (meta::META_PAGES..meta.high_water).contains(&meta.root);
-    if meta.page_size as usize != page_size || !root_ok {
+    if meta.page_size as usize != page_size
+        || meta.high_water < meta::META_PAGES
+        || usize::from(meta.root_level) + 1 >= MAX_HEIGHT
+        || !root_ok
+    {
         return Err(Error::InvalidFile("inconsistent meta page"));
     }
     Ok(meta)
@@ -837,6 +850,11 @@ async fn load_internal(
     if meta.root == 0 {
         return Ok(None);
     }
+    // The tree's pages lie below the high-water mark, which the file bounds.
+    let high_water = pages.space.high_water();
+    if meta.root >= high_water {
+        return Err(Error::Corruption { page: meta.root });
+    }
     pages.space.mark_used(meta.root);
     if meta.root_level == 0 {
         return Ok(Some(Root {
@@ -881,7 +899,7 @@ async fn load_internal(
                 let (first, n) = (node::first_page(page), node::pages(page));
                 if (level > 1 && node::span(page) > 0)
                     || first < meta::META_PAGES
-                    || first + n > meta.high_water
+                    || first + n > high_water
                     || (first..first + n).any(|page| pages.space.is_used(page))
                 {
                     return Err(Error::Corruption { page: first });

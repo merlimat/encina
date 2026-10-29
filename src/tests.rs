@@ -1504,7 +1504,7 @@ fn a_bad_child_reference_fails_the_open() {
 fn bad_meta_pages_are_rejected() {
     let meta = Meta::empty(256);
     // The meta page in each slot of a two-page file, and why it isn't a store.
-    let cases: [(&[Meta], &str); 5] = [
+    let cases: [(&[Meta], &str); 7] = [
         // Zeros.
         (&[], "no intact meta page"),
         (
@@ -1517,6 +1517,22 @@ fn bad_meta_pages_are_rejected() {
         (&[Meta { version: 2, ..meta }], "unsupported format version"),
         // The root is at the high-water mark, beyond the pages in use.
         (&[Meta { root: 2, ..meta }], "inconsistent meta page"),
+        // The high-water mark leaves out meta page 1.
+        (
+            &[Meta {
+                high_water: 1,
+                ..meta
+            }],
+            "inconsistent meta page",
+        ),
+        // The tree is deeper than writes take.
+        (
+            &[Meta {
+                root_level: crate::tree::MAX_HEIGHT as u8 - 1,
+                ..meta
+            }],
+            "inconsistent meta page",
+        ),
         // The newer slot has another page size.
         (
             &[
@@ -1543,6 +1559,105 @@ fn bad_meta_pages_are_rejected() {
             "{reason}"
         );
     }
+}
+
+#[test]
+fn the_file_bounds_the_high_water_mark() {
+    let opts = Options::new().page_size(256);
+    let open_both = |file: &[u8]| {
+        let disk = SimDisk::new();
+        disk.set_bytes(0, file);
+        let viewed = now(ReadOnlyDb::open_sim(disk.clone(), opts.clone())).map(drop);
+        (viewed, now(Db::open_sim(disk, opts.clone())))
+    };
+    // An empty store whose mark is as high as marks go: the open takes the end
+    // of the file instead, and the store works.
+    let mut file = vec![0; 512];
+    Meta {
+        high_water: u64::MAX,
+        ..Meta::empty(256)
+    }
+    .encode(&mut file[..256]);
+    open_both(&file).0.unwrap();
+    let disk = SimDisk::new();
+    disk.set_bytes(0, &file);
+    let mut store = Store {
+        db: now(Db::open_sim(disk.clone(), opts.clone())).unwrap(),
+        disk,
+        opts: opts.clone(),
+    };
+    assert_eq!(
+        store.db.tree().pages.space.high_water(),
+        crate::meta::META_PAGES
+    );
+    let ops = round_of(300, 1);
+    write(&store.db, &ops);
+    let mut model = Model::new();
+    apply(&mut model, &ops);
+    store.reopen();
+    store.db.check();
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    // A three-page file whose root lists leaves on pages 3 to 5, within the mark:
+    // no commit wrote them, so the tree is corrupt.
+    let mut file = vec![0; 3 * 256];
+    let mut buf = node::EntryBuf::default();
+    for (i, key) in [b"a", b"b", b"c"].into_iter().enumerate() {
+        let size = node::Size {
+            entries: 1,
+            bytes: 2,
+        };
+        buf.push(key, &node::child_ref(node::Child::leaf(3 + i as u64, size)));
+    }
+    node::build(&mut file[512..], 1, &buf, 0, 3);
+    node::seal(&mut file[512..], 0);
+    let meta = Meta {
+        root: 2,
+        root_level: 1,
+        high_water: 10,
+        entries: 3,
+        entry_bytes: 6,
+        ..Meta::empty(256)
+    };
+    meta.encode(&mut file[..256]);
+    let (viewed, opened) = open_both(&file);
+    assert!(
+        matches!(viewed, Err(Error::Corruption { page: 3 })),
+        "{viewed:?}"
+    );
+    assert!(matches!(opened, Err(Error::Corruption { page: 3 })));
+    // So is a root leaf past the end of the file.
+    Meta {
+        root: 5,
+        root_level: 0,
+        ..meta
+    }
+    .encode(&mut file[..256]);
+    let (viewed, opened) = open_both(&file[..512]);
+    assert!(
+        matches!(viewed, Err(Error::Corruption { page: 5 })),
+        "{viewed:?}"
+    );
+    assert!(matches!(opened, Err(Error::Corruption { page: 5 })));
+}
+
+#[test]
+fn a_view_reads_the_file_length_after_the_meta_page() {
+    // The owner commits a larger version after the view read the file's length,
+    // but before it read the meta page: the view opens that version, whose pages
+    // reach past the length it read first.
+    let opts = Options::new().page_size(256);
+    let store = Store::new(opts.clone());
+    let (first, second) = (round_of(10, 0), round_of(300, 1));
+    write(&store.db, &first);
+    let disk = store.disk.restart();
+    write(&store.db, &second);
+    assert!(store.disk.len() > disk.len());
+    let mut model = Model::new();
+    apply(&mut model, &first);
+    apply(&mut model, &second);
+    disk.overwrite_at(0, &store.disk);
+    let view = now(ReadOnlyDb::open_sim(disk, opts)).unwrap();
+    assert_eq!(view_scan(&view).unwrap(), expected_scan(&model, ALL));
 }
 
 /// Opens the store on `disk` with each read of the open failing in turn: that

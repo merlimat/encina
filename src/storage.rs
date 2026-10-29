@@ -68,6 +68,15 @@ impl Storage {
         Ok((Storage::File(file), len))
     }
 
+    /// The file's length, in bytes, as of now.
+    pub(crate) async fn len(&self) -> Result<u64> {
+        match self {
+            Storage::File(file) => Ok(file.metadata().await?.len()),
+            #[cfg(test)]
+            Storage::Sim(disk) => Ok(disk.len()),
+        }
+    }
+
     /// The smallest read it supports: a block for a file, whose direct I/O moves
     /// whole blocks, or the tiny pages tests use on the simulated disk.
     pub(crate) fn min_read(&self) -> usize {
