@@ -49,9 +49,10 @@
 //! Internal nodes use the same formats. Their values are child references,
 //! [`CHILD_REF`] bytes: the child's frame, its page id once it has one, and four
 //! zero bytes. Loading an internal node rewrites the frames, so its values are always
-//! stored whole. A level-1 node refers to leaves, which are found by page id: a
-//! reference to a leaf holds the leaf's entry count where the frame goes, and the
-//! bytes of its keys and values in the last four.
+//! stored whole. Leaves and level-1 nodes are found by page id, through the cache,
+//! so a reference to one holds no frame: a reference to a leaf holds the leaf's
+//! entry count where the frame goes, and the bytes of its keys and values in the
+//! last four, and a reference to a level-1 node holds zeros there.
 //!
 //! **Value leaves** hold one entry too large for the other formats, on as many
 //! adjacent pages as it needs: the header, with the key length at offset 8 and the
@@ -238,7 +239,8 @@ impl SubAssign for Size {
 /// The node a child reference refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Child {
-    /// Its frame, or [`NO_FRAME`] for a leaf.
+    /// Its frame, or [`NO_FRAME`] for a leaf or a level-1 node, which the cache
+    /// keeps.
     pub(crate) frame: FrameId,
     pub(crate) page: u64,
     /// A leaf's size; zero for an internal node.
@@ -263,12 +265,17 @@ impl Child {
             size: Size::default(),
         }
     }
+
+    /// A level-1 node on page id `page`, found through the cache.
+    pub(crate) fn level_1(page: u64) -> Child {
+        Child::internal(NO_FRAME, page)
+    }
 }
 
 /// Encodes a child reference for an internal node: the child's frame, its page id,
 /// and four zero bytes. For a leaf, the entry count takes the frame's place, and
-/// the bytes of its keys and values the last four. Frames are only meaningful in
-/// memory: loading an internal node rewrites them.
+/// the bytes of its keys and values the last four; a level-1 node has neither.
+/// Frames are only meaningful in memory: loading an internal node rewrites them.
 pub(crate) fn child_ref(child: Child) -> [u8; CHILD_REF] {
     let (head, tail) = if child.frame == NO_FRAME {
         let entries = u32::try_from(child.size.entries).unwrap();
@@ -283,15 +290,17 @@ pub(crate) fn child_ref(child: Child) -> [u8; CHILD_REF] {
     r
 }
 
-/// Decodes a child reference: to a leaf if `leaf`, held by a level-1 node.
-pub(crate) fn decode_child(child_ref: &[u8], leaf: bool) -> Child {
+/// Decodes a reference to a child at `level`.
+pub(crate) fn decode_child(child_ref: &[u8], level: u8) -> Child {
     let u32_at = |at: usize| u32::from_le_bytes(child_ref[at..at + 4].try_into().unwrap());
     let page = child_page(child_ref);
-    if leaf {
-        let (entries, bytes) = (u32_at(0).into(), u32_at(12).into());
-        Child::leaf(page, Size { entries, bytes })
-    } else {
-        Child::internal(u32_at(0), page)
+    match level {
+        0 => {
+            let (entries, bytes) = (u32_at(0).into(), u32_at(12).into());
+            Child::leaf(page, Size { entries, bytes })
+        }
+        1 => Child::level_1(page),
+        _ => Child::internal(u32_at(0), page),
     }
 }
 
@@ -337,8 +346,9 @@ pub(crate) fn verify(page: &[u8]) -> bool {
         && (!internal || (node.value_prefix == 0 && node.value_suffix == CHILD_REF))
 }
 
-/// Points entry `i` of the internal node in `page` at `frame`. A level-1 node's
-/// references hold its leaves' sizes there instead.
+/// Points entry `i` of the internal node in `page` at `frame`. Only nodes above
+/// level 2 refer to their children by frame: a level-1 node's references hold its
+/// leaves' sizes there instead, and a level-2 node's hold zeros.
 pub(crate) fn set_child_frame(page: &mut [u8], i: usize, frame: FrameId) {
     let (at, _) = Node::new(page).value_span(i);
     page[at..at + 4].copy_from_slice(&frame.to_le_bytes());
@@ -728,11 +738,11 @@ impl<'a> Node<'a> {
 
     /// The child an internal node's entry `i` refers to.
     pub(crate) fn child_at(&self, i: usize) -> Child {
-        decode_child(self.value(i), self.level() == 1)
+        decode_child(self.value(i), self.level() - 1)
     }
 
     /// The frame of the child an internal node's entry `i` refers to, or
-    /// [`NO_FRAME`] for a leaf.
+    /// [`NO_FRAME`] for a leaf or a level-1 node.
     pub(crate) fn child(&self, i: usize) -> FrameId {
         self.child_at(i).frame
     }
@@ -1264,13 +1274,15 @@ mod tests {
     #[test]
     fn child_refs_round_trip() {
         let internal = Child::internal(7, u64::MAX - 1);
-        assert_eq!(decode_child(&child_ref(internal), false), internal);
+        assert_eq!(decode_child(&child_ref(internal), 2), internal);
+        let level_1 = Child::level_1(u64::MAX - 1);
+        assert_eq!(decode_child(&child_ref(level_1), 1), level_1);
         let size = Size {
             entries: 807,
             bytes: u64::from(u32::MAX),
         };
         let leaf = Child::leaf(u64::MAX - 1, size);
-        assert_eq!(decode_child(&child_ref(leaf), true), leaf);
+        assert_eq!(decode_child(&child_ref(leaf), 0), leaf);
     }
 
     #[test]

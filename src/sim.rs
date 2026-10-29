@@ -87,6 +87,14 @@ impl SimDisk {
         self.0.borrow().current.len() as u64
     }
 
+    /// The `len` bytes at `offset` the disk holds now, read without counting an
+    /// operation.
+    pub(crate) fn peek(&self, offset: u64, len: usize) -> Vec<u8> {
+        let disk = self.0.borrow();
+        let at = offset as usize;
+        disk.current[at..at + len].to_vec()
+    }
+
     /// Operations started so far.
     pub(crate) fn ops(&self) -> u64 {
         self.0.borrow().ops

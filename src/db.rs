@@ -283,17 +283,23 @@ impl Db {
             }
             root => root?,
         };
+        #[allow(unused_mut)]
+        let mut tree = Tree::new(
+            pages,
+            page_size,
+            root,
+            meta.generation,
+            Size {
+                entries: meta.entries,
+                bytes: meta.entry_bytes,
+            },
+        );
+        #[cfg(test)]
+        if let Storage::Sim(disk) = &storage {
+            tree.disk = Some(disk.clone());
+        }
         let inner = Inner {
-            tree: RefCell::new(Tree::new(
-                pages,
-                page_size,
-                root,
-                meta.generation,
-                Size {
-                    entries: meta.entries,
-                    bytes: meta.entry_bytes,
-                },
-            )),
+            tree: RefCell::new(tree),
             reads: RefCell::new(reads),
             storage,
             writes: RefCell::new(Writes::new()),
@@ -452,7 +458,7 @@ impl Db {
             inner,
             key: inner.take_buffer(),
             version: None,
-            leaves: [NO_FRAME; 2],
+            nodes: [NO_FRAME; 4],
             loaded: 0,
         };
         loop {
@@ -475,19 +481,20 @@ impl Db {
                     return Ok(Some(f(key, value)));
                 }
                 Find::NotFound => return Ok(None),
-                Find::Missing(page) => {
+                Find::Missing(page, level) => {
                     if read.version.is_none() {
                         // Waiting on the disk lets writes run: pin this version first.
                         read.version = Some(inner.tree.borrow_mut().pin());
                         inner.metrics.readers.add(1);
                         continue;
                     }
-                    // A lookup reads at most two leaves, which stay pinned until it ends.
+                    // A lookup reads at most two leaves, and the level-1 nodes above
+                    // them, which stay pinned until it ends.
                     assert!(
-                        read.loaded < read.leaves.len(),
-                        "lookup needs too many leaves"
+                        read.loaded < read.nodes.len(),
+                        "lookup needs too many nodes"
                     );
-                    read.leaves[read.loaded] = match load_leaf(inner, page).await {
+                    read.nodes[read.loaded] = match load_node(inner, page, level).await {
                         Ok(frame) => frame,
                         Err(e) => return Err(inner.explain(e).await),
                     };
@@ -521,9 +528,9 @@ impl Db {
     /// other range form. `db.range(..)` covers every key, and a pair of [`Bound`]s
     /// can also leave out the start.
     ///
-    /// An iterator keeps its version's internal nodes in memory, and the pages
-    /// later writes replace allocated, until it is dropped, so keep iterators
-    /// short-lived.
+    /// An iterator keeps its version's internal nodes above level 1 in memory, and
+    /// the pages later writes replace allocated, until it is dropped, so keep
+    /// iterators short-lived.
     pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter {
         let mut bounds = self.inner.take_buffer();
         let start = copy_bound(range.start_bound().cloned(), &mut bounds);
@@ -537,6 +544,7 @@ impl Db {
             inner: self.inner.clone(),
             version,
             cursor: Cursor::new(),
+            level_1: None,
             leaf: None,
             on_value: false,
             value: None,
@@ -674,51 +682,63 @@ impl ReadOnlyDb {
     }
 
     /// Calls `f` on each node of the tree in the version this view reads: the
-    /// internal nodes first, then the leaves in key order. Leaves that aren't
+    /// internal nodes first, then the leaves in key order. Nodes that aren't
     /// cached are read one at a time, so this reads most of the file.
     ///
     /// The file's other pages are the two meta pages at its start, and free pages.
     pub async fn pages(&self, mut f: impl FnMut(PageInfo)) -> Result<()> {
         let inner = &*self.db.inner;
-        // A view never writes: its tree stays as it is while leaves are read.
+        // A view never writes: its tree stays as it is while nodes are read.
         let Some(root) = inner.tree.borrow().current().root else {
             return Ok(());
         };
+        if root.level == 0 {
+            f(leaf_info(inner, root.page).await?);
+            return Ok(());
+        }
+        // The nodes above level 1 are in memory. They list the level-1 nodes, in key
+        // order, which list the leaves.
+        let mut level_1 = Vec::new();
         let mut stack = Vec::new();
-        if root.level > 0 {
-            stack.push((root.frame, root.page));
+        match root.level {
+            1 => level_1.push(root.page),
+            _ => stack.push((root.frame, root.page)),
         }
         while let Some((frame, page)) = stack.pop() {
             let info = {
                 let tree = inner.tree.borrow();
                 let node = tree.node(frame);
-                if node.level() > 1 {
-                    stack.extend((0..node.count()).map(|i| (node.child(i), node.child_page(i))));
+                let children = (0..node.count()).rev();
+                match node.level() {
+                    2 => level_1.extend(children.rev().map(|i| node.child_page(i))),
+                    _ => stack.extend(children.map(|i| (node.child(i), node.child_page(i)))),
                 }
                 PageInfo::of(page, &node)
             };
             f(info);
         }
-        let mut cur = Cursor::new();
-        let mut leaf = Some(inner.tree.borrow().descend_first(root, &mut cur));
-        while let Some(page) = leaf {
-            let info = if node::span(page) > 0 {
-                match read_value_leaf(inner, page, None).await {
-                    Ok(buf) => PageInfo::of_value(page, &ValueLeaf::new(buf.bytes())),
-                    Err(e) => return Err(inner.explain(e).await),
-                }
-            } else {
-                let frame = match load_leaf(inner, page).await {
-                    Ok(frame) => frame,
-                    Err(e) => return Err(inner.explain(e).await),
-                };
-                let tree = inner.tree.borrow();
-                let info = PageInfo::of(page, &tree.node(frame));
-                tree.pages.pool.unref(frame);
-                info
-            };
-            leaf = inner.tree.borrow().next_leaf(&mut cur, true);
+        for &page in &level_1 {
+            let frame = load_level_1(inner, page).await?;
+            let tree = inner.tree.borrow();
+            let info = PageInfo::of(page, &tree.node(frame));
+            tree.pages.pool.unref(frame);
+            drop(tree);
             f(info);
+        }
+        for &page in &level_1 {
+            let frame = load_level_1(inner, page).await?;
+            let count = inner.tree.borrow().node(frame).count();
+            for i in 0..count {
+                let leaf = inner.tree.borrow().node(frame).child_page(i);
+                match leaf_info(inner, leaf).await {
+                    Ok(info) => f(info),
+                    Err(e) => {
+                        inner.tree.borrow().pages.pool.unref(frame);
+                        return Err(e);
+                    }
+                }
+            }
+            inner.tree.borrow().pages.pool.unref(frame);
         }
         Ok(())
     }
@@ -727,6 +747,33 @@ impl ReadOnlyDb {
     pub async fn close(self) -> Result<()> {
         self.db.close().await
     }
+}
+
+/// Pins the level-1 node on `page`, for [`ReadOnlyDb::pages`].
+async fn load_level_1(inner: &Inner, page: u64) -> Result<FrameId> {
+    match load_node(inner, page, 1).await {
+        Ok(frame) => Ok(frame),
+        Err(e) => Err(inner.explain(e).await),
+    }
+}
+
+/// Reads the leaf on `page`, if it isn't cached, and describes it, for
+/// [`ReadOnlyDb::pages`].
+async fn leaf_info(inner: &Inner, page: u64) -> Result<PageInfo> {
+    if node::span(page) > 0 {
+        return match read_value_leaf(inner, page, None).await {
+            Ok(buf) => Ok(PageInfo::of_value(page, &ValueLeaf::new(buf.bytes()))),
+            Err(e) => Err(inner.explain(e).await),
+        };
+    }
+    let frame = match load_node(inner, page, 0).await {
+        Ok(frame) => frame,
+        Err(e) => return Err(inner.explain(e).await),
+    };
+    let tree = inner.tree.borrow();
+    let info = PageInfo::of(page, &tree.node(frame));
+    tree.pages.pool.unref(frame);
+    Ok(info)
 }
 
 /// Writes the meta page and the empty second slot of a new store.
@@ -839,8 +886,10 @@ async fn read_meta(storage: &Storage, len: usize, offset: u64) -> Result<Option<
     Ok(Meta::decode(pool.page(frame)))
 }
 
-/// Loads every internal node of the tree `meta` describes, pointing each parent at
-/// its children's frames, and marks the tree's pages used. Returns the root.
+/// Loads every internal node of the tree `meta` describes, and marks the tree's
+/// pages used. The nodes above level 1 stay in memory, each parent pointing at its
+/// children's frames. The level-1 nodes, read to find their leaves' pages, go to
+/// the cache, which keeps those it has room for. Returns the root.
 async fn load_internal(
     storage: &Storage,
     pages: &mut Pages,
@@ -864,11 +913,27 @@ async fn load_internal(
         }));
     }
     let page_size = meta.page_size as u64;
-    let root = pages.pool.alloc(Holds::Internal, meta.root);
+    // Level-1 nodes take frames from the cache as they are read, a window at a time.
+    let root = match meta.root_level {
+        1 => NO_FRAME,
+        _ => pages.pool.alloc(Holds::Internal, meta.root),
+    };
     let mut level_nodes = vec![(root, meta.root)];
     for level in (1..=meta.root_level).rev() {
-        // Read this level.
-        for chunk in level_nodes.chunks(IO_WINDOW) {
+        let mut next = Vec::new();
+        // Read this level, then mark the pages of the level below, which it lists.
+        // The level-1 nodes being read fit in what the nodes above leave of the
+        // cache's budget, so that the pool stays within it.
+        let window = match level {
+            1 => IO_WINDOW.min(pages.cache.budget().saturating_sub(pages.pool.in_use())),
+            _ => IO_WINDOW,
+        };
+        for chunk in level_nodes.chunks_mut(window.max(1)) {
+            if level == 1 {
+                for (frame, page) in chunk.iter_mut() {
+                    *frame = pages.cache.alloc(&mut pages.pool, Holds::Loading, *page);
+                }
+            }
             let reads: [_; IO_WINDOW] = array::from_fn(|i| {
                 let &(frame, page) = chunk.get(i)?;
                 metrics.read.add(page_size as usize);
@@ -888,31 +953,37 @@ async fn load_internal(
                     return Err(Error::Corruption { page });
                 }
             }
-        }
-        // Then point it at the level below, which it lists.
-        let mut next = Vec::new();
-        for &(parent, _) in &level_nodes {
-            let count = Node::new(pages.pool.page(parent)).count();
-            for i in 0..count {
-                let page = Node::new(pages.pool.page(parent)).child_page(i);
-                // Only leaves may be value leaves, and each page of one is the tree's.
-                let (first, n) = (node::first_page(page), node::pages(page));
-                if (level > 1 && node::span(page) > 0)
-                    || first < meta::META_PAGES
-                    || first + n > high_water
-                    || (first..first + n).any(|page| pages.space.is_used(page))
-                {
-                    return Err(Error::Corruption { page: first });
+            for &(parent, page) in chunk.iter() {
+                let count = Node::new(pages.pool.page(parent)).count();
+                for i in 0..count {
+                    let page = Node::new(pages.pool.page(parent)).child_page(i);
+                    // Only leaves may be value leaves, and each page of one is the
+                    // tree's.
+                    let (first, n) = (node::first_page(page), node::pages(page));
+                    if (level > 1 && node::span(page) > 0)
+                        || first < meta::META_PAGES
+                        || first + n > high_water
+                        || (first..first + n).any(|page| pages.space.is_used(page))
+                    {
+                        return Err(Error::Corruption { page: first });
+                    }
+                    for page in first..first + n {
+                        pages.space.mark_used(page);
+                    }
+                    // Leaves and level-1 nodes are found by page id: a level-1
+                    // node's references hold their sizes where the frames go, and a
+                    // level-2 node's zeros.
+                    if level > 2 {
+                        let frame = pages.pool.alloc(Holds::Internal, page);
+                        node::set_child_frame(pages.pool.page_mut(parent), i, frame);
+                        next.push((frame, page));
+                    } else if level == 2 {
+                        next.push((NO_FRAME, page));
+                    }
                 }
-                for page in first..first + n {
-                    pages.space.mark_used(page);
-                }
-                // Leaves are found by page id: a level-1 node's references hold
-                // their sizes where the frames go.
-                if level > 1 {
-                    let frame = pages.pool.alloc(Holds::Internal, page);
-                    node::set_child_frame(pages.pool.page_mut(parent), i, frame);
-                    next.push((frame, page));
+                if level == 1 {
+                    pages.adopt_leaf(parent, page);
+                    pages.pool.unref(parent);
                 }
             }
         }
@@ -934,51 +1005,58 @@ async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatc
     let timing = inner.metrics.commit.start();
     let group = guard.group;
     let changed = loop {
-        // Normalize the batch and list the leaves it changes, a slice at a time, as
-        // the merge goes below.
-        let planned = loop {
-            let planned = {
-                let mut writes = inner.writes.borrow_mut();
-                // A write that left the group meanwhile took its batch along.
-                if writes.take_changed() {
-                    break false;
+        // Normalize the batch and list the nodes it changes, a slice at a time, as
+        // the merge goes below: first the level-1 nodes, then, once they are
+        // loaded, the leaves under them.
+        let planned = 'plan: loop {
+            let listed = loop {
+                let planned = {
+                    let mut writes = inner.writes.borrow_mut();
+                    // A write that left the group meanwhile took its batch along.
+                    if writes.take_changed() {
+                        break 'plan false;
+                    }
+                    let batch = if group { writes.group() } else { &mut *batch };
+                    inner.tree.borrow_mut().plan(batch)
+                };
+                match planned {
+                    Poll::Ready(listed) => break listed,
+                    Poll::Pending => yield_now().await,
                 }
-                let batch = if group { writes.group() } else { &mut *batch };
-                inner.tree.borrow_mut().plan(batch)
             };
-            match planned {
-                Poll::Ready(()) => break true,
-                Poll::Pending => yield_now().await,
+            // Load the nodes listed, keeping them in the cache. Cached ones load
+            // without waiting, so this too pauses once it has run for a slice.
+            let level = u8::from(listed);
+            let touched = inner.tree.borrow().touched.len();
+            for start in (0..touched).step_by(IO_WINDOW) {
+                let loads: [_; IO_WINDOW] = array::from_fn(|i| {
+                    let page = inner.tree.borrow().touched.get(start + i).copied();
+                    page.map(|page| load_node(inner, page, level))
+                });
+                let mut error = None;
+                for loaded in join(loads).await.into_iter().flatten() {
+                    match loaded {
+                        Ok(frame) => inner.tree.borrow_mut().pinned.push(frame),
+                        Err(e) => error = error.or(Some(e)),
+                    }
+                }
+                if let Some(e) = error {
+                    return Err(e);
+                }
+                let n = (touched - start).min(IO_WINDOW);
+                if inner.tree.borrow_mut().loaded(n) {
+                    yield_now().await;
+                    inner.tree.borrow_mut().resume();
+                }
+            }
+            if !listed {
+                break true;
             }
         };
         if !planned {
             // Start over without that batch.
             inner.tree.borrow_mut().discard();
             continue;
-        }
-        // Load the leaves the batch changes, keeping them in the cache. Cached ones
-        // load without waiting, so this too pauses once it has run for a slice.
-        let touched = inner.tree.borrow().touched.len();
-        for start in (0..touched).step_by(IO_WINDOW) {
-            let loads: [_; IO_WINDOW] = array::from_fn(|i| {
-                let page = inner.tree.borrow().touched.get(start + i).copied();
-                page.map(|page| load_leaf(inner, page))
-            });
-            let mut error = None;
-            for loaded in join(loads).await.into_iter().flatten() {
-                match loaded {
-                    Ok(frame) => inner.tree.borrow_mut().pinned.push(frame),
-                    Err(e) => error = error.or(Some(e)),
-                }
-            }
-            if let Some(e) = error {
-                return Err(e);
-            }
-            let n = (touched - start).min(IO_WINDOW);
-            if inner.tree.borrow_mut().loaded(n) {
-                yield_now().await;
-                inner.tree.borrow_mut().resume();
-            }
         }
         // Free the pages that readers held back and have let go of since, a slice
         // at a time: a reader that ends doesn't pause, and leaves them to the
@@ -1118,19 +1196,20 @@ async fn read_value_leaf(inner: &Inner, page: u64, old: Option<ValueBuf>) -> Res
     Ok(buf)
 }
 
-/// Pins the frame holding a leaf page, reading the page in if it isn't cached. A
-/// read of the page already in flight is waited for, not repeated.
-async fn load_leaf(inner: &Inner, page: u64) -> Result<FrameId> {
+/// Pins the frame holding the page of a leaf or a level-1 node, at `level`,
+/// reading the page in if it isn't cached. A read of the page already in flight is
+/// waited for, not repeated.
+async fn load_node(inner: &Inner, page: u64, level: u8) -> Result<FrameId> {
     let mut load = Load {
         inner,
         slot: None,
         missed: false,
     };
-    poll_fn(|cx| load.poll(cx, page)).await
+    poll_fn(|cx| load.poll(cx, page, level)).await
 }
 
-/// A leaf load in progress, and the read it holds, if any, which it lets go of
-/// when dropped. It counts a cache miss once it has to read the leaf.
+/// A load in progress, and the read it holds, if any, which it lets go of when
+/// dropped. It counts a cache miss once it has to read the node.
 struct Load<'a> {
     inner: &'a Inner,
     slot: Option<usize>,
@@ -1138,7 +1217,7 @@ struct Load<'a> {
 }
 
 impl Load<'_> {
-    fn poll(&mut self, cx: &mut Context<'_>, page: u64) -> Poll<Result<FrameId>> {
+    fn poll(&mut self, cx: &mut Context<'_>, page: u64, level: u8) -> Poll<Result<FrameId>> {
         let inner = self.inner;
         let mut tree = inner.tree.borrow_mut();
         let mut reads = inner.reads.borrow_mut();
@@ -1156,8 +1235,8 @@ impl Load<'_> {
                 }
                 self.slot = Some(read_leaf(inner, &mut tree, &mut reads, page));
             }
-            if let Some(loaded) = ready!(poll_read(&mut tree, &mut reads, cx, page, &mut self.slot))
-            {
+            let slot = &mut self.slot;
+            if let Some(loaded) = ready!(poll_read(&mut tree, &mut reads, cx, page, level, slot)) {
                 return Poll::Ready(loaded);
             }
         }
@@ -1175,8 +1254,8 @@ impl Drop for Load<'_> {
     }
 }
 
-/// The slot of a read of leaf `page`, which the caller then holds: the read in
-/// flight, or a new one.
+/// The slot of a read of the leaf or level-1 node on `page`, which the caller then
+/// holds: the read in flight, or a new one.
 fn read_leaf(inner: &Inner, tree: &mut Tree, reads: &mut Reads, page: u64) -> usize {
     if let Some(slot) = reads.find(page) {
         reads.join(slot);
@@ -1208,15 +1287,16 @@ fn start_read(inner: &Inner, pool: &Pool, frame: FrameId, page: u64) -> PageRead
     inner.storage.start_read(pool.adopt_buf(frame), offset)
 }
 
-/// Waits for the read of leaf `page` held in `slot` to finish, and lets go of it.
-/// If this reader claims the read, returns the pinned frame, or the read's error.
-/// Returns `None` if another reader claimed it: the page is cached then, unless
-/// the read failed.
+/// Waits for the read of `page`, a leaf or a level-1 node at `level`, held in
+/// `slot` to finish, and lets go of it. If this reader claims the read, returns the
+/// pinned frame, or the read's error. Returns `None` if another reader claimed it:
+/// the page is cached then, unless the read failed.
 fn poll_read(
     tree: &mut Tree,
     reads: &mut Reads,
     cx: &mut Context<'_>,
     page: u64,
+    level: u8,
     slot: &mut Option<usize>,
 ) -> Poll<Option<Result<FrameId>>> {
     let held = slot.expect("no read held");
@@ -1224,12 +1304,19 @@ fn poll_read(
     *slot = None;
     reads.leave(held, &mut tree.pages.pool);
     let generation = tree.current().generation;
-    Poll::Ready(claimed.map(|claim| finish(&mut tree.pages, page, claim, generation)))
+    Poll::Ready(claimed.map(|claim| finish(&mut tree.pages, page, level, claim, generation)))
 }
 
-/// Checks and caches the leaf page a claimed read brought in, pinning its frame. No
-/// leaf a reader can reach was written after `generation`, the current one.
-fn finish(pages: &mut Pages, page: u64, claim: Claim, generation: u64) -> Result<FrameId> {
+/// Checks and caches the page a claimed read brought in, a leaf or a level-1 node
+/// at `level`, pinning its frame. No node a reader can reach was written after
+/// `generation`, the current one.
+fn finish(
+    pages: &mut Pages,
+    page: u64,
+    level: u8,
+    claim: Claim,
+    generation: u64,
+) -> Result<FrameId> {
     let Claim { frame, res, buf } = claim;
     pages.pool.retain(frame);
     drop(buf);
@@ -1239,7 +1326,7 @@ fn finish(pages: &mut Pages, page: u64, claim: Claim, generation: u64) -> Result
             && ValueLeaf::new(bytes).generation() <= generation
     } else {
         node::verify(bytes)
-            && Node::new(bytes).level() == 0
+            && Node::new(bytes).level() == level
             && Node::new(bytes).generation() <= generation
     };
     if res.is_err() || !intact {
@@ -1518,20 +1605,20 @@ impl Drop for WriteGuard<'_> {
     }
 }
 
-/// What a lookup holds while it runs: a key buffer, and the version and leaves it
+/// What a lookup holds while it runs: a key buffer, and the version and nodes it
 /// pinned if it had to wait for the disk.
 struct Read<'a> {
     inner: &'a Inner,
     key: Vec<u8>,
     version: Option<Version>,
-    leaves: [FrameId; 2],
+    nodes: [FrameId; 4],
     loaded: usize,
 }
 
 impl Drop for Read<'_> {
     fn drop(&mut self) {
         if let Some(mut tree) = for_drop(&self.inner.tree) {
-            for &frame in &self.leaves[..self.loaded] {
+            for &frame in &self.nodes[..self.loaded] {
                 tree.pages.pool.unref(frame);
             }
             if let Some(version) = self.version {
@@ -1563,6 +1650,8 @@ pub struct Iter {
     inner: Rc<Inner>,
     version: Version,
     cursor: Cursor,
+    /// The level-1 node `cursor` is at, which the iterator pins.
+    level_1: Option<FrameId>,
     /// The pinned leaf the iterator is on: a cached value leaf if `on_value`.
     leaf: Option<FrameId>,
     /// Whether it is on a value leaf: the one `leaf` pins, or else, for one too
@@ -1596,6 +1685,11 @@ enum State {
         page: u64,
         first: bool,
     },
+    /// Next, read the level-1 node on page `node`, which the next leaf is under,
+    /// then move to that leaf.
+    Cross {
+        node: u64,
+    },
     /// The entry at `at` is next.
     Ready,
     /// The entry at `at` was returned.
@@ -1617,15 +1711,29 @@ impl Iter {
                 State::Done => return Ok(None),
                 State::Ready => break,
                 State::Unstarted => {
-                    let tree = self.inner.tree.borrow();
-                    let (page, first) = match self.start {
-                        Bound::Unbounded => (tree.descend_first(root, &mut self.cursor), true),
-                        _ => (
-                            tree.descend(root, &self.bounds[..self.start_len], &mut self.cursor),
-                            false,
-                        ),
+                    let found = {
+                        let mut tree = self.inner.tree.borrow_mut();
+                        let start = &self.bounds[..self.start_len];
+                        let found = match self.start {
+                            Bound::Unbounded => tree.descend_first(root, &mut self.cursor),
+                            _ => tree.descend(root, start, &mut self.cursor),
+                        };
+                        if found.is_ok() {
+                            hold_level_1(&tree.pages.pool, &mut self.level_1, &self.cursor);
+                        }
+                        found
                     };
-                    self.state = State::Enter { page, first };
+                    match found {
+                        Ok(page) => {
+                            let first = matches!(self.start, Bound::Unbounded);
+                            self.state = State::Enter { page, first };
+                        }
+                        Err(node) => self.load_level_1(node).await?,
+                    }
+                }
+                State::Cross { node } => {
+                    self.load_level_1(node).await?;
+                    self.state = self.next_leaf();
                 }
                 State::Enter { page, first } if node::span(page) > 0 => {
                     // Its key, its parent's key for it, tells whether it is in the
@@ -1747,6 +1855,39 @@ impl Iter {
         })))
     }
 
+    /// Reads the level-1 node on `page` into the cache, where the step the
+    /// iterator takes next finds it: nothing can evict it before then, since the
+    /// iterator doesn't wait meanwhile.
+    async fn load_level_1(&mut self, page: u64) -> Result<()> {
+        match poll_fn(|cx| self.poll_level_1(cx, page)).await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.inner.explain(e).await),
+        }
+    }
+
+    /// Waits for the level-1 node on `page` to be cached, reading it if it isn't.
+    /// As in [`poll_enter`](Self::poll_enter), the read stays held across calls.
+    fn poll_level_1(&mut self, cx: &mut Context<'_>, page: u64) -> Poll<Result<()>> {
+        let inner = &*self.inner;
+        let mut tree = inner.tree.borrow_mut();
+        let mut reads = inner.reads.borrow_mut();
+        loop {
+            if self.waiting.is_none() {
+                if tree.pages.cached(page).is_some() {
+                    return Poll::Ready(Ok(()));
+                }
+                tree.pages.cache.misses.add(1);
+                self.waiting = Some(read_leaf(inner, &mut tree, &mut reads, page));
+            }
+            let polled = poll_read(&mut tree, &mut reads, cx, page, 1, &mut self.waiting);
+            if let Some(loaded) = ready!(polled) {
+                return Poll::Ready(loaded.map(|frame| {
+                    tree.pages.pool.unref(frame);
+                }));
+            }
+        }
+    }
+
     /// Pins leaf `page`, at `self.cursor`. If it isn't cached, waits for a read of
     /// it, and reads the leaves after it meanwhile. The read stays held across
     /// calls, in case the caller drops the future and calls again.
@@ -1777,7 +1918,7 @@ impl Iter {
                 }
             }
             // Polling first sends this leaf's read out ahead of the others.
-            let polled = poll_read(&mut tree, &mut reads, cx, page, &mut self.waiting);
+            let polled = poll_read(&mut tree, &mut reads, cx, page, 0, &mut self.waiting);
             self.ahead
                 .fill(inner, &mut tree, &mut reads, &self.cursor, end);
             if let Some(loaded) = ready!(polled) {
@@ -1807,14 +1948,30 @@ impl Iter {
     }
 
     fn next_leaf(&mut self) -> State {
-        let tree = self.inner.tree.borrow();
+        let mut tree = self.inner.tree.borrow_mut();
         match tree.next_leaf(&mut self.cursor, true) {
-            Some(page) => {
+            Ok(Some(page)) => {
+                hold_level_1(&tree.pages.pool, &mut self.level_1, &self.cursor);
                 self.ahead.passed(window_pages(&tree.pages.cache, page));
                 State::Enter { page, first: true }
             }
-            None => State::Done,
+            Ok(None) => State::Done,
+            Err(node) => State::Cross { node },
         }
+    }
+}
+
+/// Moves the pin `held` to the level-1 node `cur` is at.
+fn hold_level_1(pool: &Pool, held: &mut Option<FrameId>, cur: &Cursor) {
+    let at = cur.level_1();
+    if *held == at {
+        return;
+    }
+    if let Some(frame) = at {
+        pool.retain(frame);
+    }
+    if let Some(old) = mem::replace(held, at) {
+        pool.unref(old);
     }
 }
 
@@ -1823,11 +1980,18 @@ impl Drop for Iter {
         if let Some(mut tree) = for_drop(&self.inner.tree) {
             if let Some(mut reads) = for_drop(&self.inner.reads) {
                 let held = self.waiting.take();
-                for slot in held.into_iter().chain(iter::from_fn(|| self.ahead.pop())) {
+                let node = self.ahead.node.take().map(|(_, slot)| slot);
+                let ahead = iter::from_fn(|| self.ahead.pop());
+                for slot in held.into_iter().chain(node).chain(ahead) {
                     reads.leave(slot, &mut tree.pages.pool);
                 }
             }
-            if let Some(frame) = self.leaf.take() {
+            let pinned = [
+                self.leaf.take(),
+                self.level_1.take(),
+                self.ahead.level_1.take(),
+            ];
+            for frame in pinned.into_iter().flatten() {
                 tree.pages.pool.unref(frame);
             }
             tree.unpin(self.version);
@@ -1853,8 +2017,9 @@ fn window_pages(cache: &Cache, page: u64) -> usize {
 struct Ahead {
     /// The last leaf considered, `by` leaves past the current one, which take
     /// `pages` pages. When `by` is 0 it may be behind, and the next fill starts
-    /// over from the current leaf.
+    /// over from the current leaf. Its level-1 node stays pinned.
     cursor: Cursor,
+    level_1: Option<FrameId>,
     by: usize,
     pages: usize,
     /// No leaf after `cursor` is in the range.
@@ -1864,18 +2029,23 @@ struct Ahead {
     reads: [(u64, usize); IO_WINDOW],
     first: usize,
     len: usize,
+    /// The read held for the level-1 node the next leaf is under, if it isn't
+    /// cached, until someone claims it: (page, slot).
+    node: Option<(u64, usize)>,
 }
 
 impl Ahead {
     fn new() -> Ahead {
         Ahead {
             cursor: Cursor::new(),
+            level_1: None,
             by: 0,
             pages: 0,
             done: false,
             reads: [(0, 0); IO_WINDOW],
             first: 0,
             len: 0,
+            node: None,
         }
     }
 
@@ -1915,7 +2085,9 @@ impl Ahead {
     /// Starts reading the leaves after the current one, at `current`, that aren't
     /// cached and fall in the range ending at `end`: at most `IO_WINDOW` leaves
     /// ahead, which take at most a quarter of the cache budget, so that reading
-    /// ahead never crowds out the leaves other readers use.
+    /// ahead never crowds out the leaves other readers use. Reaching a level-1 node
+    /// that isn't cached, it reads that, and goes on once someone has claimed the
+    /// read.
     fn fill(
         &mut self,
         inner: &Inner,
@@ -1927,13 +2099,29 @@ impl Ahead {
         let window = tree.pages.cache.budget() / 4;
         if self.by == 0 {
             self.cursor.clone_from(current);
+            hold_level_1(&tree.pages.pool, &mut self.level_1, &self.cursor);
             self.pages = 0;
+        }
+        if let Some((page, slot)) = self.node
+            && reads.find(page) != Some(slot)
+        {
+            reads.leave(slot, &mut tree.pages.pool);
+            self.node = None;
         }
         while !self.done && self.by < IO_WINDOW {
             let mut next = self.cursor.clone();
-            let Some(page) = tree.next_leaf(&mut next, true) else {
-                self.done = true;
-                break;
+            let page = match tree.next_leaf(&mut next, true) {
+                Ok(Some(page)) => page,
+                Ok(None) => {
+                    self.done = true;
+                    break;
+                }
+                Err(node) => {
+                    if self.node.is_none() {
+                        self.node = read_ahead(inner, tree, reads, node);
+                    }
+                    break;
+                }
             };
             let past = match end {
                 Bound::Included(end) => tree.cmp_leaf_key(&next, end).is_gt(),
@@ -1948,31 +2136,53 @@ impl Ahead {
             if self.pages + pages > window {
                 break;
             }
+            // Finding a frame for the read may evict cold nodes: the level-1 node
+            // `next` is at stays pinned meanwhile.
+            let mut pinned = None;
+            hold_level_1(&tree.pages.pool, &mut pinned, &next);
             let read = if pages == 0 || tree.pages.cached(page).is_some() {
-                None
-            } else if let Some(slot) = reads.find(page) {
-                reads.join(slot);
-                Some(slot)
+                Ok(None)
             } else {
-                // Reading ahead only uses frames within the budget.
-                let (pool, cache) = (&mut tree.pages.pool, &mut tree.pages.cache);
-                let frame = match node::span(page) {
-                    0 => cache.try_alloc(pool, Holds::Loading, page),
-                    span => cache.try_alloc_large(pool, Holds::Loading, page, span as usize),
-                };
-                let Some(frame) = frame else {
-                    break;
-                };
-                let slot = reads.start(page, frame, start_read(inner, pool, frame, page));
-                reads.submit(slot);
-                Some(slot)
+                read_ahead(inner, tree, reads, page).map(Some).ok_or(())
             };
-            self.cursor = next;
+            if read.is_ok() {
+                self.cursor = next;
+                hold_level_1(&tree.pages.pool, &mut self.level_1, &self.cursor);
+            }
+            if let Some(frame) = pinned {
+                tree.pages.pool.unref(frame);
+            }
+            let Ok(read) = read else {
+                break;
+            };
             self.by += 1;
             self.pages += pages;
-            if let Some(slot) = read {
+            if let Some((page, slot)) = read {
                 self.push(page, slot);
             }
         }
     }
+}
+
+/// Holds a read of the page with id `page`, which isn't cached: the read in
+/// flight, or a new one, if a frame within the budget is free for it, which reading
+/// ahead never grows the pool past. Returns the page and the slot.
+fn read_ahead(
+    inner: &Inner,
+    tree: &mut Tree,
+    reads: &mut Reads,
+    page: u64,
+) -> Option<(u64, usize)> {
+    if let Some(slot) = reads.find(page) {
+        reads.join(slot);
+        return Some((page, slot));
+    }
+    let (pool, cache) = (&mut tree.pages.pool, &mut tree.pages.cache);
+    let frame = match node::span(page) {
+        0 => cache.try_alloc(pool, Holds::Loading, page)?,
+        span => cache.try_alloc_large(pool, Holds::Loading, page, span as usize)?,
+    };
+    let slot = reads.start(page, frame, start_read(inner, pool, frame, page));
+    reads.submit(slot);
+    Some((page, slot))
 }

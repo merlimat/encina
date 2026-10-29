@@ -105,8 +105,8 @@ store's owner reports.
   count when it is dropped.
 - **`encina.reader.count`**: the readers that pin a version: open iterators, and
   lookups waiting for the disk.
-  - A pinned version keeps its internal nodes in memory, and the pages later writes
-    replace stay allocated: see `encina.file.usage`, state `held`.
+  - A pinned version keeps its internal nodes above level 1 in memory, and the pages
+    later writes replace stay allocated: see `encina.file.usage`, state `held`.
   - A count that stays up points to iterators that aren't dropped.
 
 ## Cache
@@ -118,7 +118,9 @@ store's owner reports.
 | `encina.cache.usage` | up-down counter | `By` | `encina.page.type`: `internal`, `leaf`, `value` |
 | `encina.cache.limit` | up-down counter | `By` | |
 
-- **`encina.cache.lookups`**: each leaf that a lookup, an iterator or a write needed.
+- **`encina.cache.lookups`**: each leaf that a lookup, an iterator or a write needed,
+  and each level-1 node, the internal nodes right above the leaves, that one had to
+  read, or that a write needed.
   - `hit`: the leaf was in the cache.
   - `miss`: it had to wait for a read, its own or one another reader started. That
     includes the leaves an iterator read ahead.
@@ -126,10 +128,11 @@ store's owner reports.
   - Values too large to cache, over a quarter of the budget, are read without the
     cache and don't count.
   - The hit ratio is `hit / (hit + miss)`.
-- **`encina.cache.evictions`**: the leaves evicted to make room for others.
+- **`encina.cache.evictions`**: the leaves and level-1 nodes evicted to make room
+  for others.
 - **`encina.cache.usage`**: the memory of the page frames in use, by what they hold:
-  - `internal`: internal nodes, which stay in memory.
-  - `leaf`: cached leaves, and pages being read or written.
+  - `internal`: internal nodes above level 1, which stay in memory.
+  - `leaf`: cached leaves and level-1 nodes, and pages being read or written.
   - `value`: value leaves, each in a frame of its own pages.
 
   A write holds the leaves it changes and builds until it commits, so a write
@@ -147,15 +150,16 @@ store's owner reports.
 | `encina.disk.sync.duration` | histogram | `s` | |
 
 - **`encina.disk.io`**: the bytes read from and written to the store file.
-  - Reads: leaves and value leaves, plus the internal nodes the store reads when it
-    opens.
+  - Reads: leaves, value leaves and level-1 nodes, plus the internal nodes the
+    store reads when it opens.
   - Writes: each commit's new pages and its meta page.
   - Dividing the bytes written by the sum of `encina.write.size` gives the write
     amplification.
 - **`encina.disk.operations`**: the read and write requests. A commit writes each run
   of adjacent pages, up to 1 MiB, with one request.
-- **`encina.disk.read.duration`**: how long each read of a leaf or a value leaf takes,
-  until a reader sees it finish. The reads of internal nodes at open aren't timed.
+- **`encina.disk.read.duration`**: how long each read of a leaf, a value leaf or a
+  level-1 node takes, until a reader sees it finish. The reads of internal nodes at
+  open aren't timed.
 - **`encina.disk.sync.duration`**: how long each sync of the store file takes. A
   commit syncs twice: once its pages are written, and once its meta page is.
 

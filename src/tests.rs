@@ -598,9 +598,13 @@ fn same_plans(steps: &[Step], ops: &[Op], slice: usize) {
     let mut batch = batch_of(ops);
     for slice in [usize::MAX, slice] {
         tree.set_slice(Some(slice));
-        while tree.plan(&mut batch).is_pending() {}
-        let expected = tree.plan_at_once(&batch);
-        assert_eq!(tree.touched, expected);
+        // The level-1 nodes, then the leaves. The cache holds every node, so the
+        // write would find them all.
+        for floor in [1, 0] {
+            while tree.plan(&mut batch).is_pending() {}
+            let expected = tree.plan_at_once(&batch, floor);
+            assert_eq!(tree.touched, expected);
+        }
     }
 }
 
@@ -992,9 +996,10 @@ fn path_to(db: &Db, key: &[u8]) -> Vec<Subtree> {
         hi: None,
         children: 0,
     }];
-    let mut frame = root.frame;
-    for _ in 0..root.level {
-        let node = tree.node(frame);
+    let (mut frame, mut page) = (root.frame, root.page);
+    for level in (1..=root.level).rev() {
+        let bytes = tree.node_bytes(frame, page, level);
+        let node = Node::new(&bytes);
         let n = node.count();
         let key_at = |i| {
             let mut key = Vec::new();
@@ -1016,7 +1021,7 @@ fn path_to(db: &Db, key: &[u8]) -> Vec<Subtree> {
             hi,
             children: 0,
         });
-        frame = node.child(i);
+        (frame, page) = (node.child(i), node.child_page(i));
     }
     path
 }
@@ -1145,6 +1150,72 @@ fn reopening_with_a_cold_cache_reads_everything_back() {
     store.db.check();
 }
 
+/// Checks that the frames in use fit in the cache's budget.
+fn within_budget(db: &Db) {
+    let tree = db.tree();
+    let (used, budget) = (tree.pages.pool.in_use(), tree.pages.cache.budget());
+    assert!(
+        used <= budget,
+        "{used} frames in use, for a budget of {budget}"
+    );
+}
+
+/// Checks a full scan, and every comparison on a sample of the keys, against
+/// `model`.
+fn check_sampled_reads(db: &Db, model: &Model) {
+    assert_eq!(scan(db, ALL), expected_scan(model, ALL));
+    for key in model.keys().step_by(97) {
+        for cmp in COMPARISONS {
+            assert_eq!(get(db, key, cmp), expected(model, key, cmp));
+        }
+    }
+}
+
+#[test]
+fn level_1_nodes_that_outgrow_the_cache_stay_within_its_budget() {
+    let mut store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
+    let mut model = Model::new();
+    let puts: Vec<_> = (0..20_000).map(|i| scattered_put(i, 0)).collect();
+    write(&store.db, &puts);
+    apply(&mut model, &puts);
+    store.reopen();
+    let budget = store.db.tree().pages.cache.budget();
+    assert!(store.db.tree().level_1().len() > 4 * budget);
+    assert_eq!(store.db.tree().current().root.unwrap().level, 3);
+    // Opening reads every level-1 node, but keeps those the cache has room for.
+    within_budget(&store.db);
+    check_sampled_reads(&store.db, &model);
+    within_budget(&store.db);
+    // An iterator keeps its version, reading again the level-1 nodes the cache let
+    // go of, while a write replaces them, and a range drops whole subtrees.
+    let snapshot = expected_scan(&model, ALL);
+    let mut iter = store.db.range(..);
+    let mut seen = Vec::new();
+    for _ in 0..100 {
+        let (k, v) = now(iter.next()).unwrap().unwrap();
+        seen.push((k.to_vec(), v.to_vec()));
+    }
+    let (start, end) = (3000u32.to_be_bytes(), 15_000u32.to_be_bytes());
+    let ops: Vec<_> = (0..20_000)
+        .step_by(7)
+        .map(|i| scattered_put(i, 1))
+        .chain([Op::DeleteRange(start.to_vec(), end.to_vec())])
+        .collect();
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    while let Some((k, v)) = now(iter.next()).unwrap() {
+        seen.push((k.to_vec(), v.to_vec()));
+    }
+    assert_eq!(seen, snapshot);
+    drop(iter);
+    check_tree(&store.db, &model);
+    check_sampled_reads(&store.db, &model);
+    store.reopen();
+    within_budget(&store.db);
+    check_sampled_reads(&store.db, &model);
+    check_tree(&store.db, &model);
+}
+
 #[test]
 fn damaged_pages_are_reported() {
     let mut store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
@@ -1156,10 +1227,7 @@ fn damaged_pages_are_reported() {
         let tree = store.db.tree();
         let root = tree.current().root.unwrap();
         assert!(root.level > 0);
-        (
-            root.page,
-            tree.descend_first(root, &mut crate::tree::Cursor::new()),
-        )
+        (root.page, tree.leaves()[0].0)
     };
     // A damaged leaf fails the reads that need it.
     store.disk.flip(leaf * 256 + 100);
@@ -1400,10 +1468,7 @@ fn a_read_only_view_of_a_quiet_store_reports_damage() {
         let tree = store.db.tree();
         let root = tree.current().root.unwrap();
         assert!(root.level > 0);
-        (
-            root.page,
-            tree.descend_first(root, &mut crate::tree::Cursor::new()),
-        )
+        (root.page, tree.leaves()[0].0)
     };
     // The owner has written nothing since the view opened: the page is corrupt.
     store.disk.flip(leaf * 256 + 100);
@@ -1475,7 +1540,10 @@ fn a_bad_child_reference_fails_the_open() {
         let tree = store.db.tree();
         let root = tree.current().root.unwrap();
         assert!(root.level > 0);
-        (root.page, tree.pages.pool.page(root.frame).to_vec())
+        (
+            root.page,
+            tree.node_bytes(root.frame, root.page, root.level),
+        )
     };
     let first = Node::new(&bytes).child_page(0);
     // Point the first child past the end of the file, then the second at the
@@ -2312,6 +2380,18 @@ fn cold_store(n: u32, frames: usize) -> (Store, Model) {
     (store, model)
 }
 
+/// Checks that the reads since disk operation `ops` read each of the `leaves`
+/// leaves of a cold store once, and each level-1 node at most once: the cache
+/// lets go of those the leaves pass, and they are read again when reached.
+fn read_once(store: &Store, ops: u64, leaves: u64) {
+    let reads = store.disk.ops() - ops;
+    let level_1 = store.db.tree().level_1().len() as u64;
+    assert!(
+        (leaves..=leaves + level_1).contains(&reads),
+        "{reads} reads of {leaves} leaves"
+    );
+}
+
 /// Frames that reads are filling, and frames that cancelled reads left behind.
 fn loading_frames(db: &Db) -> (usize, usize) {
     let tree = db.tree();
@@ -2352,8 +2432,7 @@ fn a_cold_scan_reads_ahead() {
         seen += 1;
     }
     assert_eq!(seen, model.len());
-    // Each leaf was read once.
-    assert_eq!(store.disk.ops() - ops, leaves);
+    read_once(&store, ops, leaves);
     drop(iter);
     store.db.check();
 }
@@ -2381,7 +2460,7 @@ fn an_iterator_waits_for_the_leaf_read_ahead() {
         seen += 1;
     }
     assert_eq!(seen, model.len());
-    assert_eq!(store.disk.ops() - ops, leaves.len() as u64);
+    read_once(&store, ops, leaves.len() as u64);
     drop(iter);
     store.db.check();
 }
@@ -2493,7 +2572,7 @@ fn reading_ahead_joins_the_reads_in_flight() {
         seen += 1;
     }
     assert_eq!(seen, model.len());
-    assert_eq!(store.disk.ops() - ops, leaves.len() as u64);
+    read_once(&store, ops, leaves.len() as u64);
     drop(iter);
     store.db.check();
 }
@@ -2515,14 +2594,19 @@ fn reading_ahead_stops_at_the_end_of_the_range() {
 
 #[test]
 fn reading_ahead_stays_within_the_cache_budget() {
-    // Internal nodes alone fill the 8-page cache.
-    let (store, model) = cold_store(6000, 8);
+    // Internal nodes above level 1 alone fill the 8-page cache.
+    let (store, model) = cold_store(40_000, 8);
     assert!(store.db.tree().pages.pool.in_use() > 8);
     store.disk.hold();
     let ops = store.disk.ops();
     let mut iter = store.db.range(..);
+    // The first level-1 node, whose read the iterator keeps across calls, then the
+    // first leaf, and none after it.
     assert!(poll(pin!(iter.next())).is_pending());
-    assert_eq!(store.disk.ops() - ops, 1, "read ahead past the budget");
+    assert_eq!(store.disk.ops() - ops, 1);
+    store.disk.release_through(ops);
+    assert!(poll(pin!(iter.next())).is_pending());
+    assert_eq!(store.disk.ops() - ops, 2, "read ahead past the budget");
     store.disk.release();
     let mut seen = 0;
     while now(iter.next()).unwrap().is_some() {
@@ -3387,13 +3471,15 @@ fn a_write_dropped_while_it_loads_its_leaves_changes_nothing() {
     let start = generation(&store.db);
     let mut batch = batch_of(&ops);
     let mut write = Box::pin(store.db.write(&mut batch));
-    // The leaves are cached, yet it pauses once it has pinned some of them.
+    // The leaves are cached, yet it pauses once it has pinned some of them, after
+    // the level-1 nodes above them.
+    let level_1 = store.db.tree().level_1().len();
     let io = store.disk.ops();
     loop {
         assert!(poll_once(write.as_mut()).is_pending());
         let tree = store.db.tree();
-        if !tree.pinned.is_empty() {
-            assert!(tree.pinned.len() < tree.touched.len());
+        if tree.pinned.len() > level_1 {
+            assert!(tree.pinned.len() < level_1 + tree.touched.len());
             break;
         }
     }

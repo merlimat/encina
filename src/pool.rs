@@ -50,9 +50,9 @@ pub(crate) enum Holds {
     Nothing,
     /// A page being read, not yet in the cache.
     Loading,
-    /// An internal node, which stays resident.
+    /// An internal node above level 1, which stays resident.
     Internal,
-    /// A leaf, in the cache.
+    /// A leaf or a level-1 node, in the cache.
     Leaf,
 }
 

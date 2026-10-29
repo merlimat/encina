@@ -18,11 +18,14 @@ and ordered lookups, range scans, and deleting whole key ranges at once.
 
 - **Asynchronous throughout.** All I/O goes through compio (io_uring on Linux), with
   no `mmap` and nothing that blocks the event loop.
-- **Fast reads.** Internal nodes stay in memory, so a lookup is a few binary
-  searches plus at most one leaf access. Nodes are searched in place, without
-  decoding.
-- **Cheap range deletes.** Subtrees inside a deleted range are dropped without being
-  read, and leave nothing behind for later reads to skip.
+- **Fast reads.** Internal nodes stay in memory, the bottom level as the cache has
+  room for it, so a lookup is a few binary searches plus at most one leaf access.
+  Nodes are searched in place, without decoding.
+- **Bounded memory.** The store keeps within its cache budget, however large it
+  grows: the bottom level of internal nodes, nearly all of them, is cached like the
+  leaves.
+- **Cheap range deletes.** Subtrees inside a deleted range are dropped without
+  reading their leaves, and leave nothing behind for later reads to skip.
 - **No compaction.** Copy-on-write pages instead of an LSM tree: no background
   rewrites and no write stalls.
 - **No allocation on the data path.** Reads, iteration, and writes that reuse a

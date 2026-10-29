@@ -184,8 +184,9 @@ impl Meter {
         )
     }
 
-    /// The memory of the frames in use, by what they hold: internal nodes, leaves,
-    /// and value leaves. Pages being read or written count as leaves.
+    /// The memory of the frames in use, by what they hold: internal nodes above
+    /// level 1, leaves and level-1 nodes, and value leaves. Pages being read or
+    /// written count as leaves.
     pub(crate) fn cache_usage(&self) -> [Amount; 3] {
         ["internal", "leaf", "value"]
             .map(|kind| self.amount(CACHE_USAGE, &[KeyValue::new(PAGE_TYPE, kind)]))

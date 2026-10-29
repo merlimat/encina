@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The leaf cache: which frame holds each cached leaf, and CLOCK eviction.
+//! The leaf cache: which frame holds each cached leaf, and CLOCK eviction. It
+//! keeps level-1 nodes the same way, and below, what it says of leaves holds for
+//! them too.
 //!
 //! The budget counts pages. A value leaf takes a large frame, of as many pages as
 //! it spans, and value leaves take at most a quarter of the budget in all: a larger
@@ -82,6 +84,12 @@ impl Cache {
         let frame = *self.map.get(&page)?;
         pool.frame_mut(frame).clock = true;
         Some(frame)
+    }
+
+    /// The frame holding a page, without marking it used.
+    #[cfg(test)]
+    pub(crate) fn peek(&self, page: u64) -> Option<FrameId> {
+        self.map.get(&page).copied()
     }
 
     pub(crate) fn insert(&mut self, page: u64, frame: FrameId) {

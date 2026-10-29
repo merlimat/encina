@@ -23,8 +23,9 @@
 //! - **Lookups without copies.** [`Db::get`] finds a key, or its nearest neighbor
 //!   under a [`Comparison`], and lends the entry to a closure. [`Db::range`]
 //!   iterates over a point-in-time view, in key order.
-//! - **Bounded memory.** Internal nodes stay in memory, and leaves are cached within
-//!   [`Options::cache_size`]. The store bypasses the OS page cache.
+//! - **Bounded memory.** Leaves, and the internal nodes right above them, are cached
+//!   within [`Options::cache_size`]; the few internal nodes above those stay in
+//!   memory. The store bypasses the OS page cache.
 //! - **One owner per store.** A [`Db`] is neither `Send` nor `Sync`: each compio
 //!   runtime thread owns its stores, and a store file has one `Db` at a time. A
 //!   [`ReadOnlyDb`] can read it meanwhile, as of when the view opened.
