@@ -744,8 +744,10 @@ prefix, the heads, the slots and every record lie in that order within the bytes
 used: reads lend values straight from the page, so a record past it would lend
 whatever memory follows. An internal node's values must be whole child
 references. Its level must be the one its parent expects, and its generation no
-newer than the meta page's. A value leaf's length must fill its span, give or
-take the last page's zeros.
+newer than the meta page's. A leaf or level-1 node found in the cache must be at
+the level its parent expects too: the cache keeps both alike, by page, and a tree
+that lists a page at both levels is corrupt, whichever level reads it first. A
+value leaf's length must fill its span, give or take the last page's zeros.
 
 ### Free space is derived, not stored
 
@@ -1469,7 +1471,9 @@ complete without suspending.
   whose value runs past its page fails the reads, and an internal node whose
   child reference is short fails the open, or at level 1, the reads and the
   scan. Format tests move each part of a slotted node out of place in turn, and
-  seal it again. A flipped bit in meta slot 0
+  seal it again. A page that the tree lists both as a leaf and as a level-1 node
+  fails the reads that find it cached at the other level, either way round. A
+  flipped bit in meta slot 0
   leaves slot 1, which the open finds where each page size would put it. A file
   of zeros, or with meta pages built from bad fields, isn't a store
   (`Error::InvalidFile`): among them, a high-water mark that leaves out a meta page,

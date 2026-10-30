@@ -2003,6 +2003,78 @@ fn nodes_past_the_high_water_mark_are_corrupt() {
 }
 
 #[test]
+fn a_page_listed_at_two_levels_is_corrupt() {
+    // A five-page file whose root, at level 2 on page 4, lists the level-1 node on
+    // page 3 under "a", and the leaf on page 2 under "m", as a level-1 node. The
+    // node on page 3 lists that leaf under "a", and itself under "f", as a leaf.
+    // The open reads neither, and the cache keeps leaves and level-1 nodes alike,
+    // by page: a read that finds one cached where the other goes must not take a
+    // leaf's values for child references, or a level-1 node's entries for a leaf's.
+    let opts = Options::new().page_size(256);
+    let mut file = vec![0; 5 * 256];
+    let size = node::Size {
+        entries: 2,
+        bytes: 7,
+    };
+    let mut nodes: [node::EntryBuf; 3] = Default::default();
+    // Values of two lengths make a slotted leaf, whose values are shorter than
+    // child references.
+    nodes[0].push(b"a", b"abc");
+    nodes[0].push(b"b", b"de");
+    nodes[1].push(b"a", &node::child_ref(node::Child::leaf(2, size)));
+    nodes[1].push(b"f", &node::child_ref(node::Child::leaf(3, size)));
+    nodes[2].push(b"a", &node::child_ref(node::Child::level_1(3)));
+    nodes[2].push(b"m", &node::child_ref(node::Child::level_1(2)));
+    for (level, entries) in nodes.iter().enumerate() {
+        let page = &mut file[(2 + level) * 256..][..256];
+        node::build(page, level as u8, entries, 0, 2);
+        node::seal(page, 0);
+    }
+    Meta {
+        root: 4,
+        root_level: 2,
+        high_water: 5,
+        entries: 2,
+        entry_bytes: 7,
+        ..Meta::empty(256)
+    }
+    .encode(&mut file[..256]);
+    let disk = SimDisk::new();
+    disk.set_bytes(0, &file);
+    let view = now(ReadOnlyDb::open_sim(disk.clone(), opts.clone())).unwrap();
+    let db = now(Db::open_sim(disk, opts)).unwrap();
+    let db_get = |key: &[u8]| now(db.get(key, Comparison::Equal, |k, v| (k.to_vec(), v.to_vec())));
+    // Finding "a" caches the level-1 node on page 3, and the leaf on page 2. Then
+    // "m" finds the leaf where a level-1 node goes, and "f", as a scan does past
+    // "b", the level-1 node where a leaf goes.
+    let a = Some((b"a".to_vec(), b"abc".to_vec()));
+    assert_eq!(view_get(&view, b"a", Comparison::Equal).unwrap(), a);
+    assert_eq!(db_get(b"a").unwrap(), a);
+    for (key, page) in [(b"m", 2), (b"f", 3)] {
+        let viewed = view_get(&view, key, Comparison::Equal);
+        assert!(
+            matches!(viewed, Err(Error::Corruption { page: p }) if p == page),
+            "{viewed:?}"
+        );
+        let found = db_get(key);
+        assert!(
+            matches!(found, Err(Error::Corruption { page: p }) if p == page),
+            "{found:?}"
+        );
+    }
+    let viewed = view_scan(&view);
+    assert!(
+        matches!(viewed, Err(Error::Corruption { page: 3 })),
+        "{viewed:?}"
+    );
+    let scanned = try_scan(&db);
+    assert!(
+        matches!(scanned, Err(Error::Corruption { page: 3 })),
+        "{scanned:?}"
+    );
+}
+
+#[test]
 fn a_view_reads_the_file_length_after_the_meta_page() {
     // The owner commits a larger version after the view read the file's length,
     // but before it read the meta page: the view opens that version, whose pages
