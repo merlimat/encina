@@ -37,12 +37,12 @@
 //! # Example
 //!
 //! ```
-//! use encina::{Comparison, Db, Options, WriteBatch};
+//! use encina::{Comparison, Db, DefaultEnv, Options, WriteBatch};
 //!
 //! # compio::runtime::Runtime::new().unwrap().block_on(async {
 //! # let dir = tempfile::tempdir().unwrap();
 //! # let path = dir.path().join("data.db");
-//! let db = Db::open(&path, Options::default()).await?;
+//! let db = Db::open(&DefaultEnv, &path, Options::default()).await?;
 //!
 //! let mut batch = WriteBatch::new();
 //! batch.put(b"user/0001", b"alice");
@@ -74,6 +74,15 @@
 //! # }).unwrap();
 //! ```
 //!
+//! # Envs and disks
+//!
+//! A store opens in an [`Env`], which opens its file as a [`Disk`] and runs its
+//! task. [`DefaultEnv`] keeps stores in files, which it reads and writes with
+//! direct I/O on the current compio runtime. A caller that runs its own I/O, such
+//! as a scheduler of its requests or a simulation, implements `Env` and `Disk`:
+//! the store then needs no compio runtime, and reads no clock unless the env lets
+//! it.
+//!
 //! # Metrics
 //!
 //! With [`Options::meter_provider`], a store exports metrics through OpenTelemetry,
@@ -96,6 +105,7 @@
 mod batch;
 mod cache;
 mod db;
+mod disk;
 mod error;
 // Entry points for the fuzz targets in fuzz/, which cargo fuzz builds with
 // `--cfg fuzzing`. Tests run them on their seeds.
@@ -114,7 +124,6 @@ mod scan;
 #[cfg_attr(not(test), allow(dead_code))]
 mod sim;
 mod space;
-mod storage;
 mod tree;
 mod writes;
 
@@ -125,5 +134,6 @@ mod tests;
 
 pub use batch::WriteBatch;
 pub use db::{Comparison, Db, Iter, PageInfo, ReadOnlyDb};
+pub use disk::{Access, DefaultEnv, Disk, Env, FileDisk, FileRead, ReadBuf, WriteBuf};
 pub use error::{Error, Result};
 pub use options::Options;

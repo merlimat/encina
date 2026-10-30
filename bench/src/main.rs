@@ -431,7 +431,7 @@ impl Encina {
     async fn open(path: &Path, cache: usize) -> Encina {
         let options = encina::Options::new().cache_size(cache);
         Encina {
-            db: encina::Db::open(path, options).await.expect("open encina"),
+            db: encina::Db::open(&encina::DefaultEnv, path, options).await.expect("open encina"),
             path: path.to_owned(),
         }
     }

@@ -28,22 +28,22 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
 
+use crate::disk::ReadBuf;
 use crate::metrics::Latency;
-use crate::pool::{FrameBuf, FrameId, Pool};
-use crate::storage::PageRead;
+use crate::pool::{FrameId, Pool};
 
-#[derive(Default)]
-pub(crate) struct Reads {
-    slots: Vec<Slot>,
+/// The reads in flight, each a disk's read future `R`.
+pub(crate) struct Reads<R> {
+    slots: Vec<Slot<R>>,
     /// Times the reads, if the store records metrics.
     pub(crate) duration: Latency,
 }
 
-struct Slot {
+struct Slot<R> {
     page: u64,
     /// The frame being read into.
     frame: FrameId,
-    state: State,
+    state: State<R>,
     /// When the read started, if it is timed.
     started: Option<Instant>,
     /// Readers holding the slot. Each claims the read or lets go of it.
@@ -55,25 +55,35 @@ struct Slot {
     waker: Waker,
 }
 
-enum State {
+enum State<R> {
     Free,
     /// In flight, or finished without anyone having polled it since.
-    Reading(PageRead),
+    Reading(R),
     /// Finished, and not claimed yet.
-    Finished(io::Result<()>, FrameBuf),
+    Finished(io::Result<()>, ReadBuf),
     /// Claimed by a reader, which took the frame.
     Claimed,
 }
 
 /// A finished read, for the reader that claimed it: the frame, the outcome, and
-/// the buffer, which holds a reference to the frame.
+/// the buffer the disk returned, which holds a reference to the frame, unless the
+/// disk returned another.
 pub(crate) struct Claim {
     pub(crate) frame: FrameId,
     pub(crate) res: io::Result<()>,
-    pub(crate) buf: FrameBuf,
+    pub(crate) buf: ReadBuf,
 }
 
-impl Reads {
+impl<R> Default for Reads<R> {
+    fn default() -> Self {
+        Reads {
+            slots: Vec::new(),
+            duration: Latency::default(),
+        }
+    }
+}
+
+impl<R> Reads<R> {
     /// The slot of the read of `page`, if one is in flight or unclaimed.
     pub(crate) fn find(&self, page: u64) -> Option<usize> {
         self.slots.iter().position(|s| {
@@ -83,7 +93,7 @@ impl Reads {
 
     /// Adds `read`, which fills `frame` with `page`, held by the caller. Returns
     /// its slot.
-    pub(crate) fn start(&mut self, page: u64, frame: FrameId, read: PageRead) -> usize {
+    pub(crate) fn start(&mut self, page: u64, frame: FrameId, read: R) -> usize {
         let i = match self
             .slots
             .iter()
@@ -119,6 +129,37 @@ impl Reads {
         self.slots[i].users += 1;
     }
 
+    /// Lets go of slot `i`. If no reader holds it any more and its read wasn't
+    /// claimed, the read is cancelled, and its frame freed once the read is done
+    /// with it: now, or else by the cache's clock hand when it finishes.
+    pub(crate) fn leave(&mut self, i: usize, pool: &mut Pool) {
+        let slot = &mut self.slots[i];
+        slot.users -= 1;
+        if slot.users > 0 {
+            return;
+        }
+        let claimed = matches!(slot.state, State::Claimed);
+        slot.state = State::Free;
+        slot.waiters.clear();
+        if !claimed && pool.unused(slot.frame) {
+            pool.free(slot.frame);
+        }
+    }
+
+    /// The reads held: each one's slot, and the frame it fills, unless a reader
+    /// claimed it already.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> impl Iterator<Item = (usize, Option<FrameId>)> + '_ {
+        let held = self.slots.iter().enumerate();
+        held.filter_map(|(i, s)| match s.state {
+            State::Free => None,
+            State::Claimed => Some((i, None)),
+            State::Reading(_) | State::Finished(..) => Some((i, Some(s.frame))),
+        })
+    }
+}
+
+impl<R: Future<Output = (io::Result<()>, ReadBuf)> + Unpin> Reads<R> {
     /// Sends the read in slot `i` on its way, without claiming it.
     pub(crate) fn submit(&mut self, i: usize) {
         self.slots[i].advance(&self.duration);
@@ -146,38 +187,9 @@ impl Reads {
             State::Free | State::Reading(_) => unreachable!("read slot {i} not held"),
         }
     }
-
-    /// Lets go of slot `i`. If no reader holds it any more and its read wasn't
-    /// claimed, the read is cancelled, and its frame freed once the read is done
-    /// with it: now, or else by the cache's clock hand when it finishes.
-    pub(crate) fn leave(&mut self, i: usize, pool: &mut Pool) {
-        let slot = &mut self.slots[i];
-        slot.users -= 1;
-        if slot.users > 0 {
-            return;
-        }
-        let claimed = matches!(slot.state, State::Claimed);
-        slot.state = State::Free;
-        slot.waiters.clear();
-        if !claimed && pool.refs(slot.frame) == 0 {
-            pool.free(slot.frame);
-        }
-    }
-
-    /// The reads held: each one's slot, and the frame it fills, unless a reader
-    /// claimed it already.
-    #[cfg(test)]
-    pub(crate) fn held(&self) -> impl Iterator<Item = (usize, Option<FrameId>)> + '_ {
-        let held = self.slots.iter().enumerate();
-        held.filter_map(|(i, s)| match s.state {
-            State::Free => None,
-            State::Claimed => Some((i, None)),
-            State::Reading(_) | State::Finished(..) => Some((i, Some(s.frame))),
-        })
-    }
 }
 
-impl Slot {
+impl<R: Future<Output = (io::Result<()>, ReadBuf)> + Unpin> Slot<R> {
     /// Polls the read, if it is in flight, recording its time in `duration` once it
     /// finishes. Returns whether it is over: finished or claimed.
     fn advance(&mut self, duration: &Latency) -> bool {

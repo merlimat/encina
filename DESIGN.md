@@ -9,7 +9,9 @@
 > leaves, which the cache keeps and iterators read ahead (§5). Level-1 internal
 > nodes live in the cache too, so memory stays within its budget however large
 > the store grows (§8), and the open reads only the nodes above them, leaving
-> level 1 to a scan that runs while the store serves reads and writes (§7).
+> level 1 to a scan that runs while the store serves reads and writes (§7). A
+> store opens in an env: files, or one its caller implements, which needs no
+> compio runtime, and where no clock decides what the store does (§9).
 
 encina is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. Its first
@@ -62,9 +64,9 @@ The costs to accept:
 | Topic | Decision |
 |---|---|
 | Durability | Each `write()` is atomic and durable: when it returns, the batch is on disk, and readers see it from that moment on. Writes that queue up behind a commit share the next one (§6). There is no separate flush and no internal WAL: after a crash the store opens at the last completed write, and the caller's journal replays anything newer. |
-| Threading | One `!Send` instance per compio thread, no locks or atomics, except in wakers, which Rust requires to be `Send` and `Sync` (§8). Scale by sharding (for example, by ledger id) above the library. |
+| Threading | One `!Send` instance per thread: a compio runtime's, or the one that runs an env the caller implements (§9). No locks or atomics, except in wakers, which Rust requires to be `Send` and `Sync` (§8). Scale by sharding (for example, by ledger id) above the library. |
 | Memory | Bounded from day one and managed entirely by encina: internal nodes above level 1 stay resident, and level-1 nodes and leaves live in encina's own cache with a budget, read on demand (§8). No reliance on the OS page cache or `mmap`: the data file is opened for direct I/O (§9). |
-| Allocation | No heap allocation on the data path. Frames in the leaf cache are the only exception (§8), besides the buffer a value leaf too large to cache is read into (§5); write batches, the batches that groups of writes share, cursors and reader bookkeeping reuse their memory. compio itself allocates once per I/O operation, so cache misses and commits are not allocation-free (§9). |
+| Allocation | No heap allocation on the data path. Frames in the leaf cache are the only exception (§8), besides the buffer a value leaf too large to cache is read into (§5); write batches, the batches that groups of writes share, cursors and reader bookkeeping reuse their memory. On a file, compio itself allocates once per I/O operation, so cache misses and commits are not allocation-free; on a disk the caller implements, they allocate what the disk does (§9). |
 | Keys and values | Arbitrary byte strings, keys up to a quarter of a page. Two node formats: slotted, which handles any lengths, and dense, for nodes whose keys share one length and whose values share another, chosen per node when it is built. An entry too large for either gets a value leaf of its own (§5). |
 
 ## 4. Architecture
@@ -354,7 +356,10 @@ replaced. That is CPU work that grows with the batch, so once it has run for a
 millisecond, it pauses and lets the other tasks run; the slice in which one step
 ends goes on with the next. It looks at the clock every 4,096 units of work:
 operations listed, compared or moved, nodes visited, leaves pinned, entries copied,
-merged or built, and nodes freed. A node that planning visits counts as 64, since
+merged or built, and nodes freed. In an env that keeps the clock from the store
+(§9), it pauses after 163,840 units instead, about a millisecond of a sorted
+load's merge, and so in the same places each time.
+A node that planning visits counts as 64, since
 searching an unsorted batch's operations for it takes up to 2 µs, and a leaf pinned
 or a node freed as 16, so that it looks every 256 of them: about 20 µs of pinning
 cached leaves, and 11 µs of freeing. An operation the merge applies counts as 32
@@ -873,10 +878,11 @@ corrupt.
   leaves the nodes it reads cached, first in line for eviction. The first node of
   its window always gets a read, which grows the pool past the budget if it must,
   as a lookup's does, so the scan always goes on.
-- **Task.** On a file, the store spawns a task for the scan on the runtime that
-  opened it (§9). The task holds the store only while it is polled, so a store
-  closes once the app lets go of it, and dropping it cancels the task. Closing
-  lets go of the scan's reads first, since they hold the file open.
+- **Task.** The store spawns a task for the scan through its env (§9): in files,
+  on the compio runtime that opened it. The task holds the store only while it is
+  polled, so a store closes once the app lets go of it; dropping the store wakes
+  the task, which then ends. Closing lets go of the scan's reads first, since
+  they hold the file open.
 - **Writes meanwhile** take pages only from where the file ended when the store
   opened, and on: those are free whatever the scan finds. The high-water mark
   doesn't come down below there, so the file isn't cut below it, and no page
@@ -991,7 +997,8 @@ at once if the read is done with it, and otherwise reclaimed by the clock hand o
 the read finishes: the buffer the runtime holds keeps the frame alive until then.
 
 Slots are reused: once the table has grown to the most reads ever in flight at
-once, a miss allocates nothing but compio's operation (§9).
+once, a miss allocates nothing but what the disk's read does: compio's operation,
+on a file (§9).
 
 ### Level-1 nodes
 
@@ -1050,14 +1057,17 @@ same 282 MiB.
 ## 9. Concurrency and I/O
 
 - `Db` is `!Send` and `!Sync` (`Rc`, `RefCell`, `Cell`). It is a cheap `Clone`
-  handle shared by the tasks of one compio runtime thread. BookKeeper already keeps
-  one index per ledger directory; here, one instance per core or shard plays the
-  same role. A `Send` facade (compio dispatcher or channels) can come later.
-- **One owner per file.** Opening takes an exclusive `flock` on the file, which
-  closing it releases, so a second open fails with `Error::Locked` instead of
-  corrupting the store. A `flock` lock belongs to the open file rather than to the
-  process, so it also stops a second open from another thread of the same process,
-  the likely mistake with one instance per thread.
+  handle shared by the tasks of one thread: those of a compio runtime, for a store
+  in a file, or of whatever runtime runs an env the caller implements (below).
+  BookKeeper already keeps one index per ledger directory; here, one instance per
+  core or shard plays the same role. A `Send` facade (compio dispatcher or
+  channels) can come later.
+- **One owner per file.** In `DefaultEnv`, opening takes an exclusive `flock` on the
+  file, which closing it releases, so a second open fails with `Error::Locked`
+  instead of corrupting the store. A `flock` lock belongs to the open file rather
+  than to the process, so it also stops a second open from another thread of the
+  same process, the likely mistake with one instance per thread. An env the caller
+  implements keeps out a second owner as it can (below).
 - **Read-only views.** A `ReadOnlyDb` opens the file read-only and takes no lock, so
   it can read a store that a `Db` owns, in this process or another. It reads the
   version that was current when it opened, with a cache of its own. The owner
@@ -1072,6 +1082,132 @@ same 282 MiB.
   uses it. Opening a view checks the internal nodes it loads the same way. Views
   suit inspection and tooling: one that should keep up with a busy owner has to be
   reopened, since nothing holds back the owner's page reuse for it.
+- A large write normalizes and plans its batch, pins the leaves it changes, and
+  merges it, a slice at a time, and yields to the executor in between (§6).
+- **The scan of level 1** that follows an open (§7) runs in a task the store
+  spawns through its env, the one task a store has. The task holds the store
+  weakly, and strongly only while it is polled, so that it neither keeps a store
+  open nor outlives it: dropping the store wakes it, and it ends. `DefaultEnv` spawns
+  it on the compio runtime that opened the store, and detaches it.
+
+### The env and the disk
+
+A store opens in an `Env`, which opens its file as a `Disk` (§10). `DefaultEnv`
+keeps stores in files on compio (below). An env the caller implements may send
+every request through an I/O scheduler of the caller's, or simulate a disk, in a
+simulation that replays a run from its seed, as encina's own tests do (§11).
+`Db::open` and `ReadOnlyDb::open` take the env, the store's path and its options.
+The env:
+
+- `open`s the file at a path, which it interprets: for `Access::ReadWrite`, an
+  owner, it creates the file if needed, keeps out other owners, and makes a new
+  file's name durable; for `Access::ReadOnly`, a view, it opens the file as it is.
+- `spawn`s the scan of level 1 (§7).
+- says, with `real_time`, whether the store may read the clock to pace its
+  writes (below).
+
+The store uses its env only while it opens. A disk does what the store did to its
+file:
+
+- `len`, and `min_read`, the smallest read it supports, 4 KiB by default: the
+  open reads that much of the first page to find the page size (§7).
+- `read` starts a read, and returns a future of a type the disk names,
+  `Disk::Read`. The table of reads in flight keeps it in a slot, and whichever
+  reader waits for the page polls it, with the slot's own waker (§8), so a read
+  needs no boxed future.
+- `write`, for a meta page, `write_vectored`, for a run of pages, `set_len` and
+  `sync`.
+- `close` closes the disk once the store's last handle is closed.
+
+Requests move owned buffers, as compio's do: a `ReadBuf`, which lends a frame, or
+the buffer of a value leaf too large to cache (§5), for a read to fill; and a
+`WriteBuf`, which lends a frame to write. Each spans whole pages, 4 KiB-aligned,
+at an offset that is a multiple of the page size. Both implement compio's buffer
+traits, so a disk passes them straight to a compio file, and nothing is copied. A
+request returns the buffers it was given with its outcome.
+
+**A disk can't break the store's memory.** The trait is safe to implement, so the
+store doesn't count on a disk to return the buffers it was given. One that kept a
+buffer could fill it later, while readers read the frame, or once the frame holds
+another page. So:
+
+- A read that returns another buffer than it was given fails with `Error::Io`,
+  and the store never looks at the frame it read into.
+- A frame's count keeps the references of the tree and its readers apart from
+  those of I/O buffers, in the low and the high half of 64 bits. The tree lets go
+  of a frame by its own references, and a frame that a buffer still holds then
+  waits, as one being read does, for the clock hand to free it once the buffer is
+  gone. No frame is reused while a disk holds a buffer over it.
+- A `WriteBuf` lends its frame to read only.
+
+A disk that misbehaves can lose or garble pages, as a failing device can, and the
+checksums find that; it can't make the store touch memory that a buffer still
+lends.
+
+**No runtime, and the clock only if the env says.** In an env the caller
+implements, nothing in encina calls compio's runtime: the store's futures run on
+any executor, since a pause only wakes the write that pauses (§6), and its one
+task, the scan, runs where the env spawns it. Unless the env's `real_time` says
+so, which it doesn't by default, no clock decides what the store does either: a
+write pauses after 163,840 units of work, about a millisecond of a sorted load's
+merge, rather than after a millisecond (§6). Given the same requests and the same
+outcomes from its disk, the store then does the same, as a simulation that
+replays a run from its seed needs. `DefaultEnv` lets the store read the clock.
+Metrics time what the store does either way, which decides nothing.
+
+Units of work measure time only roughly: those of other steps take up to five
+times as long, and a merge's scattered operations a fifth (§6). Measured once with
+`read_latency_during_a_load` (§6), on an Apple M5 Pro, with slices of 163,840
+units rather than of a millisecond: the appends' lookups took 0.38 ms at the
+median, 1.9 ms at the p99 and 2.6 ms at most, against 0.51, 1.4 and 2.0 ms; the
+random updates' took 0.64, 3.8 and 6.2 ms, against 0.51, 1.0 and 1.9 ms, since
+planning their batch counts its units five times as long. The writes took as
+long either way. So an env that needs no replay, such as a caller's in
+production, lets the store read the clock.
+
+**Classes.** Each request carries a class, of the disk's type `Disk::Class`: `()`
+for a disk that doesn't schedule. Of two classes, the greater is the more urgent.
+`Db::with_class` returns a handle to the same store whose operations take a
+class: a lookup's reads and an iterator's take that of the handle they came from,
+and a commit's requests, its reads, writes, syncs and cut, take the greatest class
+among the writes it commits. A write that waits for a commit raises the class of
+the commit's later requests to its own, if greater, since the commit holds it up.
+A read that several readers share keeps the class of the one that started it, and
+the open's reads and the scan's take the default class. Requests already sent keep
+their class: raising them too, as a scheduler may want, needs a way to tell the
+disk, which a method with a default could add without breaking its implementations.
+
+**Allocation.** A disk the caller implements adds no allocation to the store's
+own: the table of reads keeps the reads' futures in its slots, a commit keeps its
+writes' futures in a fixed array on its stack, and the buffers are the frames.
+The allocation tests run on the simulated disk, which implements the trait as a
+caller's disk does (§11). What a disk allocates for a request is its own, as is
+what an env allocates to open a store and run its task.
+
+**Alternatives.**
+
+- A disk behind a trait object would cost a boxed future per read and per write.
+  So `Db` takes the disk as a type parameter, `Db<D: Disk = FileDisk>`: `Db` alone
+  still names a store in a file, as `ReadOnlyDb` and `Iter` do a view and an
+  iterator of one, and the store's code is compiled for each kind of disk a
+  program uses.
+- An `unsafe` trait, whose implementations promised to return the buffers they
+  were given, would need neither the check of a read's buffer, a comparison of
+  pointers, nor the split count, but would leave every implementation that
+  promise to keep.
+- The caller could drive the scan of level 1 itself, through a method of the
+  store, rather than spawn it; but a store whose caller forgot would never reuse
+  a page.
+- The disk could be the argument itself, `Db::open(disk, opts)`, or one of the
+  options, which would make `Options` generic over the disk. Either way, the
+  caller would pick a file's locked open, or its read-only one for a view, and the
+  store would have no path for its metrics. An env opens the file by path, for an
+  owner or a view, so one `open` serves both, and `Disk` is I/O alone.
+
+### Files
+
+`DefaultEnv` keeps a store in a file, a `FileDisk`, locked by its owner (above):
+
 - All file I/O goes through compio 0.19: `read_at` / `write_at` on `&File`, with
   frames as the owned buffers, `sync_data`, and `set_len` to cut the file. A commit
   writes each run of pages with `write_vectored_at`, whose buffers are the frames
@@ -1090,13 +1226,6 @@ same 282 MiB.
   keeps the reads it holds inline; and the table of reads in flight reuses its
   slots (§8). If compio's show up in profiles, the fix belongs upstream (pooled
   operation slots).
-- A large write normalizes and plans its batch, pins the leaves it changes, and
-  merges it, a slice at a time, and yields to the executor in between (§6).
-- **The scan of level 1** that follows an open (§7) runs in a task the store
-  spawns on the runtime that opened it, the one task a store has. The task holds
-  the store weakly, and strongly only while it is polled, so that it neither keeps
-  a store open nor outlives it: the store holds the task's handle, and dropping
-  that cancels the task.
 - **Linux with io_uring is the target.** macOS works for development, but there
   compio runs file I/O on a blocking thread pool and `fsync` is a plain `fsync`
   (no `F_FULLFSYNC`), so macOS gives no durability guarantee against power loss.
@@ -1104,11 +1233,56 @@ same 282 MiB.
 ## 10. API sketch
 
 ```rust
-#[derive(Clone)]
-pub struct Db { /* Rc<Inner> */ }
+/// Where a store runs (§9): what opens its file, runs its task, and lets it read
+/// the clock, or not. `DefaultEnv` keeps stores in files, on compio.
+pub trait Env {
+    type Disk: Disk;
 
-impl Db {
-    pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db>;
+    /// Opens the store's file at `path`, as its owner or as a view.
+    fn open(&self, path: &Path, access: Access)
+        -> impl Future<Output = Result<Self::Disk>>;
+    /// Runs the scan of level 1 (§7) beside the store, until it ends.
+    fn spawn(&self, task: impl Future<Output = ()> + 'static);
+    /// Whether writes may pause by the clock, rather than by work (§6).
+    fn real_time(&self) -> bool { false }
+}
+
+pub enum Access { ReadWrite, ReadOnly }
+
+/// Where a store keeps its pages (§9), which its env opens.
+pub trait Disk: Sized + 'static {
+    /// What a request is for: of two classes, the greater is the more urgent.
+    type Class: Copy + Ord + Default + 'static;
+    /// A read in flight, which the table of reads in flight keeps and polls (§8).
+    type Read: Future<Output = (io::Result<()>, ReadBuf)> + Unpin + 'static;
+
+    fn len(&self) -> impl Future<Output = io::Result<u64>>;
+    fn min_read(&self) -> usize { 4096 }
+    fn read(&self, buf: ReadBuf, offset: u64, class: Self::Class) -> Self::Read;
+    fn write(&self, buf: WriteBuf, offset: u64, class: Self::Class)
+        -> impl Future<Output = (io::Result<()>, WriteBuf)>;
+    fn write_vectored(&self, bufs: Vec<WriteBuf>, offset: u64, class: Self::Class)
+        -> impl Future<Output = (io::Result<()>, Vec<WriteBuf>)>;
+    fn set_len(&self, len: u64, class: Self::Class)
+        -> impl Future<Output = io::Result<()>>;
+    fn sync(&self, class: Self::Class) -> impl Future<Output = io::Result<()>>;
+    fn close(self) -> impl Future<Output = io::Result<()>> { async { Ok(()) } }
+}
+
+/// In a file by default: `Db` is `Db<FileDisk>`.
+#[derive(Clone)]
+pub struct Db<D: Disk = FileDisk> { /* Rc<Inner<D>>, and a class */ }
+
+impl<D: Disk> Db<D> {
+    /// Opens the store at `path` in `env`: `Db::open(&DefaultEnv, path, opts)` in a
+    /// file.
+    pub async fn open<E: Env<Disk = D>>(
+        env: &E,
+        path: impl AsRef<Path>,
+        opts: Options,
+    ) -> Result<Db<D>>;
+    /// A handle to the same store whose operations' I/O takes `class` (§9).
+    pub fn with_class(&self, class: D::Class) -> Db<D>;
     /// Applies `batch` atomically and durably: once this returns `Ok`, the batch is
     /// on disk and visible to reads. Writes that queue up behind a commit share the
     /// next one (§6). Fails with `Error::KeyTooLarge`, applying nothing, if a key
@@ -1138,18 +1312,23 @@ impl Db {
     ) -> Result<Option<R>>;
     /// Point-in-time iterator. Creating and advancing it never allocates. The bounds
     /// are byte slices, in any range form: `&a[..]..&b[..]`, `..`, a pair of `Bound`s.
-    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter;
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter<D>;
     /// Closes the store. Every successful `write()` is already durable.
     pub async fn close(self) -> Result<()>;
 }
 
 /// A read-only view of a store, as of when it opened, which takes no lock (§9).
 #[derive(Clone)]
-pub struct ReadOnlyDb { /* Db */ }
+pub struct ReadOnlyDb<D: Disk = FileDisk> { /* Db<D> */ }
 
-impl ReadOnlyDb {
+impl<D: Disk> ReadOnlyDb<D> {
     /// Fails with `Error::Stale` if the owner overwrote the version meanwhile.
-    pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<ReadOnlyDb>;
+    pub async fn open<E: Env<Disk = D>>(
+        env: &E,
+        path: impl AsRef<Path>,
+        opts: Options,
+    ) -> Result<ReadOnlyDb<D>>;
+    pub fn with_class(&self, class: D::Class) -> ReadOnlyDb<D>;
     /// As `Db::get` and `Db::range`. Once the owner overwrites pages they need,
     /// they fail with `Error::Stale`.
     pub async fn get<R>(
@@ -1158,7 +1337,7 @@ impl ReadOnlyDb {
         cmp: Comparison,
         f: impl FnOnce(&[u8], &[u8]) -> R,
     ) -> Result<Option<R>>;
-    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter;
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Iter<D>;
     pub fn page_size(&self) -> usize;
     /// Calls `f` on each node of the tree: the internal nodes, then the leaves in
     /// key order, which it reads. The `stats` and `pages` commands use it.
@@ -1175,7 +1354,7 @@ pub struct PageInfo {
 
 pub enum Comparison { Equal, Floor, Ceiling, Lower, Higher }
 
-impl Iter {
+impl<D: Disk> Iter<D> {
     /// Lends the next entry; the slices stay valid until the next call.
     pub async fn next(&mut self) -> Result<Option<(&[u8], &[u8])>>;
 }
@@ -1209,13 +1388,16 @@ complete without suspending.
   `BTreeMap`, with a tiny cache budget so eviction and reloads happen constantly.
 - **Invariant checker** after every step: keys sorted, internal keys exact, levels
   consistent, and every page either live or free (never both, never neither).
-- **Failure paths, aiming for ~100% coverage.** All I/O goes through one internal
-  interface with two implementations: compio files, and a simulated disk that can
+- **Failure paths, aiming for ~100% coverage.** All I/O goes through the `Disk`
+  trait (§9), which the simulated disk implements as a caller's disk does: it can
   fail or crash at any single operation. A crash keeps what was synced, a
   pseudo-random subset of the pages written since, and the first half of the write
   in progress, which may span several pages; a cut of the file lasts once synced.
   Each failure scenario first runs once to count its I/O operations, then reruns
-  once per operation with an error injected there, and once more with a crash. One
+  once per operation with an error injected there, once more with a crash, and
+  once more with the operation returning other buffers than it was given, which
+  the disk keeps until the run ends: a read that does fails with `Error::Io`, and a
+  write's buffers keep their frames out of use until the disk lets go of them. One
   scenario reads leaves back through a tiny cache; another moves pages out of
   mostly free windows and cuts the file; a third writes in groups, so that
   failures hit groups before and during their commits. After each run, a store
@@ -1324,12 +1506,26 @@ complete without suspending.
   a directory that can't be synced, and a read-only view, which opens beside the
   owner, creates nothing, and opens a file it may only read. A write dropped while
   its page write is in flight leaves the store failed until it reopens.
+- **An env the caller implements:** `tests/disk.rs` implements an env and a disk
+  in memory with the public API alone, and runs stores in it with no compio
+  runtime, on an executor of its own that also polls the task the store spawns. A
+  store opens, writes, reads, closes and reopens in it; its scan of level 1 runs in
+  that task, and writes then reuse pages; a view opens in it too, and each open
+  asks the env for the store's path, as an owner or a view. Dropping a store wakes
+  its scan's task, which then ends. Each request has the class of what caused it: a
+  lookup's, an iterator's and a view's reads that of their handle, and a commit's
+  requests the greatest among its writes; and a commit whose first sync waits
+  while more urgent writes queue behind it sends its meta page and its second sync
+  with their class. A large write pauses in the same places, and makes the same
+  requests, each time it runs. Opens in such an env fail as in files, and with the
+  env's errors.
 - **Allocation tests:** a counting global allocator asserts that `get` and iteration
   over cached pages, `get` and iteration that miss the cache (reading ahead
   included), and `write` with a reused batch, alone, pausing as it normalizes, plans
   and merges, with ranges and keys in no order, in a group, or freeing the pages a
-  reader held back, all on the simulated disk, perform no allocations. On a real
-  disk, compio adds one per I/O operation.
+  reader held back, all on the simulated disk, perform no allocations. The
+  simulated disk implements the `Disk` trait as a caller's disk does, so the trait
+  adds none. On a real disk, compio adds one per I/O operation.
 - **Sanitizers:** CI runs every test under AddressSanitizer, std included, so a
   use of freed memory or a leak fails the run even where the test's own checks
   pass, real files' io_uring path included. One test drops a store while the

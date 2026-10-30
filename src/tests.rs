@@ -38,8 +38,8 @@ use proptest::prelude::*;
 use crate::meta::Meta;
 use crate::node::{self, Node};
 use crate::pool::Holds;
-use crate::sim::{Fault, SimDisk};
-use crate::{Comparison, Db, Error, Options, ReadOnlyDb, WriteBatch};
+use crate::sim::{Fault, SimDb, SimDisk, SimView};
+use crate::{Comparison, Db, DefaultEnv, Error, Options, ReadOnlyDb, WriteBatch};
 
 /// Runs a future that must finish without waiting, as everything does on the
 /// simulated disk. It may yield, as a write does while it merges.
@@ -78,7 +78,7 @@ const ALL: Range<'static> = (Bound::Unbounded, Bound::Unbounded);
 /// A store on a simulated disk.
 struct Store {
     disk: Rc<SimDisk>,
-    db: Db,
+    db: SimDb,
     opts: Options,
 }
 
@@ -123,7 +123,7 @@ fn batch_of(ops: &[Op]) -> WriteBatch {
     batch
 }
 
-fn write(db: &Db, ops: &[Op]) {
+fn write(db: &SimDb, ops: &[Op]) {
     now(db.write(&mut batch_of(ops))).unwrap();
 }
 
@@ -141,7 +141,7 @@ fn apply(model: &mut Model, ops: &[Op]) {
     }
 }
 
-fn get(db: &Db, key: &[u8], cmp: Comparison) -> Option<Entry> {
+fn get(db: &SimDb, key: &[u8], cmp: Comparison) -> Option<Entry> {
     now(db.get(key, cmp, |k, v| (k.to_vec(), v.to_vec()))).unwrap()
 }
 
@@ -161,7 +161,7 @@ fn expected(model: &Model, key: &[u8], cmp: Comparison) -> Option<Entry> {
     found.map(|(k, v)| (k.clone(), v.clone()))
 }
 
-fn scan(db: &Db, range: Range) -> Vec<Entry> {
+fn scan(db: &SimDb, range: Range) -> Vec<Entry> {
     let mut iter = db.range(range);
     let mut entries = Vec::new();
     while let Some((k, v)) = now(iter.next()).unwrap() {
@@ -448,7 +448,7 @@ fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
 }
 
 /// Checks the tree, and that it counts the entries of `model`.
-fn check_tree(db: &Db, model: &Model) {
+fn check_tree(db: &SimDb, model: &Model) {
     db.check();
     let bytes = model.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
     let size = node::Size {
@@ -460,7 +460,7 @@ fn check_tree(db: &Db, model: &Model) {
 
 /// Checks a full scan, and every comparison on every key and on the gap just above
 /// it, which covers the first and last keys of every leaf, against `model`.
-fn check_reads(db: &Db, model: &Model) {
+fn check_reads(db: &SimDb, model: &Model) {
     assert_eq!(scan(db, ALL), expected_scan(model, ALL));
     for key in model.keys() {
         let mut above = key.clone();
@@ -775,7 +775,7 @@ fn ranges_accept_every_form_of_bounds() {
         &store.db,
         &[1u8, 2, 3, 4].map(|k| Op::Put(vec![k], Vec::new())),
     );
-    let keys = |mut iter: crate::Iter| {
+    let keys = |mut iter: crate::Iter<Rc<SimDisk>>| {
         let mut keys = Vec::new();
         while let Some((k, _)) = now(iter.next()).unwrap() {
             keys.push(k[0]);
@@ -1010,7 +1010,7 @@ struct Subtree {
 
 /// The nodes from the root of the current version down to the leaf where `key`
 /// belongs.
-fn path_to(db: &Db, key: &[u8]) -> Vec<Subtree> {
+fn path_to(db: &SimDb, key: &[u8]) -> Vec<Subtree> {
     let tree = db.tree();
     let root = tree.current().root.unwrap();
     let mut path = vec![Subtree {
@@ -1174,7 +1174,7 @@ fn reopening_with_a_cold_cache_reads_everything_back() {
 }
 
 /// Checks that the frames in use fit in the cache's budget.
-fn within_budget(db: &Db) {
+fn within_budget(db: &SimDb) {
     let tree = db.tree();
     let (used, budget) = (tree.pages.pool.in_use(), tree.pages.cache.budget());
     assert!(
@@ -1185,7 +1185,7 @@ fn within_budget(db: &Db) {
 
 /// Checks a full scan, and every comparison on a sample of the keys, against
 /// `model`.
-fn check_sampled_reads(db: &Db, model: &Model) {
+fn check_sampled_reads(db: &SimDb, model: &Model) {
     assert_eq!(scan(db, ALL), expected_scan(model, ALL));
     for key in model.keys().step_by(97) {
         for cmp in COMPARISONS {
@@ -1243,7 +1243,7 @@ fn level_1_nodes_that_outgrow_the_cache_stay_within_its_budget() {
 }
 
 /// The pages of the internal nodes above level 1 in `db`'s tree.
-fn upper_nodes(db: &Db) -> u64 {
+fn upper_nodes(db: &SimDb) -> u64 {
     let tree = db.tree();
     (tree.pages().len() - tree.leaves().len() - tree.level_1().len()) as u64
 }
@@ -1448,7 +1448,7 @@ fn nodes_whose_entries_lie_outside_them_are_reported() {
     // crafted file could leave it. Keys of two lengths make slotted nodes, with no
     // key prefix: two heads from byte 32, then slots of 6 bytes from 40, each
     // ending with its value's length.
-    let current = |db: &Db| {
+    let current = |db: &SimDb| {
         let tree = db.tree();
         (tree.current().root.unwrap(), tree.current().generation)
     };
@@ -1511,11 +1511,11 @@ fn round_of(n: u32, round: u8) -> Vec<Op> {
         .collect()
 }
 
-fn view_get(view: &ReadOnlyDb, key: &[u8], cmp: Comparison) -> crate::Result<Option<Entry>> {
+fn view_get(view: &SimView, key: &[u8], cmp: Comparison) -> crate::Result<Option<Entry>> {
     now(view.get(key, cmp, |k, v| (k.to_vec(), v.to_vec())))
 }
 
-fn view_scan(view: &ReadOnlyDb) -> crate::Result<Vec<Entry>> {
+fn view_scan(view: &SimView) -> crate::Result<Vec<Entry>> {
     let mut iter = view.range(..);
     let mut entries = Vec::new();
     while let Some((k, v)) = now(iter.next())? {
@@ -2024,7 +2024,7 @@ fn a_view_reads_the_file_length_after_the_meta_page() {
 
 /// Opens the store on `disk` with each read of the open failing in turn: that
 /// open fails, and the next one works. Then opens it once more.
-fn open_after_failed_reads(disk: &SimDisk, opts: &Options) -> Db {
+fn open_after_failed_reads(disk: &SimDisk, opts: &Options) -> SimDb {
     let clean = disk.restart();
     now(Db::open_sim(clean.clone(), opts.clone())).unwrap();
     for op in 0..clean.ops() {
@@ -2145,7 +2145,7 @@ fn value_scenario() -> Vec<Vec<Op>> {
 
 /// Runs the scenario until an operation fails. Returns the store, if it opened,
 /// and how many batches were written.
-fn try_scenario(disk: &Rc<SimDisk>, opts: &Options, batches: &[Vec<Op>]) -> (Option<Db>, usize) {
+fn try_scenario(disk: &Rc<SimDisk>, opts: &Options, batches: &[Vec<Op>]) -> (Option<SimDb>, usize) {
     let Ok(db) = now(Db::open_sim(disk.clone(), opts.clone())) else {
         return (None, 0);
     };
@@ -2164,7 +2164,7 @@ fn try_scenario(disk: &Rc<SimDisk>, opts: &Options, batches: &[Vec<Op>]) -> (Opt
     (Some(db), batches.len())
 }
 
-fn try_scan(db: &Db) -> crate::Result<()> {
+fn try_scan(db: &SimDb) -> crate::Result<()> {
     let mut iter = db.range(..);
     while now(iter.next())?.is_some() {}
     Ok(())
@@ -2200,7 +2200,7 @@ fn check_every_single_failure(opts: &Options, batches: &[Vec<Op>]) {
 }
 
 /// Runs batches on a store until an operation fails, like [`try_scenario`].
-type Scenario = fn(&Rc<SimDisk>, &Options, &[Vec<Op>]) -> (Option<Db>, usize);
+type Scenario = fn(&Rc<SimDisk>, &Options, &[Vec<Op>]) -> (Option<SimDb>, usize);
 
 /// Like [`check_every_single_failure`], on the store that `start` holds, whose
 /// entries are `model`'s, with `run` running the batches.
@@ -2222,12 +2222,14 @@ fn check_failures(
     assert_eq!(done, batches.len());
     drop(db);
     let total = clean.ops();
-    for fault in [Fault::Error, Fault::Crash] {
+    for fault in [Fault::Error, Fault::Crash, Fault::Swap] {
         for op in 0..total {
             let disk = start.restart();
             disk.inject(op, fault);
             let (db, done) = run(&disk, opts, batches);
             let failed = db.as_ref().is_some_and(Db::has_failed);
+            // The frames of the buffers a swap kept are freed once it lets go.
+            disk.let_go();
             if let Some(db) = &db {
                 if failed {
                     assert!(matches!(
@@ -2265,7 +2267,7 @@ fn try_scan_scenario(
     disk: &Rc<SimDisk>,
     opts: &Options,
     batches: &[Vec<Op>],
-) -> (Option<Db>, usize) {
+) -> (Option<SimDb>, usize) {
     let Ok(db) = now(Db::open_sim(disk.clone(), opts.clone())) else {
         return (None, 0);
     };
@@ -2343,7 +2345,7 @@ fn try_group_scenario(
     disk: &Rc<SimDisk>,
     opts: &Options,
     rounds: &[Vec<Vec<Op>>],
-) -> (Option<Db>, Vec<Outcome>) {
+) -> (Option<SimDb>, Vec<Outcome>) {
     let Ok(db) = now(Db::open_sim(disk.clone(), opts.clone())) else {
         return (None, Vec::new());
     };
@@ -2388,12 +2390,13 @@ fn every_single_failure_in_a_group_leaves_a_recoverable_store() {
     assert_eq!(outcomes, vec![Outcome::Applied; batches.len()]);
     drop(db);
     let total = clean.ops();
-    for fault in [Fault::Error, Fault::Crash] {
+    for fault in [Fault::Error, Fault::Crash, Fault::Swap] {
         for op in 0..total {
             let disk = SimDisk::new();
             disk.inject(op, fault);
             let (db, outcomes) = try_group_scenario(&disk, &opts, &rounds);
             let failed = db.as_ref().is_some_and(Db::has_failed);
+            disk.let_go();
             if let Some(db) = &db {
                 if failed {
                     assert!(matches!(
@@ -2749,15 +2752,15 @@ fn read_once(store: &Store, ops: u64, leaves: u64) {
 }
 
 /// Frames that reads are filling, and frames that cancelled reads left behind.
-fn loading_frames(db: &Db) -> (usize, usize) {
+fn loading_frames(db: &SimDb) -> (usize, usize) {
     let tree = db.tree();
     let pool = &tree.pages.pool;
     let loading = (0..pool.slots())
         .map(|i| pool.slot(i))
         .filter(|&f| pool.frame(f).holds == Holds::Loading);
-    loading.fold((0, 0), |(busy, idle), f| match pool.refs(f) {
-        0 => (busy, idle + 1),
-        _ => (busy + 1, idle),
+    loading.fold((0, 0), |(busy, idle), f| match pool.unused(f) {
+        true => (busy, idle + 1),
+        false => (busy + 1, idle),
     })
 }
 
@@ -3041,7 +3044,7 @@ fn a_cold_scan_reads_value_leaves_ahead() {
 }
 
 /// The entries left in `iter`.
-fn scan_rest(iter: &mut crate::Iter) -> Vec<Entry> {
+fn scan_rest(iter: &mut crate::Iter<Rc<SimDisk>>) -> Vec<Entry> {
     let mut entries = Vec::new();
     while let Some((k, v)) = now(iter.next()).unwrap() {
         entries.push((k.to_vec(), v.to_vec()));
@@ -3211,14 +3214,14 @@ fn puts(keys: std::ops::Range<u32>, value: u8) -> Vec<Op> {
 }
 
 /// The generation of the store's current version: each commit adds one.
-fn generation(db: &Db) -> u64 {
+fn generation<D: crate::Disk>(db: &Db<D>) -> u64 {
     db.tree().current().generation
 }
 
 type Write<'a> = Pin<Box<dyn Future<Output = crate::Result<()>> + 'a>>;
 
 /// Starts writing each batch: polls each write once, which must wait.
-fn start_writes<'a>(db: &'a Db, batches: &'a mut [WriteBatch]) -> Vec<Write<'a>> {
+fn start_writes<'a>(db: &'a SimDb, batches: &'a mut [WriteBatch]) -> Vec<Write<'a>> {
     let mut writes: Vec<Write> = Vec::new();
     for batch in batches {
         let mut write: Write = Box::pin(db.write(batch));
@@ -3317,7 +3320,7 @@ fn queue_behind<'a>(
     store: &Store,
     first: &[Op],
     queued: &'a mut [WriteBatch],
-    db: &'a Db,
+    db: &'a SimDb,
 ) -> Vec<Write<'a>> {
     store.disk.hold_syncs();
     let mut batch = batch_of(first);
@@ -3469,7 +3472,7 @@ fn hold_group_building<'a>(
     store: &Store,
     model: &mut Model,
     queued: &'a mut [WriteBatch],
-    db: &'a Db,
+    db: &'a SimDb,
 ) -> Vec<Write<'a>> {
     let first = vec![put_op(10, 1)];
     let mut writes = queue_behind(store, &first, queued, db);
@@ -3948,7 +3951,7 @@ fn a_reader_leaves_the_pages_it_held_back_to_the_next_write() {
 
 /// Polls `write`, each poll stopping where it yields, until it pauses merging,
 /// which it does once it holds the leaves its batch changes.
-fn pause_merging<F: Future + ?Sized>(db: &Db, mut write: Pin<&mut F>) {
+fn pause_merging<F: Future + ?Sized>(db: &SimDb, mut write: Pin<&mut F>) {
     loop {
         assert!(
             poll_once(write.as_mut()).is_pending(),
@@ -4025,7 +4028,7 @@ fn pause_group<'a>(
     store: &Store,
     model: &mut Model,
     queued: &'a mut [WriteBatch],
-    db: &'a Db,
+    db: &'a SimDb,
     merging: bool,
 ) -> Vec<Write<'a>> {
     let first = puts(0..50, 2);
@@ -4209,7 +4212,7 @@ type Lookup<'a> = Pin<Box<dyn Future<Output = crate::Result<Option<Entry>>> + 'a
 
 enum Reader<'a> {
     Scan {
-        iter: Box<crate::Iter>,
+        iter: Box<crate::Iter<Rc<SimDisk>>>,
         range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
         seen: Vec<Entry>,
         done: bool,
@@ -4321,7 +4324,9 @@ async fn a_file_store_survives_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
     let key = |i: u32| i.to_be_bytes();
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     let mut batch = WriteBatch::new();
     for i in 0..20_000u32 {
         batch.put(&key(i), &key(i * 2));
@@ -4334,7 +4339,7 @@ async fn a_file_store_survives_reopening() {
 
     // The page size comes from the file. A small cache sends reads to the disk.
     let opts = Options::default().cache_size(16 * 4096);
-    let db = Db::open(&path, opts).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, opts).await.unwrap();
     for i in (0..20_000u32).step_by(97) {
         let found = db
             .get(&key(i), Comparison::Equal, |_, v| v.to_vec())
@@ -4358,8 +4363,12 @@ async fn a_file_store_survives_reopening() {
 async fn a_file_store_has_one_owner_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
-    let second = Db::open(&path, Options::default()).await.map(drop);
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
+    let second = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .map(drop);
     assert!(matches!(second, Err(Error::Locked)), "{second:?}");
 
     // The failed open left the store alone.
@@ -4369,11 +4378,15 @@ async fn a_file_store_has_one_owner_at_a_time() {
 
     // Closing the store lets go of it, and so does dropping it.
     db.close().await.unwrap();
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     let found = db.get(b"key", Comparison::Equal, |_, v| v.to_vec());
     assert_eq!(found.await.unwrap(), Some(b"value".to_vec()));
     drop(db);
-    Db::open(&path, Options::default()).await.unwrap();
+    Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
 }
 
 #[compio::test]
@@ -4381,14 +4394,20 @@ async fn a_file_store_has_one_owner_at_a_time() {
 async fn a_read_only_view_opens_beside_the_owner() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"key", b"value");
     db.write(&mut batch).await.unwrap();
 
     // The view takes no lock, and leaves the owner's in place.
-    let view = ReadOnlyDb::open(&path, Options::default()).await.unwrap();
-    let second = Db::open(&path, Options::default()).await.map(drop);
+    let view = ReadOnlyDb::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
+    let second = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .map(drop);
     assert!(matches!(second, Err(Error::Locked)), "{second:?}");
 
     // It reads the version it opened, not later writes.
@@ -4401,7 +4420,9 @@ async fn a_read_only_view_opens_beside_the_owner() {
 
     // Nor does it keep another owner out.
     db.close().await.unwrap();
-    Db::open(&path, Options::default()).await.unwrap();
+    Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     view.close().await.unwrap();
 }
 
@@ -4415,26 +4436,34 @@ async fn a_read_only_view_never_writes() {
     let path = dir.path().join("encina.db");
 
     // It doesn't create a store.
-    let opened = ReadOnlyDb::open(&path, Options::default()).await.map(drop);
+    let opened = ReadOnlyDb::open(&DefaultEnv, &path, Options::default())
+        .await
+        .map(drop);
     assert!(
         matches!(&opened, Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound),
         "{opened:?}"
     );
     assert!(!path.exists());
     fs::write(&path, b"").unwrap();
-    let opened = ReadOnlyDb::open(&path, Options::default()).await.map(drop);
+    let opened = ReadOnlyDb::open(&DefaultEnv, &path, Options::default())
+        .await
+        .map(drop);
     assert!(matches!(opened, Err(Error::InvalidFile(_))), "{opened:?}");
     assert_eq!(fs::metadata(&path).unwrap().len(), 0);
     fs::remove_file(&path).unwrap();
 
     // It opens a store it may only read.
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"key", b"value");
     db.write(&mut batch).await.unwrap();
     db.close().await.unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-    let view = ReadOnlyDb::open(&path, Options::default()).await.unwrap();
+    let view = ReadOnlyDb::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     let found = view.get(b"key", Comparison::Equal, |_, v| v.to_vec());
     assert_eq!(found.await.unwrap(), Some(b"value".to_vec()));
     view.close().await.unwrap();
@@ -4444,16 +4473,22 @@ async fn a_read_only_view_never_writes() {
 async fn a_store_closes_with_its_last_handle() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     // Closing a clone, or the store while an iterator is alive, leaves it open.
     db.clone().close().await.unwrap();
     let iter = db.range(..);
     db.close().await.unwrap();
-    let second = Db::open(&path, Options::default()).await.map(drop);
+    let second = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .map(drop);
     assert!(matches!(second, Err(Error::Locked)), "{second:?}");
     // The iterator was the last handle.
     drop(iter);
-    Db::open(&path, Options::default()).await.unwrap();
+    Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
 }
 
 #[compio::test]
@@ -4473,7 +4508,7 @@ async fn a_file_store_scans_level_1_in_the_background() {
     // The smallest cache, of 8 pages, scans 2 level-1 nodes at a time, and lets
     // writes go on while the scan has more left.
     let opts = Options::default().cache_size(0);
-    let db = Db::open(&path, opts.clone()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, opts.clone()).await.unwrap();
     let mut batch = WriteBatch::new();
     for i in 0..50_000u32 {
         batch.put(&key(i), &[i as u8; 100]);
@@ -4481,12 +4516,12 @@ async fn a_file_store_scans_level_1_in_the_background() {
     db.write(&mut batch).await.unwrap();
     db.close().await.unwrap();
     // Closing the store lets go of the file whatever its scan is reading.
-    let db = Db::open(&path, opts.clone()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, opts.clone()).await.unwrap();
     assert!(db.scan_left().unwrap() > 2);
     yield_once().await;
     db.close().await.unwrap();
     // The scan goes on by itself, while the store serves reads and writes.
-    let db = Db::open(&path, opts.clone()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, opts.clone()).await.unwrap();
     batch.clear();
     batch.delete_range(&key(10_000), &key(40_000));
     db.write(&mut batch).await.unwrap();
@@ -4499,7 +4534,7 @@ async fn a_file_store_scans_level_1_in_the_background() {
     }
     assert_eq!(db.scan_left(), None);
     db.close().await.unwrap();
-    let db = Db::open(&path, opts).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, opts).await.unwrap();
     assert_eq!(count(&db).await, 20_000);
     db.close().await.unwrap();
 }
@@ -4508,7 +4543,9 @@ async fn a_file_store_scans_level_1_in_the_background() {
 async fn a_write_dropped_mid_commit_fails_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"key", b"value");
     // The first poll sends out the new leaf's write, and the write is dropped
@@ -4518,7 +4555,9 @@ async fn a_write_dropped_mid_commit_fails_the_store() {
     // Closing waits for the leaf's write. The store reopens as it was, and takes
     // writes again.
     db.close().await.unwrap();
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     let found = db.get(b"key", Comparison::Equal, |_, v| v.to_vec());
     assert_eq!(found.await.unwrap(), None);
     db.write(&mut batch).await.unwrap();
@@ -4529,7 +4568,9 @@ async fn a_write_dropped_mid_commit_fails_the_store() {
 async fn concurrent_writes_to_a_file_share_commits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     let key = |i: u32| i.to_be_bytes();
     let mut batches: Vec<_> = (0..8u32)
         .map(|w| {
@@ -4564,7 +4605,9 @@ async fn concurrent_writes_to_a_file_share_commits() {
     assert_eq!(generation(&db), start + 2);
     drop(writes);
     db.close().await.unwrap();
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     for i in (0..8000).step_by(97) {
         let found = db.get(&key(i), Comparison::Equal, |_, v| v.to_vec()).await;
         assert_eq!(found.unwrap(), Some(key(i / 1000).to_vec()));
@@ -4575,13 +4618,17 @@ async fn concurrent_writes_to_a_file_share_commits() {
 async fn bad_options_or_a_missing_directory_fail_the_open() {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options::new().page_size(1000);
-    let opened = Db::open(dir.path().join("encina.db"), opts).await.map(drop);
+    let opened = Db::open(&DefaultEnv, dir.path().join("encina.db"), opts)
+        .await
+        .map(drop);
     assert!(
         matches!(opened, Err(Error::InvalidOptions(_))),
         "{opened:?}"
     );
     let path = dir.path().join("missing").join("encina.db");
-    let opened = Db::open(path, Options::default()).await.map(drop);
+    let opened = Db::open(&DefaultEnv, path, Options::default())
+        .await
+        .map(drop);
     assert!(
         matches!(&opened, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound),
         "{opened:?}"
@@ -4605,7 +4652,9 @@ async fn a_new_store_needs_its_directory_synced() {
     // Without read permission, a file can be created in the directory, but the
     // directory can't be opened to sync it.
     mode(0o300);
-    let result = Db::open(&path, Options::default()).await.map(drop);
+    let result = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .map(drop);
     mode(0o700);
     assert!(
         matches!(&result, Err(Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied),
@@ -4614,7 +4663,9 @@ async fn a_new_store_needs_its_directory_synced() {
 
     // The file left behind is empty, so opening it again creates the store.
     assert_eq!(fs::metadata(&path).unwrap().len(), 0);
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"key", b"value");
     db.write(&mut batch).await.unwrap();
@@ -4627,7 +4678,9 @@ async fn a_file_store_shrinks_once_its_end_is_free() {
     let path = dir.path().join("encina.db");
     let len = || std::fs::metadata(&path).unwrap().len();
     let key = |i: u32| i.to_be_bytes();
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     let mut batch = WriteBatch::new();
     for i in 0..20_000u32 {
         batch.put(&key(i), &key(i * 2));
@@ -4644,7 +4697,9 @@ async fn a_file_store_shrinks_once_its_end_is_free() {
     assert!(len() < full / 2, "{} of {full} bytes", len());
     db.close().await.unwrap();
 
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, Options::default())
+        .await
+        .unwrap();
     let mut iter = db.range(..);
     let mut count = 0u32;
     while let Some((k, v)) = iter.next().await.unwrap() {
@@ -5373,7 +5428,7 @@ async fn metrics_name_the_store_by_its_path() {
     // Files take pages of 4 KiB at least.
     let opts = metered(test).page_size(4096);
     let path = dir.path().join("a.db");
-    let db = Db::open(&path, opts.clone()).await.unwrap();
+    let db = Db::open(&DefaultEnv, &path, opts.clone()).await.unwrap();
     db.write(&mut batch_of(&[Op::Put(vec![1], vec![1])]))
         .await
         .unwrap();
@@ -5381,7 +5436,9 @@ async fn metrics_name_the_store_by_its_path() {
 
     // The options can name it otherwise.
     let opts = opts.metric_attributes(&[KeyValue::new("encina.store", "ledgers")]);
-    let db = Db::open(dir.path().join("b.db"), opts).await.unwrap();
+    let db = Db::open(&DefaultEnv, dir.path().join("b.db"), opts)
+        .await
+        .unwrap();
     db.write(&mut batch_of(&[Op::Delete(vec![1])]))
         .await
         .unwrap();

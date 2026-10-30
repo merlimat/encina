@@ -107,7 +107,7 @@ impl Scan {
     /// Stops the scan at error `e`, letting go of the reads it holds. It keeps the
     /// version it holds: writes fail from now on, so none replaces it. Returns a
     /// copy of the error.
-    pub(crate) fn fail(&mut self, e: Error, reads: &mut Reads, pool: &mut Pool) -> Error {
+    pub(crate) fn fail<R>(&mut self, e: Error, reads: &mut Reads<R>, pool: &mut Pool) -> Error {
         self.release(reads, pool);
         let copy = e.duplicate();
         self.error = Some(e);
@@ -115,7 +115,7 @@ impl Scan {
     }
 
     /// Lets go of the reads it holds.
-    pub(crate) fn release(&mut self, reads: &mut Reads, pool: &mut Pool) {
+    pub(crate) fn release<R>(&mut self, reads: &mut Reads<R>, pool: &mut Pool) {
         for k in 0..self.len {
             if let Some(slot) = self.at(k).1.take() {
                 reads.leave(slot, pool);

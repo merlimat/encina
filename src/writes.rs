@@ -18,6 +18,10 @@
 //! they arrive. Once the commit ends, whichever of them runs first commits the
 //! whole group, and the others get its outcome. No write depends on another being
 //! polled, except on the one committing.
+//!
+//! Each write has a class (see [`Disk::Class`](crate::Disk::Class)). A commit's
+//! requests take the greatest class among the writes it commits and those that
+//! wait for it: a write that waits behind a commit raises its later requests.
 
 use std::mem;
 use std::task::{Context, Poll, Waker};
@@ -57,9 +61,11 @@ enum State {
     Committing,
 }
 
-/// A write waiting for a commit.
+/// A write waiting for a commit, of class `C`.
 #[derive(Default)]
-struct Member {
+struct Member<C> {
+    /// Its class, while the slot is held.
+    class: Option<C>,
     /// The group it joined, if it has yet.
     group: Option<u64>,
     /// The indexes of its operations in that group's batch.
@@ -69,9 +75,11 @@ struct Member {
     waker: Option<Waker>,
 }
 
-pub(crate) struct Writes {
+pub(crate) struct Writes<C> {
     /// A write is committing. The others wait.
     busy: bool,
+    /// The class of the commit's requests.
+    class: C,
     /// The group being committed, or waiting to be: its writes' batches, appended
     /// in the order they joined, with how many writes it holds.
     current: WriteBatch,
@@ -86,16 +94,17 @@ pub(crate) struct Writes {
     next_group: u64,
     /// The writes waiting, by slot, and the free slots. Slots are reused, so once
     /// warmed up, waiting allocates nothing; neither do the groups' batches.
-    members: Vec<Member>,
+    members: Vec<Member<C>>,
     free: Vec<usize>,
     /// The memory a group's batches may take: `GROUP_SIZE`, or less in tests.
     limit: usize,
 }
 
-impl Writes {
-    pub(crate) fn new() -> Writes {
+impl<C: Copy + Ord + Default> Writes<C> {
+    pub(crate) fn new() -> Writes<C> {
         Writes {
             busy: false,
+            class: C::default(),
             current: WriteBatch::new(),
             current_writes: 0,
             state: State::Idle,
@@ -109,14 +118,15 @@ impl Writes {
         }
     }
 
-    /// Moves along the write that holds `slot`, or none yet, with `batch`: it
-    /// commits alone if nothing else is going on, otherwise it joins the next
-    /// group. Then it waits until it can commit its group, or until another write
-    /// has.
+    /// Moves along the write of `class` that holds `slot`, or none yet, with
+    /// `batch`: it commits alone if nothing else is going on, otherwise it joins
+    /// the next group. Then it waits until it can commit its group, or until
+    /// another write has.
     pub(crate) fn poll(
         &mut self,
         slot: &mut Option<usize>,
         batch: &WriteBatch,
+        class: C,
         cx: &mut Context<'_>,
     ) -> Poll<Turn> {
         let s = match *slot {
@@ -124,9 +134,10 @@ impl Writes {
             None if !self.busy && self.state == State::Idle && self.next_writes == 0 => {
                 self.busy = true;
                 self.changed = false;
+                self.class = class;
                 return Poll::Ready(Turn::Alone);
             }
-            None => *slot.insert(self.enter()),
+            None => *slot.insert(self.enter(class)),
         };
         if let Some(result) = self.members[s].result.take() {
             *slot = None;
@@ -150,17 +161,28 @@ impl Writes {
             self.state = State::Building;
             self.busy = true;
             self.changed = false;
+            // The writes that waited, in its group or for the next one, and not
+            // those whose outcome another group's commit gave them.
+            let waited = self.members.iter().filter(|m| m.result.is_none());
+            self.class = waited.filter_map(|m| m.class).fold(class, C::max);
             if !own {
                 return Poll::Ready(Turn::Lead(None));
             }
             *slot = None;
             return Poll::Ready(Turn::Lead(Some(s)));
         }
+        // It waits for the commit in progress, which takes its class if greater.
+        self.class = self.class.max(class);
         let waker = &mut self.members[s].waker;
         if !waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
             *waker = Some(cx.waker().clone());
         }
         Poll::Pending
+    }
+
+    /// The class of the commit in progress.
+    pub(crate) fn class(&self) -> C {
+        self.class
     }
 
     /// The current group's batch.
@@ -257,11 +279,13 @@ impl Writes {
         self.wake_all();
     }
 
-    fn enter(&mut self) -> usize {
-        self.free.pop().unwrap_or_else(|| {
+    fn enter(&mut self, class: C) -> usize {
+        let slot = self.free.pop().unwrap_or_else(|| {
             self.members.push(Member::default());
             self.members.len() - 1
-        })
+        });
+        self.members[slot].class = Some(class);
+        slot
     }
 
     fn free_slot(&mut self, slot: usize) {
