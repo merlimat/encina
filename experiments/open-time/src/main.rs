@@ -13,7 +13,7 @@ use std::env;
 use std::fs;
 use std::time::{Duration, Instant};
 
-use encina::{Comparison, Db, Files, Options, WriteBatch};
+use encina::{Comparison, Db, DefaultEnv, Options, WriteBatch};
 
 const KEY: usize = 32;
 const VALUE: usize = 100;
@@ -79,7 +79,7 @@ async fn main() {
 }
 
 async fn build(path: &str, entries: u64) {
-    let db = Db::open(&Files, path, Options::default()).await.unwrap();
+    let db = Db::open(&DefaultEnv, path, Options::default()).await.unwrap();
     let mut batch = WriteBatch::new();
     let (mut k, mut v) = ([0; KEY], [0; VALUE]);
     let start = Instant::now();
@@ -103,7 +103,7 @@ async fn open(path: &str, entries: u64, cache_mb: usize) {
     let opts = Options::default().cache_size(cache_mb << 20);
     let io = read_bytes();
     let start = Instant::now();
-    let db = Db::open(&Files, path, opts).await.unwrap();
+    let db = Db::open(&DefaultEnv, path, opts).await.unwrap();
     let opened = start.elapsed();
     let at_open = read_bytes() - io;
     // Cold lookups of random keys, right after the open.

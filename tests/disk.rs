@@ -54,8 +54,8 @@ struct State {
     broken: Cell<bool>,
     /// The opens asked of the env, with their access.
     opens: RefCell<Vec<(PathBuf, Access)>>,
-    /// While set, an owner's open fails, as with `Files` while another owner has
-    /// the file.
+    /// While set, an owner's open fails, as with `DefaultEnv` while another owner
+    /// has the file.
     taken: Cell<bool>,
 }
 

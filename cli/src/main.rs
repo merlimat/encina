@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use encina::{Comparison, Db, Files, Options, PageInfo, ReadOnlyDb, WriteBatch};
+use encina::{Comparison, Db, DefaultEnv, Options, PageInfo, ReadOnlyDb, WriteBatch};
 
 /// How many times in a row a read opens a new view of the store, after finding
 /// that the store's owner overwrote the version its view reads.
@@ -285,7 +285,7 @@ fn at(path: &Path, e: encina::Error) -> Box<dyn Error> {
 async fn write(path: &Path, batch: &mut WriteBatch) -> Result<(), Box<dyn Error>> {
     // Each command is a write of its own, of a few pages: taking any free page
     // keeps the file small, at the cost of a request or two.
-    let db = Db::open(&Files, path, Options::default().min_run_pages(1))
+    let db = Db::open(&DefaultEnv, path, Options::default().min_run_pages(1))
         .await
         .map_err(|e| at(path, e))?;
     db.write(batch).await.map_err(|e| at(path, e))
@@ -304,7 +304,7 @@ async fn get(path: &Path, key: &[u8]) -> encina::Result<Option<Vec<u8>>> {
     let mut stale = 0;
     loop {
         let read = async {
-            let db = ReadOnlyDb::open(&Files, path, Options::default()).await?;
+            let db = ReadOnlyDb::open(&DefaultEnv, path, Options::default()).await?;
             db.get(key, Comparison::Equal, |_k, v| v.to_vec()).await
         };
         match read.await {
@@ -340,7 +340,7 @@ async fn read_pages(path: &Path) -> Result<Store, Box<dyn Error>> {
     let mut stale = 0;
     let (page_size, entry_count, entry_size, nodes) = loop {
         let read = async {
-            let db = ReadOnlyDb::open(&Files, path, Options::default()).await?;
+            let db = ReadOnlyDb::open(&DefaultEnv, path, Options::default()).await?;
             let mut nodes = Vec::new();
             db.pages(|info| nodes.push(info)).await?;
             Ok((db.page_size(), db.entry_count(), db.entry_size(), nodes))
@@ -392,7 +392,7 @@ async fn scan(
     let mut last: Option<Vec<u8>> = None;
     let mut stale = 0;
     loop {
-        let db = match ReadOnlyDb::open(&Files, path, Options::default()).await {
+        let db = match ReadOnlyDb::open(&DefaultEnv, path, Options::default()).await {
             Ok(db) => db,
             Err(encina::Error::Stale) if stale < MAX_STALE => {
                 stale += 1;

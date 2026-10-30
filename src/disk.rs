@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Where a store runs: the env that opens its disk and runs its task, and the disk
-//! that keeps its pages. [`Files`] keeps stores in files, on compio.
+//! that keeps its pages. [`DefaultEnv`] keeps stores in files, on compio.
 
 use std::future::Future;
 use std::io;
@@ -41,8 +41,8 @@ const BLOCK: u64 = 4096;
 /// Where a store runs: what opens its file, runs its task, and lets it read the
 /// clock, or not.
 ///
-/// [`Files`] keeps stores in files, on the current compio runtime. A caller that
-/// runs its own I/O, such as a scheduler that orders the requests of several
+/// [`DefaultEnv`] keeps stores in files, on the current compio runtime. A caller
+/// that runs its own I/O, such as a scheduler that orders the requests of several
 /// stores, or a simulation that replays a run from its seed, implements this trait
 /// and [`Disk`] instead. Either way, [`Db::open`](crate::Db::open) and
 /// [`ReadOnlyDb::open`](crate::ReadOnlyDb::open) take the env, the store's path and
@@ -56,12 +56,12 @@ pub trait Env {
     /// The disk that [`open`](Self::open) opens.
     type Disk: Disk;
 
-    /// Opens the store's file at `path`, which the env interprets: [`Files`] opens
-    /// it in the file system.
+    /// Opens the store's file at `path`, which the env interprets: [`DefaultEnv`]
+    /// opens it in the file system.
     ///
     /// For [`ReadWrite`](Access::ReadWrite), the store's owner, it creates the file
     /// if needed, empty, and keeps out other owners until the disk closes: two
-    /// would corrupt the store. [`Files`] fails a second owner's open with
+    /// would corrupt the store. [`DefaultEnv`] fails a second owner's open with
     /// [`Error::Locked`](crate::Error::Locked). A file it creates must outlast a
     /// crash once a sync of the disk has finished. For
     /// [`ReadOnly`](Access::ReadOnly), a view, it opens the file as it is.
@@ -99,9 +99,9 @@ pub enum Access {
 
 /// The disk a store keeps its pages on, which its [`Env`] opens.
 ///
-/// [`Files`] opens a [`FileDisk`], which reads and writes a file with direct I/O on
-/// the current compio runtime. A caller that runs its own I/O implements this
-/// trait, and an [`Env`] that opens it.
+/// [`DefaultEnv`] opens a [`FileDisk`], which reads and writes a file with direct
+/// I/O on the current compio runtime. A caller that runs its own I/O implements
+/// this trait, and an [`Env`] that opens it.
 ///
 /// The disk holds one store, from offset 0: two meta pages, then the tree's. The
 /// store calls it from the thread it runs on.
@@ -289,18 +289,18 @@ impl IoBuf for WriteBuf {
     }
 }
 
-/// The env of stores in files. It opens each with direct I/O, as a [`FileDisk`],
-/// runs the store's task on the current compio runtime, and lets writes pause by
-/// the real clock.
+/// The env to open a store in unless the caller runs its own I/O: it keeps stores in
+/// files. It opens each with direct I/O, as a [`FileDisk`], runs the store's task on
+/// the current compio runtime, and lets writes pause by the real clock.
 ///
 /// An owner's open locks the file until its disk closes, so that a second owner, in
 /// this process or another, fails with [`Error::Locked`](crate::Error::Locked); a
 /// view's takes no lock. A new file's directory is synced, which makes its name
 /// durable.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Files;
+pub struct DefaultEnv;
 
-impl Env for Files {
+impl Env for DefaultEnv {
     type Disk = FileDisk;
 
     async fn open(&self, path: &Path, access: Access) -> Result<FileDisk> {
@@ -319,8 +319,8 @@ impl Env for Files {
     }
 }
 
-/// The disk of a store in a file, which [`Files`] opens. It reads and writes the
-/// file with direct I/O on the current compio runtime.
+/// The disk of a store in a file, which [`DefaultEnv`] opens. It reads and writes
+/// the file with direct I/O on the current compio runtime.
 pub struct FileDisk {
     file: File,
 }

@@ -410,17 +410,17 @@ impl Db<Rc<crate::sim::SimDisk>> {
 
 impl<D: Disk> Db<D> {
     /// Opens the store at `path` in `env`, creating it if needed: in a file, with
-    /// [`Files`](crate::Files).
+    /// [`DefaultEnv`](crate::DefaultEnv).
     ///
     /// A new store takes its page size from `opts`, 4 KiB if it sets none. An
     /// existing one keeps the page size it was created with: this fails with
     /// [`Error::PageSizeMismatch`] if `opts` sets another.
     ///
-    /// A store has one owner at a time, which the env sees to: with `Files`, this
-    /// fails with [`Error::Locked`] while another `Db`, in this process or another,
-    /// has it open. That `Db` lets go once it, its clones and its iterators are
-    /// closed or dropped, and any I/O it started has finished. A [`ReadOnlyDb`] can
-    /// read the store meanwhile.
+    /// A store has one owner at a time, which the env sees to: with `DefaultEnv`,
+    /// this fails with [`Error::Locked`] while another `Db`, in this process or
+    /// another, has it open. That `Db` lets go once it, its clones and its
+    /// iterators are closed or dropped, and any I/O it started has finished. A
+    /// [`ReadOnlyDb`] can read the store meanwhile.
     ///
     /// Opening reads the internal nodes above the leaves' parents, a fraction of a
     /// percent of the internal nodes, and returns: the store serves reads and
@@ -637,7 +637,7 @@ impl<D: Disk> Db<D> {
     /// entries' locations:
     ///
     /// ```
-    /// # use encina::{Comparison, Db, Files, Options, WriteBatch};
+    /// # use encina::{Comparison, Db, DefaultEnv, Options, WriteBatch};
     /// fn key(ledger: u64, entry: u64) -> [u8; 16] {
     ///     let mut key = [0; 16];
     ///     key[..8].copy_from_slice(&ledger.to_be_bytes());
@@ -652,7 +652,7 @@ impl<D: Disk> Db<D> {
     /// # compio::runtime::Runtime::new().unwrap().block_on(async {
     /// # let dir = tempfile::tempdir().unwrap();
     /// # let path = dir.path().join("data.db");
-    /// # let db = Db::open(&Files, &path, Options::default()).await?;
+    /// # let db = Db::open(&DefaultEnv, &path, Options::default()).await?;
     /// # let mut batch = WriteBatch::new();
     /// # for entry in 0..3u64 {
     /// #     batch.put(&key(7, entry), &(entry * 1024).to_be_bytes());

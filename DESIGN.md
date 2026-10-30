@@ -1062,7 +1062,7 @@ same 282 MiB.
   BookKeeper already keeps one index per ledger directory; here, one instance per
   core or shard plays the same role. A `Send` facade (compio dispatcher or
   channels) can come later.
-- **One owner per file.** In `Files`, opening takes an exclusive `flock` on the
+- **One owner per file.** In `DefaultEnv`, opening takes an exclusive `flock` on the
   file, which closing it releases, so a second open fails with `Error::Locked`
   instead of corrupting the store. A `flock` lock belongs to the open file rather
   than to the process, so it also stops a second open from another thread of the
@@ -1087,14 +1087,14 @@ same 282 MiB.
 - **The scan of level 1** that follows an open (§7) runs in a task the store
   spawns through its env, the one task a store has. The task holds the store
   weakly, and strongly only while it is polled, so that it neither keeps a store
-  open nor outlives it: dropping the store wakes it, and it ends. `Files` spawns
+  open nor outlives it: dropping the store wakes it, and it ends. `DefaultEnv` spawns
   it on the compio runtime that opened the store, and detaches it.
 
 ### The env and the disk
 
-A store opens in an `Env`, which opens its file as a `Disk` (§10). `Files` keeps
-stores in files on compio (below). An env the caller implements may send every
-request through an I/O scheduler of the caller's, or simulate a disk, in a
+A store opens in an `Env`, which opens its file as a `Disk` (§10). `DefaultEnv`
+keeps stores in files on compio (below). An env the caller implements may send
+every request through an I/O scheduler of the caller's, or simulate a disk, in a
 simulation that replays a run from its seed, as encina's own tests do (§11).
 `Db::open` and `ReadOnlyDb::open` take the env, the store's path and its options.
 The env:
@@ -1152,8 +1152,8 @@ so, which it doesn't by default, no clock decides what the store does either: a
 write pauses after 163,840 units of work, about a millisecond of a sorted load's
 merge, rather than after a millisecond (§6). Given the same requests and the same
 outcomes from its disk, the store then does the same, as a simulation that
-replays a run from its seed needs. `Files` lets the store read the clock. Metrics
-time what the store does either way, which decides nothing.
+replays a run from its seed needs. `DefaultEnv` lets the store read the clock.
+Metrics time what the store does either way, which decides nothing.
 
 Units of work measure time only roughly: those of other steps take up to five
 times as long, and a merge's scattered operations a fifth (§6). Measured once with
@@ -1206,7 +1206,7 @@ what an env allocates to open a store and run its task.
 
 ### Files
 
-`Files` keeps a store in a file, a `FileDisk`, which an owner's open locks (above):
+`DefaultEnv` keeps a store in a file, a `FileDisk`, locked by its owner (above):
 
 - All file I/O goes through compio 0.19: `read_at` / `write_at` on `&File`, with
   frames as the owned buffers, `sync_data`, and `set_len` to cut the file. A commit
@@ -1234,7 +1234,7 @@ what an env allocates to open a store and run its task.
 
 ```rust
 /// Where a store runs (§9): what opens its file, runs its task, and lets it read
-/// the clock, or not. `Files` keeps stores in files, on compio.
+/// the clock, or not. `DefaultEnv` keeps stores in files, on compio.
 pub trait Env {
     type Disk: Disk;
 
@@ -1274,7 +1274,7 @@ pub trait Disk: Sized + 'static {
 pub struct Db<D: Disk = FileDisk> { /* Rc<Inner<D>>, and a class */ }
 
 impl<D: Disk> Db<D> {
-    /// Opens the store at `path` in `env`: `Db::open(&Files, path, opts)` in a
+    /// Opens the store at `path` in `env`: `Db::open(&DefaultEnv, path, opts)` in a
     /// file.
     pub async fn open<E: Env<Disk = D>>(
         env: &E,
