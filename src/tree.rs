@@ -145,9 +145,13 @@ impl Pages {
         (frame, page, used)
     }
 
-    /// The cached frame of a leaf or level-1 page.
-    pub(crate) fn cached(&mut self, page: u64) -> Option<FrameId> {
-        self.cache.get(&mut self.pool, page)
+    /// The cached frame of the leaf or level-1 node on `page`, if the node is at
+    /// `level`. The cache keeps both alike, and a corrupt tree can list a page at
+    /// both levels: where it lists the page at the other one, the node misses, and
+    /// the read that follows fails its checks, as it would had it come first.
+    pub(crate) fn cached(&mut self, page: u64, level: u8) -> Option<FrameId> {
+        let frame = self.cache.get(&mut self.pool, page)?;
+        (Node::new(self.pool.page(frame)).level() == level).then_some(frame)
     }
 
     /// Caches the leaf or level-1 page just read into `frame`. Reads of a page are
@@ -554,7 +558,7 @@ impl Tree {
         if root.level > 1 {
             return Ok(root.frame);
         }
-        self.pages.cached(root.page).ok_or(root.page)
+        self.pages.cached(root.page, 1).ok_or(root.page)
     }
 
     /// The frame of the internal child at entry `i` of the node above level 1 in
@@ -566,7 +570,7 @@ impl Tree {
             return Ok(node.child(i));
         }
         let page = node.child_page(i);
-        self.pages.cached(page).ok_or(page)
+        self.pages.cached(page, 1).ok_or(page)
     }
 
     /// Descends from `root` through the internal nodes towards `key`, recording the
@@ -756,7 +760,7 @@ impl Tree {
     /// The frame holding leaf `page`, if it is cached, counted as a cache hit if
     /// `count`.
     fn cached_leaf(&mut self, page: u64, count: bool) -> Option<FrameId> {
-        let frame = self.pages.cached(page)?;
+        let frame = self.pages.cached(page, 0)?;
         if count {
             self.pages.cache.hits.add(1);
         }
@@ -833,7 +837,7 @@ impl Tree {
             return frame;
         }
         self.pages
-            .cached(page)
+            .cached(page, 1)
             .expect("the write loads the level-1 nodes it reads")
     }
 
@@ -1427,7 +1431,7 @@ impl Tree {
         if !m.active {
             let frame = page.map_or(NO_FRAME, |page| {
                 self.pages
-                    .cached(page)
+                    .cached(page, 0)
                     .expect("the write loads the leaves it changes")
             });
             m = LeafMerge {
@@ -1782,7 +1786,7 @@ impl Tree {
             }
             let frame = if level > 1 {
                 item.frame
-            } else if let Some(frame) = self.pages.cached(item.page) {
+            } else if let Some(frame) = self.pages.cached(item.page, level as u8) {
                 frame
             } else {
                 continue;
@@ -1868,7 +1872,7 @@ impl Tree {
             }
             *frame = if level > 1 {
                 item.frame
-            } else if let Some(frame) = self.pages.cached(item.page) {
+            } else if let Some(frame) = self.pages.cached(item.page, level as u8) {
                 frame
             } else {
                 return false;
@@ -2446,7 +2450,7 @@ impl Tree {
             if node::span(page) > 0 {
                 // Its key is its parent's key for it.
                 let lo = lo.expect("a value leaf at the root");
-                if let Some(frame) = self.pages.cached(page) {
+                if let Some(frame) = self.pages.cached(page, 0) {
                     let leaf = ValueLeaf::new(self.pages.pool.page(frame));
                     assert_eq!(leaf.key(), lo, "value leaf under another key");
                     let bytes = (leaf.key().len() + leaf.value().len()) as u64;
@@ -2455,7 +2459,7 @@ impl Tree {
                 assert_eq!(size.entries, 1, "value leaf miscounted");
                 return None;
             }
-            let frame = self.pages.cached(page)?;
+            let frame = self.pages.cached(page, 0)?;
             self.pages.pool.page(frame).to_vec()
         } else if level == 1 {
             // The cache's entries are checked with the cache.

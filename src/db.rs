@@ -1429,7 +1429,7 @@ impl Load<'_> {
         let mut reads = inner.reads.borrow_mut();
         loop {
             if self.slot.is_none() {
-                if let Some(frame) = tree.pages.cached(page) {
+                if let Some(frame) = tree.pages.cached(page, level) {
                     if !self.missed {
                         tree.pages.cache.hits.add(1);
                     }
@@ -2092,7 +2092,7 @@ impl Iter {
         let mut reads = inner.reads.borrow_mut();
         loop {
             if self.waiting.is_none() {
-                if tree.pages.cached(page).is_some() {
+                if tree.pages.cached(page, 1).is_some() {
                     return Poll::Ready(Ok(()));
                 }
                 tree.pages.cache.misses.add(1);
@@ -2123,7 +2123,7 @@ impl Iter {
             if self.waiting.is_none() {
                 if self.ahead.front() == Some(page) {
                     self.waiting = self.ahead.pop();
-                } else if let Some(frame) = tree.pages.cached(page) {
+                } else if let Some(frame) = tree.pages.cached(page, 0) {
                     if !mem::take(&mut self.missed) {
                         tree.pages.cache.hits.add(1);
                     }
@@ -2359,7 +2359,7 @@ impl Ahead {
             // `next` is at stays pinned meanwhile.
             let mut pinned = None;
             hold_level_1(&tree.pages.pool, &mut pinned, &next);
-            let read = if pages == 0 || tree.pages.cached(page).is_some() {
+            let read = if pages == 0 || tree.pages.cached(page, 0).is_some() {
                 Ok(None)
             } else {
                 read_ahead(inner, tree, reads, page).map(Some).ok_or(())
