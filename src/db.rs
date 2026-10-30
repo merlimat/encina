@@ -1376,9 +1376,14 @@ impl Drop for Queued<'_> {
 
 /// Reads the value leaf with page id `page`, which the cache doesn't keep, into a
 /// buffer, `old` if it is large enough, and checks it. No value leaf a reader can
-/// reach was written after the current generation.
+/// reach was written after the current generation, or lies past the high-water
+/// mark: the span its parent gives is checked before the buffer is taken, since
+/// the open no longer checks it (see [`Scan`]).
 async fn read_value_leaf(inner: &Inner, page: u64, old: Option<ValueBuf>) -> Result<ValueBuf> {
     let first = node::first_page(page);
+    if first + node::span(page) > inner.tree.borrow().pages.space.high_water() {
+        return Err(Error::Corruption { page: first });
+    }
     let len = node::span(page) as usize * inner.page_size;
     let buf = ValueBuf::new(old, len);
     inner.metrics.read.add(len);
@@ -1510,7 +1515,7 @@ fn poll_read(
 
 /// Checks and caches the page a claimed read brought in, a leaf or a level-1 node
 /// at `level`, pinning its frame. No node a reader can reach was written after
-/// `generation`, the current one.
+/// `generation`, the current one, or lies past the high-water mark.
 fn finish(
     pages: &mut Pages,
     page: u64,
@@ -1522,14 +1527,16 @@ fn finish(
     pages.pool.retain(frame);
     drop(buf);
     let bytes = pages.pool.page(frame);
-    let intact = if node::span(page) > 0 {
-        node::verify_value_leaf(bytes, pages.pool.page_size())
-            && ValueLeaf::new(bytes).generation() <= generation
-    } else {
-        node::verify(bytes)
-            && Node::new(bytes).level() == level
-            && Node::new(bytes).generation() <= generation
-    };
+    let within = node::first_page(page) + node::pages(page) <= pages.space.high_water();
+    let intact = within
+        && if node::span(page) > 0 {
+            node::verify_value_leaf(bytes, pages.pool.page_size())
+                && ValueLeaf::new(bytes).generation() <= generation
+        } else {
+            node::verify(bytes)
+                && Node::new(bytes).level() == level
+                && Node::new(bytes).generation() <= generation
+        };
     if res.is_err() || !intact {
         pages.pool.unref(frame);
         pages.pool.free(frame);

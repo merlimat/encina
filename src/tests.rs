@@ -1943,6 +1943,66 @@ fn the_file_bounds_the_high_water_mark() {
 }
 
 #[test]
+fn nodes_past_the_high_water_mark_are_corrupt() {
+    // A four-page file whose root, at level 1, lists past the mark of 3 pages: a
+    // value leaf of a million pages, too many to cache, one of two, and a leaf on
+    // page 3, which holds one. The open reads none of them: reads find them corrupt,
+    // the first without taking a buffer as large as its span, or reading it.
+    let opts = Options::new().page_size(256);
+    let mut file = vec![0; 4 * 256];
+    let size = node::Size {
+        entries: 1,
+        bytes: 2,
+    };
+    let children = [node::spanned(3, 1 << 20), node::spanned(3, 2), 3];
+    let mut buf = node::EntryBuf::default();
+    for (key, page) in [b"a", b"b", b"c"].into_iter().zip(children) {
+        buf.push(key, &node::child_ref(node::Child::leaf(page, size)));
+    }
+    node::build(&mut file[512..768], 1, &buf, 0, 3);
+    node::seal(&mut file[512..768], 0);
+    let mut leaf = node::EntryBuf::default();
+    leaf.push(b"c", b"3");
+    node::build(&mut file[768..], 0, &leaf, 0, 1);
+    node::seal(&mut file[768..], 0);
+    Meta {
+        root: 2,
+        root_level: 1,
+        high_water: 3,
+        entries: 3,
+        entry_bytes: 6,
+        ..Meta::empty(256)
+    }
+    .encode(&mut file[..256]);
+    let disk = SimDisk::new();
+    disk.set_bytes(0, &file);
+    let view = now(ReadOnlyDb::open_sim(disk.clone(), opts.clone())).unwrap();
+    let db = now(Db::open_sim(disk.clone(), opts)).unwrap();
+    for key in [b"a", b"b", b"c"] {
+        let found = view_get(&view, key, Comparison::Equal);
+        assert!(
+            matches!(found, Err(Error::Corruption { page: 3 })),
+            "{found:?}"
+        );
+        let found = now(db.get(key, Comparison::Equal, |_, _| ()));
+        assert!(
+            matches!(found, Err(Error::Corruption { page: 3 })),
+            "{found:?}"
+        );
+    }
+    // The root is cached now.
+    let ops = disk.ops();
+    let found = now(db.get(b"a", Comparison::Equal, |_, _| ()));
+    assert!(
+        matches!(found, Err(Error::Corruption { page: 3 })),
+        "{found:?}"
+    );
+    assert_eq!(disk.ops(), ops, "the value leaf was read");
+    let scanned = now(db.scan_level_1(usize::MAX));
+    assert!(matches!(scanned, Err(Error::Corruption { page: 3 })));
+}
+
+#[test]
 fn a_view_reads_the_file_length_after_the_meta_page() {
     // The owner commits a larger version after the view read the file's length,
     // but before it read the meta page: the view opens that version, whose pages

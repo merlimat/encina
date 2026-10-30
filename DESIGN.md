@@ -838,9 +838,11 @@ to 4,540 averaging 158 KiB, and made it three times as fast.
 No page past the end of the file is in use, since a commit writes its tree before
 its meta page. So the open takes the end of the file as the high-water mark if it
 comes first, which bounds the bitmap's memory by the file, and a page the tree
-lists past it is corrupt: the open and the scan find it so, and a read of it
-fails with `Error::Corruption`. The mark can lie past the end of a store's file: a
-write may free again the last pages it took, which it then doesn't write. A
+lists past it is corrupt. The open and the scan find it so, and so does a read,
+which checks a node's pages against the mark before it reads them, with
+`Error::Corruption`: the span that a value leaf's parent gives never sizes a
+buffer past the file. The mark can lie past the end of a store's file: a write
+may free again the last pages it took, which it then doesn't write. A
 read-only view reads the file's length once it has read the meta page, as the
 owner may have committed past the length the view read first.
 
@@ -1278,12 +1280,14 @@ complete without suspending.
   internal node above level 1 fails the open, both with `Error::Corruption`. One
   in a level-1 node fails the reads that need it, and stops the scan of level 1:
   writes then fail with that error. A child reference past the end of the file
-  or to a page already used fails the open, and at level 1, the scan. So does a
+  or to a page already used fails the open, and at level 1, the scan. A leaf or
+  a value leaf that a level-1 node lists past the high-water mark fails the
+  reads that need it too, before any buffer is taken for its span. So does a
   node whose checksum matches but whose entries lie outside it: a slotted leaf
   whose value runs past its page fails the reads, and an internal node whose
   child reference is short fails the open, or at level 1, the reads and the
-  scan. Format tests move each part of a slotted
-  node out of place in turn, and seal it again. A flipped bit in meta slot 0
+  scan. Format tests move each part of a slotted node out of place in turn, and
+  seal it again. A flipped bit in meta slot 0
   leaves slot 1, which the open finds where each page size would put it. A file
   of zeros, or with meta pages built from bad fields, isn't a store
   (`Error::InvalidFile`): among them, a high-water mark that leaves out a meta page,
@@ -1345,8 +1349,8 @@ complete without suspending.
   - `open`: a file opens on the simulated disk, as a read-only view and as its
     owner, or fails with an error. An open store answers a scan, lookups with every
     comparison and short scans from keys the scan found and keys beside them, and,
-    in the view, `pages`, with entries or errors. Writes to such a store aren't
-    fuzzed.
+    in the view, `pages`, with entries or errors; then the owner runs its scan of
+    level 1. Writes to such a store aren't fuzzed.
   - `node_round_trip`, `value_leaf_round_trip` and `meta_round_trip`: what the
     encoders write decodes back to what they were given. Sorted entries of any
     lengths are built into nodes a page's worth at a time, at levels 0 to 3, with
