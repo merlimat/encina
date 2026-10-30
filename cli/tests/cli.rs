@@ -146,6 +146,22 @@ fn hexdump() {
 }
 
 #[test]
+fn completions() {
+    // The script needs no -f, and completes the commands and their options.
+    let bash = ok(&["completions", "bash"]);
+    for word in ["delete-range", "--file", "--hexdump"] {
+        assert!(bash.contains(word), "{word} isn't completed");
+    }
+    assert_eq!(ok(&["-f", "data.db", "completions", "bash"]), bash);
+    for shell in ["elvish", "fish", "powershell", "zsh"] {
+        assert!(ok(&["completions", shell]).contains("delete-range"));
+    }
+
+    assert_eq!(encina(&["completions"]).status.code(), Some(2));
+    assert_eq!(encina(&["completions", "frob"]).status.code(), Some(2));
+}
+
+#[test]
 fn errors_leave_no_store() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.db");
