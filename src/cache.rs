@@ -231,7 +231,7 @@ impl Cache {
                 self.looked += 1;
             }
             let frame = *pool.frame(id);
-            if frame.holds == Holds::Nothing || pool.refs(id) != 0 {
+            if frame.holds == Holds::Nothing || !pool.unused(id) {
                 continue;
             }
             match frame.holds {

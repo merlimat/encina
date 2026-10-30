@@ -12,24 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A simulated disk for tests. It can fail any single operation, or crash during
-//! one: then only what was synced survives, plus whichever pages written since
-//! happen to have landed, with the write in progress torn. It can also hold leaf
-//! reads in flight, or syncs and cuts, until a test releases them, and delay
-//! writes, syncs and leaf reads while the runtime runs other tasks, as a real
-//! disk's take time.
+//! A simulated disk for tests, which implements [`Disk`] as a caller's disk does.
+//! It can fail any single operation, or crash during one: then only what was synced
+//! survives, plus whichever pages written since happen to have landed, with the
+//! write in progress torn. It can also hold reads in flight, or syncs and cuts,
+//! until a test releases them, and delay writes, syncs and reads while the
+//! runtime runs other tasks, as a real disk's take time.
+//!
+//! It runs no task: the tests drive the scan that follows an open themselves.
 
 use std::cell::RefCell;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::io;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::slice;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use compio::buf::IoBuf;
+use crate::disk::{Disk, ReadBuf, WriteBuf};
+use crate::options::MIN_PAGE_SIZE;
+use crate::pool::{Holds, Pool};
+use crate::{Db, ReadOnlyDb};
 
-use crate::pool::{FrameBuf, ValueBuf};
+/// A store on a simulated disk, and a view of one.
+pub(crate) type SimDb = Db<Rc<SimDisk>>;
+pub(crate) type SimView = ReadOnlyDb<Rc<SimDisk>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fault {
@@ -38,12 +46,16 @@ pub(crate) enum Fault {
     /// The machine crashes during the operation. It and every later operation
     /// fail; only a restart sees the disk again.
     Crash,
+    /// The operation works, but returns other buffers than it was given, and keeps
+    /// those until [`let_go`](SimDisk::let_go): a read returns one it fills, a
+    /// write one of its own, or none. A cut or a sync has none to swap.
+    Swap,
 }
 
-pub(crate) struct SimDisk(RefCell<Disk>);
+pub(crate) struct SimDisk(RefCell<State>);
 
 #[derive(Default)]
-struct Disk {
+struct State {
     /// What reads see.
     current: Vec<u8>,
     /// What survives a crash.
@@ -66,10 +78,12 @@ struct Disk {
     waiting: Vec<Waker>,
     /// The buffers of held reads that were cancelled, with their operation
     /// numbers. Like a kernel, the disk keeps them until the read finishes.
-    cancelled: Vec<(u64, FrameBuf)>,
+    cancelled: Vec<(u64, ReadBuf)>,
     /// What the disk holds from an operation number on, as if another process
     /// wrote it meanwhile.
     overwrite: Option<(u64, Vec<u8>)>,
+    /// The buffers that operations which swapped them kept.
+    kept: (Vec<ReadBuf>, Vec<WriteBuf>),
     /// Whether writes and syncs first let the runtime run other tasks, and how many
     /// have finished. Syncs then keep nothing for a crash.
     delay: bool,
@@ -80,7 +94,7 @@ struct Disk {
 
 impl SimDisk {
     pub(crate) fn new() -> Rc<SimDisk> {
-        Rc::new(SimDisk(RefCell::new(Disk::default())))
+        Rc::new(SimDisk(RefCell::new(State::default())))
     }
 
     pub(crate) fn len(&self) -> u64 {
@@ -143,17 +157,23 @@ impl SimDisk {
     pub(crate) fn restart(&self) -> Rc<SimDisk> {
         let disk = self.0.borrow();
         let image = disk.crashed.clone().unwrap_or_else(|| disk.current.clone());
-        let disk = Disk {
+        let disk = State {
             current: image.clone(),
             durable: image,
-            ..Disk::default()
+            ..State::default()
         };
         Rc::new(SimDisk(RefCell::new(disk)))
     }
 
+    /// Lets go of the buffers that operations which swapped them kept.
+    pub(crate) fn let_go(&self) {
+        self.0.borrow_mut().kept = Default::default();
+    }
+
     /// Counts an operation and applies a fault planned for it. `write` is where
-    /// the operation writes and what, if it does, for tearing.
-    fn begin(&self, write: Option<(usize, &[FrameBuf])>) -> io::Result<()> {
+    /// the operation writes and what, if it does, for tearing. Returns whether the
+    /// operation swaps its buffers.
+    fn begin(&self, write: Option<(usize, &[WriteBuf])>) -> io::Result<bool> {
         let mut disk = self.0.borrow_mut();
         if disk.crashed.is_some() {
             return Err(io::Error::other("the simulated machine crashed"));
@@ -166,6 +186,7 @@ impl SimDisk {
             disk.current = image;
         }
         match disk.fault {
+            Some((at, Fault::Swap)) if at == op => Ok(true),
             Some((at, fault)) if at == op => {
                 if fault == Fault::Crash {
                     disk.crash(op, write);
@@ -174,22 +195,8 @@ impl SimDisk {
                     "simulated {fault:?} at operation {op}"
                 )))
             }
-            _ => Ok(()),
+            _ => Ok(false),
         }
-    }
-
-    pub(crate) fn read(&self, mut buf: FrameBuf, offset: u64) -> (io::Result<()>, FrameBuf) {
-        let res = self
-            .begin(None)
-            .and_then(|()| self.fill(buf.bytes_mut(), offset));
-        (res, buf)
-    }
-
-    pub(crate) fn read_value(&self, mut buf: ValueBuf, offset: u64) -> (io::Result<()>, ValueBuf) {
-        let res = self
-            .begin(None)
-            .and_then(|()| self.fill(buf.bytes_mut(), offset));
-        (res, buf)
     }
 
     /// Copies what the disk holds at `offset` into `out`.
@@ -201,7 +208,7 @@ impl SimDisk {
         Ok(())
     }
 
-    /// Makes the leaf reads started from now on wait until released.
+    /// Makes the reads started from now on wait until released.
     pub(crate) fn hold(&self) {
         let mut disk = self.0.borrow_mut();
         disk.holding = true;
@@ -253,7 +260,7 @@ impl SimDisk {
         self.0.borrow_mut().delay = true;
     }
 
-    /// Makes each leaf read from now on take `time`, while the runtime runs other
+    /// Makes each read from now on take `time`, while the runtime runs other
     /// tasks, as the thread would while a real disk read the page.
     pub(crate) fn delay_reads(&self, time: Duration) {
         self.0.borrow_mut().read_time = Some(time);
@@ -302,8 +309,8 @@ impl SimDisk {
         .await;
     }
 
-    /// Starts a leaf read: returns its operation number and outcome.
-    fn start_read(&self) -> (u64, io::Result<()>) {
+    /// Starts a read: returns its operation number and outcome.
+    fn start_read(&self) -> (u64, io::Result<bool>) {
         let op = self.ops();
         (op, self.begin(None))
     }
@@ -320,60 +327,93 @@ impl SimDisk {
 
     /// Takes the buffer of read `op`, cancelled: it is dropped once the read
     /// would have finished.
-    fn cancel(&self, op: u64, buf: FrameBuf) {
+    fn cancel(&self, op: u64, buf: ReadBuf) {
         let mut disk = self.0.borrow_mut();
         if disk.is_held(op) {
             disk.cancelled.push((op, buf));
         }
     }
 
-    pub(crate) async fn write(&self, buf: FrameBuf, offset: u64) -> (io::Result<()>, FrameBuf) {
+    /// Writes `bufs` back to back from `offset`. Returns whether the write swaps
+    /// its buffers.
+    fn write_pages(&self, bufs: &[WriteBuf], offset: u64) -> io::Result<bool> {
+        let mut at = offset as usize;
+        let swap = self.begin(Some((at, bufs)))?;
+        let mut disk = self.0.borrow_mut();
+        disk.writes += 1;
+        for buf in bufs {
+            land(&mut disk.current, at, buf);
+            disk.unsynced.push((at, buf.len()));
+            disk.written += buf.len() as u64;
+            at += buf.len();
+        }
+        Ok(swap)
+    }
+}
+
+impl Disk for Rc<SimDisk> {
+    type Class = ();
+    type Read = SimRead;
+
+    async fn len(&self) -> io::Result<u64> {
+        Ok(SimDisk::len(self))
+    }
+
+    fn min_read(&self) -> usize {
+        MIN_PAGE_SIZE
+    }
+
+    fn read(&self, buf: ReadBuf, offset: u64, _: ()) -> SimRead {
+        SimRead::new(self.clone(), buf, offset)
+    }
+
+    async fn write(&self, buf: WriteBuf, offset: u64, _: ()) -> (io::Result<()>, WriteBuf) {
         self.delayed().await;
-        let res = self.write_pages(slice::from_ref(&buf), offset);
-        (res, buf)
+        match self.write_pages(slice::from_ref(&buf), offset) {
+            Ok(true) => {
+                // Another buffer as long, in memory of its own.
+                let mut pool = Pool::new(buf.len());
+                let frame = pool.alloc(Holds::Loading, 0);
+                let other = WriteBuf::new(pool.buf(frame));
+                self.0.borrow_mut().kept.1.push(buf);
+                (Ok(()), other)
+            }
+            res => (res.map(drop), buf),
+        }
     }
 
     /// Writes the pages in `bufs` back to back from `offset`, in one operation.
     /// Until a sync, each page lands, or not, on its own.
-    pub(crate) async fn write_run(
+    async fn write_vectored(
         &self,
-        bufs: Vec<FrameBuf>,
+        bufs: Vec<WriteBuf>,
         offset: u64,
-    ) -> (io::Result<()>, Vec<FrameBuf>) {
+        _: (),
+    ) -> (io::Result<()>, Vec<WriteBuf>) {
         self.delayed().await;
-        let res = self.write_pages(&bufs, offset);
-        (res, bufs)
-    }
-
-    fn write_pages(&self, bufs: &[FrameBuf], offset: u64) -> io::Result<()> {
-        let mut at = offset as usize;
-        self.begin(Some((at, bufs)))?;
-        let mut disk = self.0.borrow_mut();
-        disk.writes += 1;
-        for buf in bufs {
-            let data = buf.as_init();
-            land(&mut disk.current, at, data);
-            disk.unsynced.push((at, data.len()));
-            disk.written += data.len() as u64;
-            at += data.len();
+        match self.write_pages(&bufs, offset) {
+            Ok(true) => {
+                self.0.borrow_mut().kept.1.extend(bufs);
+                (Ok(()), Vec::new())
+            }
+            res => (res.map(drop), bufs),
         }
-        Ok(())
     }
 
     /// Cuts the disk at `len` bytes. Until a sync, a crash may undo it.
-    pub(crate) async fn set_len(&self, len: u64) -> io::Result<()> {
+    async fn set_len(&self, len: u64, _: ()) -> io::Result<()> {
         self.unheld().await;
         self.begin(None)?;
         self.0.borrow_mut().current.resize(len as usize, 0);
         Ok(())
     }
 
-    pub(crate) async fn sync(&self) -> io::Result<()> {
+    async fn sync(&self, _: ()) -> io::Result<()> {
         self.unheld().await;
         self.delayed().await;
         self.begin(None)?;
         let mut disk = self.0.borrow_mut();
-        let Disk {
+        let State {
             current,
             durable,
             unsynced,
@@ -390,22 +430,28 @@ impl SimDisk {
         }
         Ok(())
     }
+
+    /// Drops `task`: the tests drive the scan that follows an open.
+    fn spawn(&self, task: impl Future<Output = ()> + 'static) {
+        drop(task);
+    }
 }
 
-/// A leaf read on the simulated disk. It finishes when first polled, unless the
-/// disk holds or delays it.
+/// A read on the simulated disk. It finishes when first polled, unless the disk
+/// holds or delays it.
 pub(crate) struct SimRead {
     disk: Rc<SimDisk>,
     offset: u64,
-    buf: Option<FrameBuf>,
-    /// The read's operation number and outcome, once started.
-    started: Option<(u64, io::Result<()>)>,
+    buf: Option<ReadBuf>,
+    /// The read's operation number and outcome, once started: whether it swaps
+    /// its buffer, if it works.
+    started: Option<(u64, io::Result<bool>)>,
     /// When it finishes, if the disk delays it.
     done: Option<Instant>,
 }
 
 impl SimRead {
-    pub(crate) fn new(disk: Rc<SimDisk>, buf: FrameBuf, offset: u64) -> SimRead {
+    fn new(disk: Rc<SimDisk>, buf: ReadBuf, offset: u64) -> SimRead {
         SimRead {
             disk,
             offset,
@@ -414,23 +460,37 @@ impl SimRead {
             done: None,
         }
     }
+}
 
-    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<(io::Result<()>, FrameBuf)> {
-        let disk = &self.disk;
-        let (op, _) = self.started.get_or_insert_with(|| disk.start_read());
+impl Future for SimRead {
+    type Output = (io::Result<()>, ReadBuf);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let disk = &this.disk;
+        let (op, _) = this.started.get_or_insert_with(|| disk.start_read());
         if disk.holds(*op, cx.waker()) {
             return Poll::Pending;
         }
         if let Some(time) = disk.0.borrow().read_time {
-            let done = *self.done.get_or_insert_with(|| Instant::now() + time);
+            let done = *this.done.get_or_insert_with(|| Instant::now() + time);
             if Instant::now() < done {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
         }
-        let (_, res) = self.started.take().unwrap();
-        let mut buf = self.buf.take().unwrap();
-        let res = res.and_then(|()| self.disk.fill(buf.bytes_mut(), self.offset));
+        let (_, res) = this.started.take().unwrap();
+        let mut buf = this.buf.take().unwrap();
+        if let Ok(true) = res {
+            // Another buffer as long, a frame of a pool of its own.
+            let mut pool = Pool::new(MIN_PAGE_SIZE);
+            let frame = pool.alloc_large(Holds::Loading, 0, buf.len() / MIN_PAGE_SIZE);
+            let mut other = ReadBuf::frame(pool.buf(frame));
+            let res = this.disk.fill(&mut other, this.offset);
+            this.disk.0.borrow_mut().kept.0.push(buf);
+            return Poll::Ready((res, other));
+        }
+        let res = res.and_then(|_| this.disk.fill(&mut buf, this.offset));
         Poll::Ready((res, buf))
     }
 }
@@ -443,7 +503,7 @@ impl Drop for SimRead {
     }
 }
 
-impl Disk {
+impl State {
     fn is_held(&self, op: u64) -> bool {
         self.holding && op >= self.released
     }
@@ -461,7 +521,7 @@ impl Disk {
     /// Records what a crash during operation `op` leaves on disk: what was synced,
     /// plus a pseudo-random subset of the pages written since, plus the first half
     /// of the write in progress, if any.
-    fn crash(&mut self, op: u64, write: Option<(usize, &[FrameBuf])>) {
+    fn crash(&mut self, op: u64, write: Option<(usize, &[WriteBuf])>) {
         let mut image = self.durable.clone();
         let mut rng = op.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
         for &(at, len) in &self.unsynced {
@@ -473,8 +533,8 @@ impl Disk {
             }
         }
         if let Some((mut at, bufs)) = write {
-            let mut left = bufs.iter().map(|b| b.as_init().len()).sum::<usize>() / 2;
-            for buf in bufs.iter().map(FrameBuf::as_init) {
+            let mut left = bufs.iter().map(|b| b.len()).sum::<usize>() / 2;
+            for buf in bufs {
                 if left == 0 {
                     break;
                 }

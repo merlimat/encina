@@ -20,18 +20,21 @@
 //! reference counts live there too, so a buffer can drop its reference wherever
 //! the runtime drops it. Frames are the only memory the tree allocates.
 //!
+//! A frame's count keeps the references of the tree and its readers apart from
+//! those of I/O buffers. The tree decides when it is done with a frame by its own
+//! references, and a frame is reused only once no buffer is left either: a disk
+//! may keep a buffer it was given, and a frame the tree is done with waits, as one
+//! being read does, until the disk lets go.
+//!
 //! A value leaf that the cache keeps takes a large frame: one of several pages, in
 //! memory of its own, which `Memory` owns as well. Freeing a large frame gives its
 //! memory back.
 
 use std::alloc::{self, Layout};
 use std::cell::{Cell, RefCell};
-use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::slice;
-
-use compio::buf::{IoBuf, IoBufMut, SetLen};
 
 use crate::metrics::Amount;
 
@@ -42,6 +45,14 @@ const ALIGN: usize = 4096;
 
 /// The bit that marks the ids of large frames.
 const LARGE: FrameId = 1 << 31;
+
+/// One I/O buffer's reference in a frame's count, whose low half counts the tree's.
+const IO: u64 = 1 << 32;
+
+/// The tree's references in a frame's `count`.
+fn tree_refs(count: u64) -> u32 {
+    count as u32
+}
 
 /// What a frame holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +83,7 @@ pub(crate) struct Frame {
 struct Chunk {
     data: NonNull<u8>,
     /// Owns the reference counts, which `Pool` and `FrameBuf` reach by pointer.
-    _refs: Box<[Cell<u32>]>,
+    _refs: Box<[Cell<u64>]>,
 }
 
 /// A large frame's memory.
@@ -80,7 +91,7 @@ struct Large {
     data: NonNull<u8>,
     layout: Layout,
     /// Owns the reference count, which `Pool` and `FrameBuf` reach by pointer.
-    _refs: Box<Cell<u32>>,
+    _refs: Box<Cell<u64>>,
 }
 
 impl Drop for Large {
@@ -111,12 +122,12 @@ pub(crate) struct Pool {
     mem: Rc<Memory>,
     page_size: usize,
     /// Each chunk's data and reference counts, copied out of `mem`.
-    chunks: Vec<(NonNull<u8>, NonNull<Cell<u32>>)>,
+    chunks: Vec<(NonNull<u8>, NonNull<Cell<u64>>)>,
     frames: Vec<Frame>,
     free: Vec<FrameId>,
     /// Each large frame's data and reference count, copied out of `mem`, and the
     /// frame; its indexes free for reuse; and the pages the large frames take.
-    large: Vec<(NonNull<u8>, NonNull<Cell<u32>>, Frame)>,
+    large: Vec<(NonNull<u8>, NonNull<Cell<u64>>, Frame)>,
     large_free: Vec<usize>,
     large_pages: usize,
     /// The memory of the frames in use, as [`usage`] sorts them, if the store
@@ -188,7 +199,7 @@ impl Pool {
             self.grow();
         }
         let id = self.free.pop().unwrap();
-        debug_assert_eq!(self.refs(id), 0);
+        debug_assert!(self.unused(id));
         self.refs_cell(id).set(1);
         self.usage[usage(holds, false)].add(self.page_size as i64);
         self.frames[id as usize] = Frame {
@@ -242,7 +253,7 @@ impl Pool {
         // SAFETY: the layout has a non-zero size.
         let data = unsafe { alloc::alloc_zeroed(layout) };
         let data = NonNull::new(data).unwrap_or_else(|| alloc::handle_alloc_error(layout));
-        let refs: Box<[Cell<u32>]> = (0..CHUNK_FRAMES).map(|_| Cell::new(0)).collect();
+        let refs: Box<[Cell<u64>]> = (0..CHUNK_FRAMES).map(|_| Cell::new(0)).collect();
         let mut chunks = self.mem.chunks.borrow_mut();
         chunks.push(Chunk { data, _refs: refs });
         // A pointer to all the counts, taken once the box has moved into place:
@@ -279,7 +290,7 @@ impl Pool {
         }
     }
 
-    fn refs_cell(&self, id: FrameId) -> &Cell<u32> {
+    fn refs_cell(&self, id: FrameId) -> &Cell<u64> {
         if let Some(i) = large_index(id) {
             debug_assert_ne!(
                 self.large[i].2.holds,
@@ -299,8 +310,14 @@ impl Pool {
         }
     }
 
+    /// The references the tree and its readers hold to frame `id`.
     pub(crate) fn refs(&self, id: FrameId) -> u32 {
-        self.refs_cell(id).get()
+        tree_refs(self.refs_cell(id).get())
+    }
+
+    /// Whether nothing references frame `id`: neither the tree nor an I/O buffer.
+    pub(crate) fn unused(&self, id: FrameId) -> bool {
+        self.refs_cell(id).get() == 0
     }
 
     pub(crate) fn retain(&self, id: FrameId) {
@@ -308,18 +325,51 @@ impl Pool {
         refs.set(refs.get() + 1);
     }
 
-    /// Drops one reference, returning whether it was the last.
+    /// Drops one of the tree's references, returning whether it was its last.
     pub(crate) fn unref(&self, id: FrameId) -> bool {
         let refs = self.refs_cell(id);
-        debug_assert!(refs.get() > 0, "frame {id} released too often");
+        debug_assert!(tree_refs(refs.get()) > 0, "frame {id} released too often");
         refs.set(refs.get() - 1);
-        refs.get() == 0
+        tree_refs(refs.get()) == 0
     }
 
-    /// Returns an unreferenced frame to the free list, or a large frame's memory
-    /// to the allocator.
+    /// Drops `buf`, which a disk returned, and frees its frame if that was the
+    /// frame's last reference and the frame held a page being read or written, as
+    /// [`free_unused`](Self::free_unused) does.
+    pub(crate) fn release(&mut self, buf: FrameBuf) {
+        let id = buf.id;
+        let ours = Rc::ptr_eq(&buf._mem, &self.mem);
+        drop(buf);
+        if ours {
+            self.free_unused(id);
+        }
+    }
+
+    /// Frees frame `id`, which held a page being read or written, unless something
+    /// still references it: a disk may keep a buffer it was given, and return
+    /// another. The clock hand frees it once nothing does.
+    pub(crate) fn free_unused(&mut self, id: FrameId) {
+        if self.frame(id).holds == Holds::Loading && self.unused(id) {
+            self.free(id);
+        }
+    }
+
+    /// Returns a frame the tree no longer references to the free list, or a large
+    /// frame's memory to the allocator. A frame that an I/O buffer still holds
+    /// waits instead, as one being read does, for the clock hand to free it once
+    /// nothing does.
     pub(crate) fn free(&mut self, id: FrameId) {
         debug_assert_eq!(self.refs(id), 0, "freeing a referenced frame");
+        if !self.unused(id) {
+            let large = is_large(id);
+            let frame = *self.frame(id);
+            let len = (frame.pages as usize * self.page_size) as i64;
+            self.usage[usage(frame.holds, large)].add(-len);
+            self.usage[usage(Holds::Loading, large)].add(len);
+            let frame = self.frame_mut(id);
+            (frame.holds, frame.dirty) = (Holds::Loading, false);
+            return;
+        }
         if let Some(i) = large_index(id) {
             let frame = &mut self.large[i].2;
             let len = frame.pages as usize * self.page_size;
@@ -387,12 +437,23 @@ impl Pool {
 
     /// An I/O buffer over a frame, which holds a reference to it until dropped.
     pub(crate) fn buf(&self, id: FrameId) -> FrameBuf {
-        self.retain(id);
-        self.adopt_buf(id)
+        let refs = self.refs_cell(id);
+        refs.set(refs.get() + IO);
+        self.frame_buf(id)
     }
 
     /// An I/O buffer over a frame that takes over a reference the caller holds.
     pub(crate) fn adopt_buf(&self, id: FrameId) -> FrameBuf {
+        let refs = self.refs_cell(id);
+        debug_assert!(
+            tree_refs(refs.get()) > 0,
+            "frame {id} has no reference to adopt"
+        );
+        refs.set(refs.get() + IO - 1);
+        self.frame_buf(id)
+    }
+
+    fn frame_buf(&self, id: FrameId) -> FrameBuf {
         FrameBuf {
             _mem: self.mem.clone(),
             id,
@@ -431,18 +492,18 @@ pub(crate) struct FrameBuf {
     id: FrameId,
     data: NonNull<u8>,
     len: usize,
-    refs: NonNull<Cell<u32>>,
+    refs: NonNull<Cell<u64>>,
 }
 
 impl FrameBuf {
-    /// The frame it is over.
-    pub(crate) fn id(&self) -> FrameId {
-        self.id
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: frame memory is initialized (zeroed when allocated), and `_mem`
+        // keeps it alive.
+        unsafe { slice::from_raw_parts(self.data.as_ptr(), self.len) }
     }
 
-    #[cfg(any(test, fuzzing))]
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: frame memory is initialized (zeroed when allocated).
+        // SAFETY: as in `bytes`.
         unsafe { slice::from_raw_parts_mut(self.data.as_ptr(), self.len) }
     }
 }
@@ -451,27 +512,7 @@ impl Drop for FrameBuf {
     fn drop(&mut self) {
         // SAFETY: `_mem` keeps the count alive.
         let refs = unsafe { self.refs.as_ref() };
-        refs.set(refs.get() - 1);
-    }
-}
-
-impl IoBuf for FrameBuf {
-    fn as_init(&self) -> &[u8] {
-        // SAFETY: frame memory is initialized, and `_mem` keeps it alive.
-        unsafe { slice::from_raw_parts(self.data.as_ptr(), self.len) }
-    }
-}
-
-impl SetLen for FrameBuf {
-    unsafe fn set_len(&mut self, _len: usize) {
-        // A frame is always full: a page, or a large frame's pages.
-    }
-}
-
-impl IoBufMut for FrameBuf {
-    fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        // SAFETY: as in `as_init`.
-        unsafe { slice::from_raw_parts_mut(self.data.as_ptr().cast(), self.len) }
+        refs.set(refs.get() - IO);
     }
 }
 
@@ -504,7 +545,6 @@ impl ValueBuf {
         unsafe { slice::from_raw_parts(self.data.as_ptr(), self.len) }
     }
 
-    #[cfg(any(test, fuzzing))]
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: as in `bytes`.
         unsafe { slice::from_raw_parts_mut(self.data.as_ptr(), self.len) }
@@ -516,24 +556,5 @@ impl Drop for ValueBuf {
         let layout = Layout::from_size_align(self.cap, ALIGN).unwrap();
         // SAFETY: allocated in `new` with this layout.
         unsafe { alloc::dealloc(self.data.as_ptr(), layout) };
-    }
-}
-
-impl IoBuf for ValueBuf {
-    fn as_init(&self) -> &[u8] {
-        self.bytes()
-    }
-}
-
-impl SetLen for ValueBuf {
-    unsafe fn set_len(&mut self, _len: usize) {
-        // Reads fill the whole buffer, which is initialized anyway.
-    }
-}
-
-impl IoBufMut for ValueBuf {
-    fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        // SAFETY: as in `bytes`.
-        unsafe { slice::from_raw_parts_mut(self.data.as_ptr().cast(), self.len) }
     }
 }

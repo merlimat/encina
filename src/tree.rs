@@ -68,6 +68,13 @@ const SLICE: Duration = Duration::from_millis(1);
 /// [`SCATTERED`] units each.
 const CHECK: usize = 4096;
 
+/// The work after which a write pauses on a disk that gives no clock, where what a
+/// write does follows from its batch alone: about a millisecond of merging a sorted
+/// load on an Apple M5 Pro, where [`CHECK`] units take 25 µs. The units of other
+/// steps take from a fifth as long, for a merge's scattered operations, to five
+/// times as long, for the nodes planning visits.
+pub(crate) const UNTIMED: usize = 40 * CHECK;
+
 /// The work planning counts for a node it visits, so that it looks at the clock
 /// every 64 visits. A visit searches the operations and ranges left for the node,
 /// whose keys lie scattered in the memory of an unsorted batch: on an Apple M5
@@ -220,15 +227,16 @@ enum Outcome {
 }
 
 /// When the write in progress pauses its work on the batch: once it has run for
-/// [`SLICE`], or, in tests, once it has done a set amount of work.
+/// [`SLICE`], or once it has done a set amount of work, on a disk that gives no
+/// clock and in tests.
 pub(crate) struct Budget {
     /// The work done since the write last paused, and the work after which it next
-    /// looks at the clock, or pauses in tests.
+    /// looks at the clock, or pauses if it doesn't.
     pub(crate) work: usize,
     check: usize,
-    /// When it last started or resumed.
-    start: Instant,
-    /// The work it does before pausing, in tests.
+    /// When it last started or resumed, if it looks at the clock.
+    start: Option<Instant>,
+    /// The work it does before pausing, if it doesn't.
     fixed: Option<usize>,
 }
 
@@ -237,7 +245,7 @@ impl Budget {
         Budget {
             work: 0,
             check: CHECK,
-            start: Instant::now(),
+            start: None,
             fixed: None,
         }
     }
@@ -255,7 +263,9 @@ impl Budget {
     pub(crate) fn start(&mut self) {
         self.work = 0;
         self.check = self.fixed.unwrap_or(CHECK);
-        self.start = Instant::now();
+        if self.fixed.is_none() {
+            self.start = Some(Instant::now());
+        }
     }
 
     /// Whether the slice is over.
@@ -263,7 +273,7 @@ impl Budget {
         if self.work < self.check {
             return false;
         }
-        if self.fixed.is_some() || self.start.elapsed() >= SLICE {
+        if self.fixed.is_some() || self.start.is_none_or(|start| start.elapsed() >= SLICE) {
             return true;
         }
         self.check = self.work + CHECK;
@@ -1042,6 +1052,12 @@ impl Tree {
     /// leaves, or freeing pages.
     pub(crate) fn resume(&mut self) {
         self.budget.start();
+    }
+
+    /// Sets the work a write does before it pauses, or with `None`, has it pause
+    /// after a time instead.
+    pub(crate) fn set_slice(&mut self, slice: Option<usize>) {
+        self.budget.fixed = slice;
     }
 
     /// The meta page that makes the pending version current as `generation`.
@@ -2372,18 +2388,19 @@ impl Tree {
             assert_eq!((info.holds, info.dirty), (Holds::Internal, false));
             assert_eq!(pool.refs(frame), n, "frame {frame} has extra references");
         }
-        // Frames that cancelled reads left behind wait for the clock hand.
+        // Frames that cancelled reads left behind, or that buffers a disk kept held
+        // when the tree let go of them, wait for the clock hand.
         // The pages each frame takes: a large frame holds a value leaf.
         let pages = |frame| pool.frame(frame).pages as usize;
         let cancelled: usize = (0..pool.slots())
             .map(|i| pool.slot(i))
-            .filter(|&f| pool.frame(f).holds == Holds::Loading && pool.refs(f) == 0)
+            .filter(|&f| pool.frame(f).holds == Holds::Loading && !reading.contains(&f))
             .map(pages)
             .sum();
         for &frame in reading {
             assert_eq!(pool.frame(frame).holds, Holds::Loading);
             assert!(
-                pool.refs(frame) > 0,
+                !pool.unused(frame),
                 "frame {frame} read into, but let go of"
             );
         }
@@ -2621,10 +2638,6 @@ impl Tree {
 
     pub(crate) fn page_size(&self) -> usize {
         self.page_size
-    }
-
-    pub(crate) fn set_slice(&mut self, slice: Option<usize>) {
-        self.budget.fixed = slice;
     }
 
     /// Whether the write in progress is merging its batch.

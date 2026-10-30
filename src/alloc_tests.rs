@@ -21,7 +21,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::pin::pin;
 
-use crate::sim::SimDisk;
+use crate::sim::{SimDb, SimDisk};
 use crate::tests::{metered, now, poll};
 use crate::tree::Budget;
 use crate::{Comparison, Db, Options, WriteBatch};
@@ -280,7 +280,7 @@ fn group_commits_do_not_allocate() {
 }
 
 /// A store holding 10 entries too large for a leaf, of `len` bytes each.
-fn value_leaves(opts: Options, len: usize) -> Db {
+fn value_leaves(opts: Options, len: usize) -> SimDb {
     let db = now(Db::open_sim(SimDisk::new(), opts)).unwrap();
     let mut batch = WriteBatch::new();
     for i in 0..10 {
@@ -290,7 +290,7 @@ fn value_leaves(opts: Options, len: usize) -> Db {
     db
 }
 
-fn scan_values(db: &Db, len: usize) {
+fn scan_values(db: &SimDb, len: usize) {
     let mut iter = db.range(..);
     let mut n = 0;
     while let Some((_, v)) = now(iter.next()).unwrap() {

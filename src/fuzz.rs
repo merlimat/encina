@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::hint::black_box;
 use std::pin::pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use crate::meta::{MAGIC, META_PAGES, Meta};
@@ -34,7 +35,7 @@ use crate::node::{
     ValueLeaf,
 };
 use crate::options::MIN_PAGE_SIZE;
-use crate::sim::SimDisk;
+use crate::sim::{SimDb, SimDisk, SimView};
 use crate::{Comparison, Db, Iter, Options, ReadOnlyDb};
 
 /// Checks a page that [`node::verify`] accepts as lookups, scans and opens read
@@ -322,25 +323,25 @@ async fn read(store: &impl Store) {
 /// The reads [`read`] makes of a store: a [`Db`], or a [`ReadOnlyDb`].
 trait Store {
     async fn lookup(&self, key: &[u8], cmp: Comparison);
-    fn scan(&self, start: &[u8]) -> Iter;
+    fn scan(&self, start: &[u8]) -> Iter<Rc<SimDisk>>;
 }
 
-impl Store for Db {
+impl Store for SimDb {
     async fn lookup(&self, key: &[u8], cmp: Comparison) {
         let _ = self.get(key, cmp, touch).await;
     }
 
-    fn scan(&self, start: &[u8]) -> Iter {
+    fn scan(&self, start: &[u8]) -> Iter<Rc<SimDisk>> {
         self.range(start..)
     }
 }
 
-impl Store for ReadOnlyDb {
+impl Store for SimView {
     async fn lookup(&self, key: &[u8], cmp: Comparison) {
         let _ = self.get(key, cmp, touch).await;
     }
 
-    fn scan(&self, start: &[u8]) -> Iter {
+    fn scan(&self, start: &[u8]) -> Iter<Rc<SimDisk>> {
         self.range(start..)
     }
 }

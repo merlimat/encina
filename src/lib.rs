@@ -74,6 +74,14 @@
 //! # }).unwrap();
 //! ```
 //!
+//! # Disks
+//!
+//! A store lives in a file, which [`Db::open`] reads and writes with direct I/O on
+//! the current compio runtime. A caller that runs its own I/O, such as a scheduler
+//! of its requests or a simulated disk, implements [`Disk`] and opens the store
+//! with [`Db::open_on`]: the store then needs no compio runtime, and no clock
+//! decides what it does.
+//!
 //! # Metrics
 //!
 //! With [`Options::meter_provider`], a store exports metrics through OpenTelemetry,
@@ -96,6 +104,7 @@
 mod batch;
 mod cache;
 mod db;
+mod disk;
 mod error;
 // Entry points for the fuzz targets in fuzz/, which cargo fuzz builds with
 // `--cfg fuzzing`. Tests run them on their seeds.
@@ -114,7 +123,6 @@ mod scan;
 #[cfg_attr(not(test), allow(dead_code))]
 mod sim;
 mod space;
-mod storage;
 mod tree;
 mod writes;
 
@@ -125,5 +133,6 @@ mod tests;
 
 pub use batch::WriteBatch;
 pub use db::{Comparison, Db, Iter, PageInfo, ReadOnlyDb};
+pub use disk::{Disk, FileDisk, FileRead, ReadBuf, WriteBuf};
 pub use error::{Error, Result};
 pub use options::Options;
