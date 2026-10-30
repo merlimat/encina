@@ -855,14 +855,13 @@ completed write.
 
 ### The scan of level 1
 
-Level 1 holds nearly all the internal nodes (§8), so reading it took most of the
-open: about 5 s per billion entries with 32-byte keys and 100-byte values, at the
-10 µs a page that a cold scan reads on the benchmark VM with 16 reads in flight.
-The open reads only the nodes above it, and a scan goes on once the open has
-returned: it reads each level-1 node of the version the store opened, in key
-order, and marks the pages of the leaves it lists, value leaves' spans included.
-It checks them as the open checks the nodes above: a leaf among the meta pages,
-past the end of the file, or on a page already in use is corrupt.
+Level 1 holds nearly all the internal nodes (§8), so reading it took nearly all
+of the open (below). The open reads only the nodes above it, and a scan goes on
+once the open has returned: it reads each level-1 node of the version the store
+opened, in key order, and marks the pages of the leaves it lists, value leaves'
+spans included. It checks them as the open checks the nodes above: a leaf among
+the meta pages, past the end of the file, or on a page already in use is
+corrupt.
 
 - **Reads.** The scan keeps up to 64 reads in flight, within a quarter of the
   cache budget, as an iterator reads ahead: NVMe drives read faster with more in
@@ -899,6 +898,25 @@ past the end of the file, or on a page already in use is corrupt.
 - **Views.** A read-only view writes nothing, so it doesn't scan: its open reads
   the nodes above level 1, and its reads check the level-1 nodes and leaves they
   need.
+
+Measured with [experiments/open-time](experiments/open-time) on the benchmark VM
+(6 vCPUs, ext4 on virtio): a store of 100M entries with 32-byte keys and 100-byte
+values, loaded in sorted batches of 1M, takes a file of 12.9 GB, whose 3.1M leaves
+take 32,700 level-1 nodes, under 350 nodes above them. With a cache of 64 MiB, over
+6 alternating runs:
+
+| | Open | Read by the open | Scan after it | Lookups right after, p50 |
+|---|---:|---:|---:|---:|
+| Before, reading level 1 at open | 190 ms | 129.5 MiB | | 0.11 ms |
+| Now | 2.9 ms | 1.6 MiB | 95 ms | 0.27 ms |
+
+At a billion entries, ten times as many pages, the open would take about 1.9 s
+before, and the scan now about a second, which the open no longer waits for. A
+lookup right after the open reads its level-1 node and then its leaf, beside the
+scan's reads, where the old open had cached half the level-1 nodes. Over 5 more
+alternating runs, with 16 reads in flight, as the old open kept, the scan took
+185 ms at the median, and with 128, 77 ms, but the lookups beside it then took
+0.39 ms rather than 0.25 with 64.
 
 ## 8. Memory and the leaf cache
 
