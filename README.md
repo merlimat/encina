@@ -164,6 +164,13 @@ open the store again, and `scan` resumes after the last key it printed. Argument
 take `\xNN` for any byte and `\\` for a backslash, and output prints UTF-8 text as
 is and escapes other bytes the same way. `encina --help` has the details.
 
+`encina completions` prints a script that completes encina's commands and options in
+bash, zsh, fish, elvish or PowerShell. For bash:
+
+```sh
+encina completions bash > ~/.local/share/bash-completion/completions/encina
+```
+
 ## Metrics
 
 A store exports metrics through OpenTelemetry when its options name a meter

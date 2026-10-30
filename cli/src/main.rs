@@ -22,7 +22,8 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use encina::{Comparison, Db, DefaultEnv, Options, PageInfo, ReadOnlyDb, WriteBatch};
 
 /// How many times in a row a read opens a new view of the store, after finding
@@ -50,6 +51,14 @@ struct Cli {
     /// The store's file
     #[arg(short = 'f', long = "file", value_name = "PATH")]
     path: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// The command line without -f, which only `completions` may leave out.
+#[derive(Parser)]
+#[command(name = "encina")]
+struct NoFile {
     #[command(subcommand)]
     command: Command,
 }
@@ -114,13 +123,31 @@ enum Command {
     /// leaf, D a dense leaf, V a page of a value leaf, a digit an internal node at
     /// that level, and . a free page.
     Pages,
+    /// Prints a script that completes encina's commands and options in a shell
+    ///
+    /// It needs no -f. For bash, save it where bash-completion looks for it:
+    ///
+    ///     encina completions bash > ~/.local/share/bash-completion/completions/encina
+    ///
+    /// For zsh, save it as _encina in a directory of $fpath, and for fish, as
+    /// ~/.config/fish/completions/encina.fish.
+    #[command(override_usage = "encina completions <SHELL>")]
+    Completions { shell: Shell },
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let result: Result<ExitCode, Box<dyn Error>> = compio::runtime::Runtime::new()
-        .map_err(Box::from)
-        .and_then(|runtime| runtime.block_on(run(&cli.path, cli.command)));
+    let result = match NoFile::try_parse() {
+        // Every other command opens the store, so `Cli` requires -f.
+        Ok(NoFile {
+            command: Command::Completions { shell },
+        }) => completions(shell),
+        _ => {
+            let cli = Cli::parse();
+            compio::runtime::Runtime::new()
+                .map_err(Box::from)
+                .and_then(|runtime| runtime.block_on(run(&cli.path, cli.command)))
+        }
+    };
     match result {
         Ok(code) => code,
         // The reader went away, as in `encina -f data.db scan | head`: stop quietly.
@@ -271,8 +298,18 @@ async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn Error>> 
                 writeln!(out)?;
             }
         }
+        Command::Completions { shell } => return completions(shell),
     }
     out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Prints the script that completes encina's command line in `shell`.
+fn completions(shell: Shell) -> Result<ExitCode, Box<dyn Error>> {
+    // `generate` panics if it can't write: a closed pipe is an error here instead.
+    let mut script = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "encina", &mut script);
+    io::stdout().write_all(&script)?;
     Ok(ExitCode::SUCCESS)
 }
 
