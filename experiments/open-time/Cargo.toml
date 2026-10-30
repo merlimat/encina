@@ -1,0 +1,16 @@
+# Times opening a store of 32-byte keys and 100-byte values, for DESIGN.md §7.
+# Run with:
+#   cargo run --release -- build PATH 100000000
+#   cargo run --release -- open PATH 100000000
+[package]
+name = "open-time"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Not part of the encina crate.
+[workspace]
+
+[dependencies]
+compio = { version = "0.19.2", features = ["macros", "time"] }
+encina = { path = "../.." }

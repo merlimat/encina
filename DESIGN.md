@@ -8,7 +8,8 @@
 > leaves early remains. M4 is done: entries too large for a leaf get value
 > leaves, which the cache keeps and iterators read ahead (§5). Level-1 internal
 > nodes live in the cache too, so memory stays within its budget however large
-> the store grows (§8).
+> the store grows (§8), and the open reads only the nodes above them, leaving
+> level 1 to a scan that runs while the store serves reads and writes (§7).
 
 encina is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. Its first
@@ -206,7 +207,7 @@ never one. With 4 KiB pages, 40 bits address 4 PiB, and 24 bits give spans of up
 64 GiB, more than a batch holds.
 
 **Free space.** The bottom internal level lists each value leaf with its span, so
-the open still builds the free bitmap from internal nodes alone (§7), and
+the free bitmap is still built from internal nodes alone (§7), and
 `delete_range` still drops value leaves without reading them. A dropped value leaf's
 pages become reusable together, subject to §8. A value leaf needs adjacent pages: it
 takes them from the write's run of long-lived pages when what is left of that run
@@ -278,8 +279,8 @@ apart.
 **Alternatives.**
 
 - Overflow pages that leaves point to, as in LMDB and SQLite, pack leaves better.
-  But leaves aren't resident: the open would have to read every leaf to build the
-  free bitmap, and `delete_range` the leaves it drops, unless free space were stored
+  But leaves aren't resident: building the free bitmap would take reading every
+  leaf, and `delete_range` the leaves it drops, unless free space were stored
   rather than derived (§7).
 - A value log, as in WiscKey, needs garbage collection: the compaction §2 avoids.
 - Chunks of each value as ordinary entries, in a second tree keyed by the encoded
@@ -743,11 +744,13 @@ take the last page's zeros.
 
 ### Free space is derived, not stored
 
-No free list is persisted. At open, the live set is the meta pages, every internal
-page, and every leaf page id listed in the bottom internal level. Every other page
-below the high-water mark is free, tracked in an in-memory bitmap (1 bit per page:
+No free list is persisted. The live set is the meta pages, every internal page,
+and every leaf page id listed in the bottom internal level. Every other page below
+the high-water mark is free, tracked in an in-memory bitmap (1 bit per page:
 128 KiB covers 4 GiB). Nothing on disk can drift out of sync with the tree, and a
-crash cannot leak space.
+crash cannot leak space. The open marks the internal pages, and a scan that goes
+on once it has returned marks the leaves (below): until the scan ends, writes take
+pages past where the file ended.
 
 At runtime, a write takes its pages in order from runs of free pages: the first
 free stretch of at least 16 pages (64 KiB with 4 KiB pages), then the next one,
@@ -778,7 +781,8 @@ write moves at most as many nodes as it builds for its changes.
 
 The file gives back its end once that is free: every write starts by lowering the
 high-water mark to the last page in use, which its meta page records, and the
-commit cuts the file once an eighth of it lies past the mark (step 5 above).
+commit cuts the file once an eighth of it lies past the mark (step 5 above). Until
+the scan of level 1 has ended, the mark stays where the open found it, or above.
 
 Writing in runs costs space, in exchange for requests. The table shows the file
 against the pages in use, and the write requests and pages per commit, measured
@@ -822,20 +826,25 @@ to 4,540 averaging 158 KiB, and made it three times as fast.
    each possible page size would put it. Then read both slots, and pick the intact
    one with the highest generation. Its high-water mark must leave the meta pages
    in, and its root no deeper than writes take (`MAX_HEIGHT`).
-2. Load the internal pages level by level, verifying checksums, levels and
-   generations, and point each parent above level 2 at its children's frames. The
-   level-1 nodes are read into the cache, which keeps those it has room for, a
-   window at a time within the budget. Leaves are read on demand, so open time
-   scales with the internal pages, a fraction of a percent of the file.
-3. Build the free bitmap from the pages the tree reaches.
+2. Load the internal pages above level 1, level by level, 64 reads at a time,
+   verifying checksums, levels and generations, and point each parent above level
+   2 at its children's frames. Mark their pages used, and those of the level-1
+   nodes the level-2 nodes list.
+3. Return. Level-1 nodes and leaves are read on demand (§8), so open time scales
+   with the internal pages above level 1, a fraction of a percent of the internal
+   pages, and the store serves reads and writes at once. A scan of level 1 then
+   marks the pages of the leaves (below).
 
 No page past the end of the file is in use, since a commit writes its tree before
 its meta page. So the open takes the end of the file as the high-water mark if it
 comes first, which bounds the bitmap's memory by the file, and a page the tree
-lists past it is corrupt. The mark can lie past the end of a store's file: a write
-may free again the last pages it took, which it then doesn't write. A read-only
-view reads the file's length once it has read the meta page, as the owner may have
-committed past the length the view read first.
+lists past it is corrupt. The open and the scan find it so, and so does a read,
+which checks a node's pages against the mark before it reads them, with
+`Error::Corruption`: the span that a value leaf's parent gives never sizes a
+buffer past the file. The mark can lie past the end of a store's file: a write
+may free again the last pages it took, which it then doesn't write. A
+read-only view reads the file's length once it has read the meta page, as the
+owner may have committed past the length the view read first.
 
 Opening an empty file creates a store. It first syncs the file's directory, since a
 new file's name is durable only once its directory is: without that, a crash could
@@ -845,6 +854,71 @@ store (`Error::InvalidFile`): a crash while a store is being created can leave o
 
 There is no log to replay: the caller's journal covers anything newer than the last
 completed write.
+
+### The scan of level 1
+
+Level 1 holds nearly all the internal nodes (§8), so reading it took nearly all
+of the open (below). The open reads only the nodes above it, and a scan goes on
+once the open has returned: it reads each level-1 node of the version the store
+opened, in key order, and marks the pages of the leaves it lists, value leaves'
+spans included. It checks them as the open checks the nodes above: a leaf among
+the meta pages, past the end of the file, or on a page already in use is
+corrupt.
+
+- **Reads.** The scan keeps up to 64 reads in flight, within a quarter of the
+  cache budget, as an iterator reads ahead: NVMe drives read faster with more in
+  flight than the 16 that writes and iterators keep. Its reads go through the
+  cache and the table of reads in flight (§8): it marks a level-1 node that a
+  reader cached without reading it, shares the reads that readers started, and
+  leaves the nodes it reads cached, first in line for eviction. The first node of
+  its window always gets a read, which grows the pool past the budget if it must,
+  as a lookup's does, so the scan always goes on.
+- **Task.** On a file, the store spawns a task for the scan on the runtime that
+  opened it (§9). The task holds the store only while it is polled, so a store
+  closes once the app lets go of it, and dropping it cancels the task. Closing
+  lets go of the scan's reads first, since they hold the file open.
+- **Writes meanwhile** take pages only from where the file ended when the store
+  opened, and on: those are free whatever the scan finds. The high-water mark
+  doesn't come down below there, so the file isn't cut below it, and no page
+  moves out of a window below it. The scan holds the version it reads, as an
+  iterator would, so no write frees a page of it before the scan has marked it,
+  and none overwrites a node the scan has yet to read. The cost is that writes
+  reuse no page until the scan ends: the file grows by what they write
+  meanwhile, and the next write after the scan frees the pages they replaced.
+- **Short scans.** A write that finds no more than a window of level-1 nodes left
+  lets the scan end first: that costs it about one read, and spares a small
+  store, whose scan would end that soon anyway, pages past the end of its file. A
+  process that writes once and exits, like the `encina` command, then keeps
+  reusing free pages.
+- **Errors.** A level-1 node or a leaf page that fails its checks, or a read that
+  fails, stops the scan, and writes fail with its error from then on, as the open
+  would have: the store can't know which of its pages are free. Reads go on, and
+  those that need a damaged node fail as they would have anyway. Reopening runs
+  the scan again.
+- **Crashes.** The scan writes nothing, so a crash during it leaves nothing to
+  recover: the next open scans the version it finds.
+- **Views.** A read-only view writes nothing, so it doesn't scan: its open reads
+  the nodes above level 1, and its reads check the level-1 nodes and leaves they
+  need.
+
+Measured with [experiments/open-time](experiments/open-time) on the benchmark VM
+(6 vCPUs, ext4 on virtio): a store of 100M entries with 32-byte keys and 100-byte
+values, loaded in sorted batches of 1M, takes a file of 12.9 GB, whose 3.1M leaves
+take 32,700 level-1 nodes, under 350 nodes above them. With a cache of 64 MiB, over
+6 alternating runs:
+
+| | Open | Read by the open | Scan after it | Lookups right after, p50 |
+|---|---:|---:|---:|---:|
+| Before, reading level 1 at open | 190 ms | 129.5 MiB | | 0.11 ms |
+| Now | 2.9 ms | 1.6 MiB | 95 ms | 0.27 ms |
+
+At a billion entries, ten times as many pages, the open would take about 1.9 s
+before, and the scan now about a second, which the open no longer waits for. A
+lookup right after the open reads its level-1 node and then its leaf, beside the
+scan's reads, where the old open had cached half the level-1 nodes. Over 5 more
+alternating runs, with 16 reads in flight, as the old open kept, the scan took
+185 ms at the median, and with 128, 77 ms, but the lookups beside it then took
+0.39 ms rather than 0.25 with 64.
 
 ## 8. Memory and the leaf cache
 
@@ -900,8 +974,9 @@ completed write.
 
 ### Reads in flight
 
-Leaf reads go through a table of the reads in flight. A reader that misses looks
-there before starting a read, so concurrent misses on a page share one read. Each
+Leaf reads go through a table of the reads in flight, as do those of level-1
+nodes, the scan of level 1's included (§7). A reader that misses looks there
+before starting a read, so concurrent misses on a page share one read. Each
 read sits in a slot that counts the readers holding it. Whichever of them is polled
 drives the read, and the first to find it finished claims it: it verifies and
 caches the page. The others then find the page cached, or, if the read failed,
@@ -940,9 +1015,10 @@ stays within the budget, however large the store.
 - **Writes** load the level-1 nodes they change first, then the leaves under them,
   and keep both pinned until they publish (§6). They build level-1 nodes into the
   cache, as they do leaves.
-- **Open** still reads every level-1 node, to mark its leaves' pages used (§7), so
-  it takes as long as before. A level-1 node that isn't cached when a write moves
-  or merges its siblings stays where it is, as a leaf does.
+- **Open** reads none: a scan after it reads every level-1 node, to mark its
+  leaves' pages used, and leaves those the cache has room for cached (§7). A
+  level-1 node that isn't cached when a write moves or merges its siblings stays
+  where it is, as a leaf does.
 
 ### Reading ahead
 
@@ -1016,6 +1092,11 @@ same 282 MiB.
   operation slots).
 - A large write normalizes and plans its batch, pins the leaves it changes, and
   merges it, a slice at a time, and yields to the executor in between (§6).
+- **The scan of level 1** that follows an open (§7) runs in a task the store
+  spawns on the runtime that opened it, the one task a store has. The task holds
+  the store weakly, and strongly only while it is polled, so that it neither keeps
+  a store open nor outlives it: the store holds the task's handle, and dropping
+  that cancels the task.
 - **Linux with io_uring is the target.** macOS works for development, but there
   compio runs file I/O on a blocking thread pool and `fsync` is a plain `fsync`
   (no `F_FULLFSYNC`), so macOS gives no durability guarantee against power loss.
@@ -1196,18 +1277,39 @@ complete without suspending.
   writes what it holds. On a compio runtime, another task's lookups run while a
   write merges, and see the last version.
 - **Damage:** a flipped bit in a leaf fails the reads that need it, and one in an
-  internal node fails the open, both with `Error::Corruption`, as does a child
-  reference past the end of the file or to a page already used. So does a node
-  whose checksum matches but whose entries lie outside it: a slotted leaf whose
-  value runs past its page fails the reads, and an internal node whose child
-  reference is short fails the open. Format tests move each part of a slotted
-  node out of place in turn, and seal it again. A flipped bit in meta slot 0
+  internal node above level 1 fails the open, both with `Error::Corruption`. One
+  in a level-1 node fails the reads that need it, and stops the scan of level 1:
+  writes then fail with that error. A child reference past the end of the file
+  or to a page already used fails the open, and at level 1, the scan. A leaf or
+  a value leaf that a level-1 node lists past the high-water mark fails the
+  reads that need it too, before any buffer is taken for its span. So does a
+  node whose checksum matches but whose entries lie outside it: a slotted leaf
+  whose value runs past its page fails the reads, and an internal node whose
+  child reference is short fails the open, or at level 1, the reads and the
+  scan. Format tests move each part of a slotted node out of place in turn, and
+  seal it again. A flipped bit in meta slot 0
   leaves slot 1, which the open finds where each page size would put it. A file
   of zeros, or with meta pages built from bad fields, isn't a store
   (`Error::InvalidFile`): among them, a high-water mark that leaves out a meta page,
   and a root deeper than writes take. A mark as high as marks go gives way to the
   end of the file, and the store works; a tree page past the end, within the mark,
   is `Error::Corruption`.
+- **The scan of level 1:** the open of a store whose level 1 outgrows the cache
+  reads the meta pages and the nodes above level 1, and nothing else, and so does
+  a view's; the scan then reads each level-1 node once. While it runs, lookups
+  and scans find what the model holds, and writes take only pages past where the
+  file ended, free none of those they replace, and never cut the file, though
+  its end is free; once it has ended, writes reuse the free pages below and cut
+  the file. A write lets the scan end first only when it has a window of level-1
+  nodes left, or fewer. A failure injected at each operation of a scenario that
+  writes while the scan goes on, its reads included, leaves a store that reopens
+  in the state after the last write that succeeded. The model-based tests go on
+  with the scan a few level-1 nodes at a time after each reopen, with writes
+  that let it end first when it is that short, or never. On a real file, the scan
+  ends by itself while the store serves reads and writes, and a store closes, and
+  opens again, while the scan's reads are in flight. The invariant checker counts
+  the leaf pages the scan hasn't reached as in use but not marked, the frames of
+  the version it holds, and those its reads fill.
 - **Read-only views:** a view on the owner's simulated disk returns exactly its
   version while the owner rewrites every leaf, until its reads fail with
   `Error::Stale`, and never with other entries; so does a read of a page the owner
@@ -1247,8 +1349,8 @@ complete without suspending.
   - `open`: a file opens on the simulated disk, as a read-only view and as its
     owner, or fails with an error. An open store answers a scan, lookups with every
     comparison and short scans from keys the scan found and keys beside them, and,
-    in the view, `pages`, with entries or errors. Writes to such a store aren't
-    fuzzed.
+    in the view, `pages`, with entries or errors; then the owner runs its scan of
+    level 1. Writes to such a store aren't fuzzed.
   - `node_round_trip`, `value_leaf_round_trip` and `meta_round_trip`: what the
     encoders write decodes back to what they were given. Sorted entries of any
     lengths are built into nodes a page's worth at a time, at levels 0 to 3, with
@@ -1287,7 +1389,8 @@ complete without suspending.
 3. **M3, performance:** group commit (writes that queue up during a commit share
    the next one, done, §6), the dense node format (done, §5), yielding inside
    large merges (done, §6), writing large batches' new leaves early
-   ([#25](https://github.com/merlimat/encina/issues/25)), one shared read for
+   ([#25](https://github.com/merlimat/encina/issues/25)), opening without reading
+   level 1 (done, §7), one shared read for
    concurrent misses and reading ahead in iterators (done, §8), coverage measured
    in CI (done, §11), and benchmarks against RocksDB (done, §11).
 4. **M4, large values:** value leaves (§5), with values written and read whole,

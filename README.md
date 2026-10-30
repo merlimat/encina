@@ -43,9 +43,9 @@ and ordered lookups, range scans, and deleting whole key ranges at once.
 - [x] **M2, persistence and caching:** atomic durable commits, recovery, the leaf
   cache, and direct I/O.
 - [ ] **M3, performance:** group commit, a dense node format, yielding inside large
-  merges and benchmarks against RocksDB are done. Writing a large batch's new
-  leaves before it commits ([#25](https://github.com/merlimat/encina/issues/25))
-  remains.
+  merges, opening without reading the bottom level of internal nodes, and
+  benchmarks against RocksDB are done. Writing a large batch's new leaves before
+  it commits ([#25](https://github.com/merlimat/encina/issues/25)) remains.
 - [x] **M4, large values:** an entry too large for a leaf gets pages of its own, so
   values may be any size that fits in memory. The cache keeps them, up to a quarter
   of its budget.

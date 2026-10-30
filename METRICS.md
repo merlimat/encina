@@ -71,6 +71,8 @@ store's owner reports.
 - **`encina.write.errors`**: the writes that failed, by `error.type`:
   - `key_too_large`: a put's key exceeds `Options::max_key_size`.
   - `io`, `corruption`: an I/O error, or a leaf the write read failed its checks.
+    Writes also fail with the error that the scan of level 1 following the open
+    met, if it met one, until the store is reopened (DESIGN.md §7).
   - `failed`: an earlier I/O error left the store failed (see
     `encina.store.failed`).
 - **`encina.commit.duration`**: how long each commit takes, from the write taking its
@@ -127,6 +129,8 @@ store's owner reports.
   - A lookup that misses counts once, not again when it finds the leaf it read.
   - Values too large to cache, over a quarter of the budget, are read without the
     cache and don't count.
+  - The scan of level 1 that follows the open looks nothing up: the level-1 nodes
+    it reads don't count.
   - The hit ratio is `hit / (hit + miss)`.
 - **`encina.cache.evictions`**: the leaves and level-1 nodes evicted to make room
   for others.
@@ -150,16 +154,17 @@ store's owner reports.
 | `encina.disk.sync.duration` | histogram | `s` | |
 
 - **`encina.disk.io`**: the bytes read from and written to the store file.
-  - Reads: leaves, value leaves and level-1 nodes, plus the internal nodes the
-    store reads when it opens.
+  - Reads: leaves, value leaves and level-1 nodes, those the scan that follows the
+    open reads included, plus the internal nodes above them, which the store reads
+    when it opens.
   - Writes: each commit's new pages and its meta page.
   - Dividing the bytes written by the sum of `encina.write.size` gives the write
     amplification.
 - **`encina.disk.operations`**: the read and write requests. A commit writes each run
   of adjacent pages, up to 1 MiB, with one request.
 - **`encina.disk.read.duration`**: how long each read of a leaf, a value leaf or a
-  level-1 node takes, until a reader sees it finish. The reads of internal nodes at
-  open aren't timed.
+  level-1 node takes, until a reader sees it finish. The open's reads of the
+  internal nodes above level 1 aren't timed.
 - **`encina.disk.sync.duration`**: how long each sync of the store file takes. A
   commit syncs twice: once its pages are written, and once its meta page is.
 
@@ -192,6 +197,8 @@ store's owner reports.
 
   These four are updated when the store opens and after each commit. The store
   keeps the entries' count and size in its meta page, so they cost no reads.
+  `encina.file.usage` waits until the scan of level 1 that follows the open has
+  found which pages are in use (DESIGN.md §7): until then, it stays at 0.
 - **`encina.store.failed`**: 1 while the store rejects writes with `Error::Failed`. An
   I/O error during a commit left it unknown whether the commit is durable.
   Reopening the store recovers it.

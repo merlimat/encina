@@ -248,7 +248,8 @@ pub fn meta_round_trip(data: &[u8]) {
 /// Opens a store whose file is `data`, as a read-only view and as its owner, and
 /// reads it as each would: a scan, then lookups with every comparison, and short
 /// scans, from some of the keys the scan found and keys just after them. The view
-/// then lists its pages. Each must return entries or an error, never panic.
+/// then lists its pages, and the owner scans its level-1 nodes, as it does once it
+/// opens. Each must return entries or an error, never panic.
 ///
 /// The meta slots and every node get their checksums, with pages of the size slot
 /// 0 records, or else slot 1 does where recovery looks for it.
@@ -270,6 +271,7 @@ pub fn open(data: &[u8]) {
         }
         if let Ok(db) = Db::open_sim(disk, Options::new()).await {
             read(&db).await;
+            let _ = db.scan_level_1(usize::MAX).await;
         }
     });
 }

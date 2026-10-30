@@ -36,6 +36,8 @@
 //! root is never one.
 
 use std::cmp::Ordering;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::mem;
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -2314,6 +2316,18 @@ impl Tree {
     ///
     /// Leaves are checked when cached; contents are left to the callers' scans.
     pub(crate) fn check(&mut self) {
+        self.check_scanning(None, &BTreeSet::new(), &[]);
+    }
+
+    /// Like [`check`](Self::check), while the scan of level 1 holds the version
+    /// rooted at `held`, reads level-1 nodes into the frames `reading`, and has yet
+    /// to mark the leaf pages `unmarked`.
+    pub(crate) fn check_scanning(
+        &mut self,
+        held: Option<Root>,
+        unmarked: &BTreeSet<u64>,
+        reading: &[FrameId],
+    ) {
         let mut stats = Stats::default();
         if let Some(root) = self.root {
             // A root leaf holds every entry.
@@ -2322,17 +2336,42 @@ impl Tree {
                 page: root.page,
                 size: self.size,
             };
-            self.check_node(node, root.level, None, None, &mut stats);
+            self.check_node(node, root.level, None, None, unmarked, &mut stats);
         }
         assert_eq!(stats.size, self.size, "entries miscounted");
         assert_eq!(self.pending_size, self.size);
+        let live: BTreeSet<u64> = self.pages().into_iter().collect();
         let Pages { pool, cache, space } = &self.pages;
+        let dropped: BTreeSet<u64> = space.dropped().collect();
+        // The scan holds the version it reads: every leaf page it has yet to mark is
+        // in the tree, or held back for it.
+        for &page in unmarked {
+            assert!(!space.is_used(page), "page {page} marked before the scan");
+            assert!(
+                live.contains(&page) || dropped.contains(&page),
+                "page {page} left for the scan, but neither live nor dropped"
+            );
+        }
         // Pages that versions replaced stay in use until a write frees them.
         assert_eq!(
-            space.used_count() as u64,
-            crate::meta::META_PAGES + stats.pages + space.dropped().count() as u64,
+            space.used_count() as u64 + unmarked.len() as u64,
+            crate::meta::META_PAGES + stats.pages + dropped.len() as u64,
             "pages leaked"
         );
+        // Each internal node above level 1 holds a reference from each node above it
+        // that refers to it, and from each root it is: the current one, and the one
+        // the scan holds.
+        let mut refs = std::collections::HashMap::new();
+        for root in [self.root, held].into_iter().flatten() {
+            if root.level > 1 {
+                count_refs(pool, root.frame, &mut refs);
+            }
+        }
+        for (&frame, &n) in &refs {
+            let info = pool.frame(frame);
+            assert_eq!((info.holds, info.dirty), (Holds::Internal, false));
+            assert_eq!(pool.refs(frame), n, "frame {frame} has extra references");
+        }
         // Frames that cancelled reads left behind wait for the clock hand.
         // The pages each frame takes: a large frame holds a value leaf.
         let pages = |frame| pool.frame(frame).pages as usize;
@@ -2341,10 +2380,18 @@ impl Tree {
             .filter(|&f| pool.frame(f).holds == Holds::Loading && pool.refs(f) == 0)
             .map(pages)
             .sum();
+        for &frame in reading {
+            assert_eq!(pool.frame(frame).holds, Holds::Loading);
+            assert!(
+                pool.refs(frame) > 0,
+                "frame {frame} read into, but let go of"
+            );
+        }
+        let reading: usize = reading.iter().map(|&frame| pages(frame)).sum();
         let cached: usize = cache.entries().map(|(_, frame)| pages(frame)).sum();
         assert_eq!(
             pool.in_use(),
-            stats.internal + cached + cancelled,
+            refs.len() + cached + cancelled + reading,
             "frames leaked"
         );
         for (page, frame) in cache.entries() {
@@ -2360,7 +2407,10 @@ impl Tree {
             );
             assert_eq!(pool.refs(frame), 0, "leaf {page} still pinned");
             let first = node::first_page(page);
-            assert!(space.is_used(first), "cached leaf {page} on a free page");
+            assert!(
+                space.is_used(first) || unmarked.contains(&first),
+                "cached leaf {page} on a free page"
+            );
         }
         assert!(self.pinned.is_empty() && self.pending.is_none());
         assert!(!cache.writing(), "a write still holds leaves");
@@ -2370,13 +2420,15 @@ impl Tree {
     }
 
     /// Checks the subtree at `node`, whose keys fall in `lo..hi`, and returns its
-    /// smallest key if known.
+    /// smallest key if known. The pages in `unmarked` are left for the scan of
+    /// level 1 to mark.
     fn check_node(
         &mut self,
         node: Child,
         level: u8,
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
+        unmarked: &BTreeSet<u64>,
         stats: &mut Stats,
     ) -> Option<Vec<u8>> {
         let Child { frame, page, size } = node;
@@ -2384,7 +2436,7 @@ impl Tree {
         let first = node::first_page(page);
         for page in first..first + node::pages(page) {
             assert!(
-                self.pages.space.is_used(page),
+                self.pages.space.is_used(page) || unmarked.contains(&page),
                 "page {page} in the tree but free"
             );
         }
@@ -2410,16 +2462,11 @@ impl Tree {
             assert_eq!(frame, NO_FRAME);
             self.node_bytes(frame, page, level)
         } else {
-            stats.internal += 1;
+            // The references to it are checked with the others.
             let info = *self.pages.pool.frame(frame);
             assert_eq!(
                 (info.holds, info.page, info.dirty),
                 (Holds::Internal, page, false)
-            );
-            assert_eq!(
-                self.pages.pool.refs(frame),
-                1,
-                "frame {frame} has extra references"
             );
             self.node_bytes(frame, page, level)
         };
@@ -2464,7 +2511,8 @@ impl Tree {
                     hi
                 };
                 let child = node::decode_child(entries.value(i), level - 1);
-                let min = self.check_node(child, level - 1, Some(entries.key(i)), child_hi, stats);
+                let key = Some(entries.key(i));
+                let min = self.check_node(child, level - 1, key, child_hi, unmarked, stats);
                 if let Some(min) = min {
                     assert_eq!(
                         min,
@@ -2661,11 +2709,27 @@ impl Tree {
     }
 }
 
+/// Counts in `refs` a reference to the internal node above level 1 in `frame`,
+/// and, the first time, those it holds to the nodes below it above level 1.
+#[cfg(test)]
+fn count_refs(pool: &Pool, frame: FrameId, refs: &mut std::collections::HashMap<FrameId, u32>) {
+    let n = refs.entry(frame).or_insert(0);
+    *n += 1;
+    if *n > 1 {
+        return;
+    }
+    let node = Node::new(pool.page(frame));
+    if node.level() > 2 {
+        for i in 0..node.count() {
+            count_refs(pool, node.child(i), refs);
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct Stats {
     pages: u64,
-    internal: usize,
     /// The leaves' sizes, as their parents record them.
     size: Size,
 }

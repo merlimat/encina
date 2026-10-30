@@ -87,7 +87,6 @@ impl Cache {
     }
 
     /// The frame holding a page, without marking it used.
-    #[cfg(test)]
     pub(crate) fn peek(&self, page: u64) -> Option<FrameId> {
         self.map.get(&page).copied()
     }

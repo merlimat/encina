@@ -108,6 +108,7 @@ mod node;
 mod options;
 mod pool;
 mod reads;
+mod scan;
 // The fuzz targets open stores on the simulated disk, and use only some of it.
 #[cfg(any(test, fuzzing))]
 #[cfg_attr(not(test), allow(dead_code))]

@@ -31,6 +31,8 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - name: Clippy for the leaf-layout benchmark
         run: cargo clippy --manifest-path experiments/leaf-layouts/Cargo.toml -- -D warnings
+      - name: Clippy for the open-time benchmark
+        run: cargo clippy --manifest-path experiments/open-time/Cargo.toml -- -D warnings
 
   msrv:
     name: Check on the minimum Rust version

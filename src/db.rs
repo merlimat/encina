@@ -21,9 +21,11 @@ use std::mem;
 use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::pin::pin;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::slice;
 use std::task::{Context, Poll, ready};
+
+use compio::runtime::JoinHandle;
 
 use crate::batch::WriteBatch;
 use crate::cache::Cache;
@@ -34,13 +36,14 @@ use crate::node::{self, NO_FRAME, Node, Size, ValueLeaf};
 use crate::options::{DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE, Options};
 use crate::pool::{FrameBuf, FrameId, Holds, Pool, ValueBuf};
 use crate::reads::{Claim, Reads};
+use crate::scan::{self, Scan};
 use crate::space::Space;
 use crate::storage::{PageRead, Storage};
 use crate::tree::{Cursor, Find, MAX_HEIGHT, Pages, Root, Tree, Version};
 use crate::writes::{Turn, Writes};
 
-/// How many reads or writes a write or an open keeps in flight, and how many
-/// leaves an iterator reads ahead.
+/// How many reads or writes a write keeps in flight, and how many leaves an
+/// iterator reads ahead.
 const IO_WINDOW: usize = 16;
 
 /// The most bytes one write request carries: a commit writes each run of adjacent
@@ -144,6 +147,14 @@ struct Inner {
     buffers: RefCell<Vec<Vec<u8>>>,
     /// Buffer lists for the page runs a commit writes, reused likewise.
     runs: RefCell<Vec<Vec<FrameBuf>>>,
+    /// The scan of level 1 that the open leaves to finish, until it ends.
+    scan: RefCell<Option<Scan>>,
+    /// The task that runs it on a file, which dropping the store cancels.
+    scanner: Cell<Option<JoinHandle<()>>>,
+    /// In tests, how many level-1 nodes the scan may have left for a write to let
+    /// it end first, if not its window.
+    #[cfg(test)]
+    scan_wait: Cell<Option<usize>>,
 }
 
 impl Inner {
@@ -170,9 +181,22 @@ impl Inner {
         self.metrics.failed.set(1);
     }
 
+    /// Fails with the error that keeps the store from writing, if any: an earlier
+    /// I/O error in a commit, or the error that stopped the scan of level 1, with
+    /// which the open would have failed before.
+    fn writable(&self) -> Result<()> {
+        if self.failed.get() {
+            return Err(Error::Failed);
+        }
+        match self.scan.borrow().as_ref().and_then(|s| s.error.as_ref()) {
+            Some(e) => Err(e.duplicate()),
+            None => Ok(()),
+        }
+    }
+
     /// Reports the current version's entries, the file's size, and how its pages
     /// are used: by the current version, held back by older versions' readers, or
-    /// free.
+    /// free. The last are known once the scan of level 1 has ended.
     fn report_usage(&self) {
         let tree = self.tree.borrow();
         let size = tree.size();
@@ -181,6 +205,9 @@ impl Inner {
         let page_size = self.page_size as u64;
         let end = self.file_end.get();
         self.metrics.file_size.set((end * page_size) as i64);
+        if self.scan.borrow().is_some() {
+            return;
+        }
         let (used, held) = tree.pages.space.usage();
         let pages = [used - held, held, end - used];
         for (amount, pages) in self.metrics.file_usage.iter().zip(pages) {
@@ -197,6 +224,131 @@ impl Inner {
         let generation = self.tree.borrow().current().generation;
         stale_or(&self.storage, self.page_size, generation, e).await
     }
+
+    /// Drives the scan of level 1, if one runs: keeps a window of its reads in
+    /// flight, and marks the leaves of the level-1 nodes they bring in, in key
+    /// order. Returns once it has ended, with the error that stopped it, if any, or
+    /// once it has marked the leaves of `quota` more nodes, which it counts down.
+    /// After a window of nodes, it lets the other tasks run.
+    fn poll_scan(&self, cx: &mut Context<'_>, quota: &mut usize) -> Poll<Result<()>> {
+        let mut running = self.scan.borrow_mut();
+        let Some(scan) = running.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        if let Some(e) = &scan.error {
+            return Poll::Ready(Err(e.duplicate()));
+        }
+        let mut tree = self.tree.borrow_mut();
+        let mut reads = self.reads.borrow_mut();
+        let window = scan_window(&tree.pages.cache);
+        let mut marked = 0;
+        loop {
+            self.fill_scan(scan, &mut tree, &mut reads, window);
+            if scan.len() == 0 {
+                break;
+            }
+            if *quota == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if marked == window {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let (page, held) = *scan.at(0);
+            let frame = if held.is_some() {
+                match poll_read(&mut tree, &mut reads, cx, page, 1, &mut scan.at(0).1) {
+                    Poll::Pending => return Poll::Pending,
+                    // Another reader claimed the read: the node is cached, unless the
+                    // read failed.
+                    Poll::Ready(None) => continue,
+                    Poll::Ready(Some(Ok(frame))) => {
+                        // Read for the scan alone: the cache lets go of it first.
+                        tree.pages.pool.frame_mut(frame).clock = false;
+                        frame
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        let e = scan.fail(e, &mut reads, &mut tree.pages.pool);
+                        return Poll::Ready(Err(e));
+                    }
+                }
+            } else if let Some(frame) = tree.pages.cache.peek(page) {
+                tree.pages.pool.retain(frame);
+                frame
+            } else {
+                // Like a lookup's, this read grows the pool past the budget if it
+                // has to, so the scan always goes on.
+                scan.at(0).1 = Some(read_leaf(self, &mut tree, &mut reads, page));
+                continue;
+            };
+            let Pages { pool, space, .. } = &mut tree.pages;
+            let checked = scan.mark(space, &Node::new(pool.page(frame)));
+            pool.unref(frame);
+            if let Err(e) = checked {
+                let e = scan.fail(e, &mut reads, &mut tree.pages.pool);
+                return Poll::Ready(Err(e));
+            }
+            scan.pop();
+            *quota -= 1;
+            marked += 1;
+        }
+        // Every page in use is marked.
+        running.take().unwrap().end(&mut tree);
+        drop((running, tree, reads));
+        self.report_usage();
+        Poll::Ready(Ok(()))
+    }
+
+    /// Tops up the window of the scan of level 1 with the next level-1 nodes, and
+    /// starts reading those past the first that aren't cached, within the budget.
+    fn fill_scan(&self, scan: &mut Scan, tree: &mut Tree, reads: &mut Reads, window: usize) {
+        while scan.len() < window
+            && let Some(page) = scan.next_page(&tree.pages.pool)
+        {
+            scan.push(page);
+        }
+        for k in 1..scan.len() {
+            let (page, held) = *scan.at(k);
+            if held.is_some() || tree.pages.cache.peek(page).is_some() {
+                continue;
+            }
+            match read_ahead(self, tree, reads, page) {
+                Some((_, slot)) => scan.at(k).1 = Some(slot),
+                // No frame is free within the budget: the reads in flight free some.
+                None => break,
+            }
+        }
+    }
+
+    /// Whether a write should let the scan of level 1 end first: when it has no
+    /// more than a window of level-1 nodes left, reading them costs the write about
+    /// one read, and saves it from taking pages past the end of the file, as a
+    /// small store's first writes would.
+    fn scan_nearly_done(&self) -> bool {
+        let window = scan_window(&self.tree.borrow().pages.cache);
+        #[cfg(test)]
+        let window = self.scan_wait.get().unwrap_or(window);
+        self.scan
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.left() <= window)
+    }
+}
+
+/// How many level-1 nodes the scan of level 1 reads at once: at most a quarter
+/// of the cache budget, as an iterator reads ahead.
+fn scan_window(cache: &Cache) -> usize {
+    scan::WINDOW.min(cache.budget() / 4).max(1)
+}
+
+/// Runs the scan of level 1 in a task of its own, which holds the store only while
+/// it is polled: dropping the store cancels it.
+async fn scan_level_1(inner: Weak<Inner>) {
+    let mut all = usize::MAX;
+    poll_fn(|cx| match inner.upgrade() {
+        Some(inner) => inner.poll_scan(cx, &mut all).map(drop),
+        None => Poll::Ready(()),
+    })
+    .await;
 }
 
 impl Db {
@@ -210,6 +362,12 @@ impl Db {
     /// another `Db`, in this process or another, has it open. That `Db` lets go
     /// once it, its clones and its iterators are closed or dropped, and any I/O it
     /// started has finished. A [`ReadOnlyDb`] can read the store meanwhile.
+    ///
+    /// Opening reads the internal nodes above the leaves' parents, a fraction of a
+    /// percent of the internal nodes, and returns: the store serves reads and
+    /// writes at once. A task that the store spawns on the current compio runtime
+    /// then reads the leaves' parents, to find the pages free for reuse. Until it
+    /// has, writes take new pages at the end of the file.
     pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
         opts.validate()?;
         let (storage, len) = Storage::open(path.as_ref()).await?;
@@ -283,7 +441,6 @@ impl Db {
             }
             root => root?,
         };
-        #[allow(unused_mut)]
         let mut tree = Tree::new(
             pages,
             page_size,
@@ -298,6 +455,12 @@ impl Db {
         if let Storage::Sim(disk) = &storage {
             tree.disk = Some(disk.clone());
         }
+        // The scan of level 1 marks the pages of the leaves while the store serves
+        // reads and writes. A view writes nothing, so it needs no free pages.
+        let scan = match read_only {
+            false => Scan::new(&mut tree),
+            true => None,
+        };
         let inner = Inner {
             tree: RefCell::new(tree),
             reads: RefCell::new(reads),
@@ -311,13 +474,27 @@ impl Db {
             max_key: opts.max_key_size(),
             buffers: RefCell::new(Vec::new()),
             runs: RefCell::new(Vec::new()),
+            scan: RefCell::new(scan),
+            scanner: Cell::new(None),
+            #[cfg(test)]
+            scan_wait: Cell::new(None),
         };
         if !read_only {
             inner.report_usage();
         }
-        Ok(Db {
-            inner: Rc::new(inner),
-        })
+        let inner = Rc::new(inner);
+        // On a file, the scan runs in a task of its own. On the simulated disk, the
+        // tests drive it.
+        let on_file = match &inner.storage {
+            Storage::File(_) => true,
+            #[cfg(any(test, fuzzing))]
+            Storage::Sim(_) => false,
+        };
+        if on_file && inner.scan.borrow().is_some() {
+            let task = compio::runtime::spawn(scan_level_1(Rc::downgrade(&inner)));
+            inner.scanner.set(Some(task));
+        }
+        Ok(Db { inner })
     }
 
     /// Applies `batch` atomically and durably: once this returns `Ok`, the batch is
@@ -332,6 +509,9 @@ impl Db {
     /// store unchanged. One during the commit leaves it unknown whether the batch
     /// is durable, and makes this and later writes fail with [`Error::Failed`]
     /// until the store is reopened. Writes that share a commit share its outcome.
+    /// If the reads that follow the [`open`](Self::open) find a page corrupt, or
+    /// fail, writes fail with that error until the store is reopened: the store
+    /// can't know which of its pages are free.
     ///
     /// Dropping the future withdraws the batch while it waits, and until its
     /// commit starts writing pages. After that, the batch commits with the rest,
@@ -357,9 +537,7 @@ impl Db {
 
     async fn write_batch(&self, batch: &mut WriteBatch) -> Result<()> {
         let inner = &*self.inner;
-        if inner.failed.get() {
-            return Err(Error::Failed);
-        }
+        inner.writable()?;
         batch.check(inner.max_key)?;
         // Wait for the commit in progress, if any. Then this write commits, alone
         // or with the writes that queued alongside it, or another of them does.
@@ -568,6 +746,12 @@ impl Db {
     /// is already durable.
     pub async fn close(self) -> Result<()> {
         if let Ok(inner) = Rc::try_unwrap(self.inner) {
+            // The reads of the scan of level 1 keep the file open until it lets go
+            // of them.
+            if let Some(scan) = inner.scan.borrow_mut().as_mut() {
+                let mut tree = inner.tree.borrow_mut();
+                scan.release(&mut inner.reads.borrow_mut(), &mut tree.pages.pool);
+            }
             match inner.storage {
                 Storage::File(file) => file.close().await?,
                 #[cfg(any(test, fuzzing))]
@@ -601,13 +785,50 @@ impl Db {
         self.tree().set_slice(slice);
     }
 
-    /// Checks the tree, and that no read is held and no write waits: only valid
-    /// while no reader or write is in progress.
+    /// Checks the tree, and that no read is held but the scan's, and no write
+    /// waits: only valid while no reader or write is in progress.
     #[cfg(test)]
     pub(crate) fn check(&self) {
-        self.tree().check();
-        assert!(self.inner.reads.borrow().is_idle(), "reads still held");
+        let scan = self.inner.scan.borrow();
+        let reads = self.inner.reads.borrow();
+        let mut tree = self.tree();
+        let slots: Vec<usize> = scan.iter().flat_map(Scan::slots).collect();
+        let mut reading = Vec::new();
+        for (slot, frame) in reads.held() {
+            assert!(slots.contains(&slot), "reads still held");
+            reading.extend(frame);
+        }
+        match scan.as_ref() {
+            Some(scan) => {
+                let level_1 = |page| tree.node_bytes(NO_FRAME, page, 1);
+                let unmarked = scan.unmarked(&tree.pages.pool, level_1);
+                tree.check_scanning(scan.version.root, &unmarked, &reading);
+            }
+            None => tree.check(),
+        }
         assert!(self.inner.writes.borrow().is_idle(), "writes still waiting");
+    }
+
+    /// Drives the scan of level 1 until it has marked the leaves of `nodes` more
+    /// level-1 nodes, or has ended. Fails with the error that stopped it, if any.
+    #[cfg(any(test, fuzzing))]
+    pub(crate) async fn scan_level_1(&self, nodes: usize) -> Result<()> {
+        let mut quota = nodes;
+        poll_fn(|cx| self.inner.poll_scan(cx, &mut quota)).await
+    }
+
+    /// Sets how many level-1 nodes the scan of level 1 may have left for a write
+    /// to let it end first, or with `None`, back to the scan's window.
+    #[cfg(test)]
+    pub(crate) fn set_scan_wait(&self, nodes: Option<usize>) {
+        self.inner.scan_wait.set(nodes);
+    }
+
+    /// The level-1 nodes whose leaves the scan of level 1 has left to mark, while
+    /// it runs, or after it stopped at an error.
+    #[cfg(test)]
+    pub(crate) fn scan_left(&self) -> Option<usize> {
+        self.inner.scan.borrow().as_ref().map(Scan::left)
     }
 }
 
@@ -886,10 +1107,10 @@ async fn read_meta(storage: &Storage, len: usize, offset: u64) -> Result<Option<
     Ok(Meta::decode(pool.page(frame)))
 }
 
-/// Loads every internal node of the tree `meta` describes, and marks the tree's
-/// pages used. The nodes above level 1 stay in memory, each parent pointing at its
-/// children's frames. The level-1 nodes, read to find their leaves' pages, go to
-/// the cache, which keeps those it has room for. Returns the root.
+/// Loads the internal nodes above level 1 of the tree `meta` describes, which stay
+/// in memory, each parent pointing at its children's frames, and marks their
+/// pages, and those of the level-1 nodes, used. The scan of level 1 marks those
+/// of the leaves. Returns the root.
 async fn load_internal(
     storage: &Storage,
     pages: &mut Pages,
@@ -905,39 +1126,24 @@ async fn load_internal(
         return Err(Error::Corruption { page: meta.root });
     }
     pages.space.mark_used(meta.root);
-    if meta.root_level == 0 {
+    if meta.root_level <= 1 {
         return Ok(Some(Root {
             page: meta.root,
             frame: NO_FRAME,
-            level: 0,
+            level: meta.root_level,
         }));
     }
     let page_size = meta.page_size as u64;
-    // Level-1 nodes take frames from the cache as they are read, a window at a time.
-    let root = match meta.root_level {
-        1 => NO_FRAME,
-        _ => pages.pool.alloc(Holds::Internal, meta.root),
-    };
+    let root = pages.pool.alloc(Holds::Internal, meta.root);
     let mut level_nodes = vec![(root, meta.root)];
-    for level in (1..=meta.root_level).rev() {
+    for level in (2..=meta.root_level).rev() {
         let mut next = Vec::new();
         // Read this level, then mark the pages of the level below, which it lists.
-        // The level-1 nodes being read fit in what the nodes above leave of the
-        // cache's budget, so that the pool stays within it.
-        let window = match level {
-            1 => IO_WINDOW.min(pages.cache.budget().saturating_sub(pages.pool.in_use())),
-            _ => IO_WINDOW,
-        };
-        for chunk in level_nodes.chunks_mut(window.max(1)) {
-            if level == 1 {
-                for (frame, page) in chunk.iter_mut() {
-                    *frame = pages.cache.alloc(&mut pages.pool, Holds::Loading, *page);
-                }
-            }
-            let reads: [_; IO_WINDOW] = array::from_fn(|i| {
+        for chunk in level_nodes.chunks(scan::WINDOW) {
+            let reads: [_; scan::WINDOW] = array::from_fn(|i| {
                 let &(frame, page) = chunk.get(i)?;
                 metrics.read.add(page_size as usize);
-                Some(storage.read(pages.pool.buf(frame), page * page_size))
+                Some(storage.start_read(pages.pool.buf(frame), page * page_size))
             });
             let results = join(reads).await.into_iter().flatten();
             for (&(frame, page), (res, buf)) in chunk.iter().zip(results) {
@@ -953,37 +1159,28 @@ async fn load_internal(
                     return Err(Error::Corruption { page });
                 }
             }
-            for &(parent, page) in chunk.iter() {
+            for &(parent, _) in chunk {
                 let count = Node::new(pages.pool.page(parent)).count();
                 for i in 0..count {
                     let page = Node::new(pages.pool.page(parent)).child_page(i);
-                    // Only leaves may be value leaves, and each page of one is the
-                    // tree's.
-                    let (first, n) = (node::first_page(page), node::pages(page));
-                    if (level > 1 && node::span(page) > 0)
-                        || first < meta::META_PAGES
-                        || first + n > high_water
-                        || (first..first + n).any(|page| pages.space.is_used(page))
+                    // Only leaves are value leaves.
+                    if node::span(page) > 0
+                        || page < meta::META_PAGES
+                        || page >= high_water
+                        || pages.space.is_used(page)
                     {
-                        return Err(Error::Corruption { page: first });
+                        return Err(Error::Corruption {
+                            page: node::first_page(page),
+                        });
                     }
-                    for page in first..first + n {
-                        pages.space.mark_used(page);
-                    }
-                    // Leaves and level-1 nodes are found by page id: a level-1
-                    // node's references hold their sizes where the frames go, and a
-                    // level-2 node's zeros.
+                    pages.space.mark_used(page);
+                    // Level-1 nodes are found by page id, through the cache: a
+                    // level-2 node's references hold zeros where the frames go.
                     if level > 2 {
                         let frame = pages.pool.alloc(Holds::Internal, page);
                         node::set_child_frame(pages.pool.page_mut(parent), i, frame);
                         next.push((frame, page));
-                    } else if level == 2 {
-                        next.push((NO_FRAME, page));
                     }
-                }
-                if level == 1 {
-                    pages.adopt_leaf(parent, page);
-                    pages.pool.unref(parent);
                 }
             }
         }
@@ -999,8 +1196,10 @@ async fn load_internal(
 /// Commits the batch of a write that commits alone, or the group of writes that
 /// `guard` leads.
 async fn commit(inner: &Inner, guard: &mut WriteGuard<'_>, batch: &mut WriteBatch) -> Result<()> {
-    if inner.failed.get() {
-        return Err(Error::Failed);
+    inner.writable()?;
+    if inner.scan_nearly_done() {
+        let mut all = usize::MAX;
+        poll_fn(|cx| inner.poll_scan(cx, &mut all)).await?;
     }
     let timing = inner.metrics.commit.start();
     let group = guard.group;
@@ -1177,16 +1376,23 @@ impl Drop for Queued<'_> {
 
 /// Reads the value leaf with page id `page`, which the cache doesn't keep, into a
 /// buffer, `old` if it is large enough, and checks it. No value leaf a reader can
-/// reach was written after the current generation.
+/// reach was written after the current generation, or lies past the high-water
+/// mark: the span its parent gives is checked before the buffer is taken, since
+/// the open no longer checks it (see [`Scan`]).
 async fn read_value_leaf(inner: &Inner, page: u64, old: Option<ValueBuf>) -> Result<ValueBuf> {
     let first = node::first_page(page);
+    if first + node::span(page) > inner.tree.borrow().pages.space.high_water() {
+        return Err(Error::Corruption { page: first });
+    }
     let len = node::span(page) as usize * inner.page_size;
     let buf = ValueBuf::new(old, len);
     inner.metrics.read.add(len);
     let timing = inner.metrics.read_duration.start();
     let (res, buf) = inner.storage.read_value(buf, inner.offset(first)).await;
     timing.stop();
-    res?;
+    if res.is_err() {
+        return Err(read_error(res, page));
+    }
     let generation = inner.tree.borrow().current().generation;
     if !node::verify_value_leaf(buf.bytes(), inner.page_size)
         || ValueLeaf::new(buf.bytes()).generation() > generation
@@ -1309,7 +1515,7 @@ fn poll_read(
 
 /// Checks and caches the page a claimed read brought in, a leaf or a level-1 node
 /// at `level`, pinning its frame. No node a reader can reach was written after
-/// `generation`, the current one.
+/// `generation`, the current one, or lies past the high-water mark.
 fn finish(
     pages: &mut Pages,
     page: u64,
@@ -1321,22 +1527,35 @@ fn finish(
     pages.pool.retain(frame);
     drop(buf);
     let bytes = pages.pool.page(frame);
-    let intact = if node::span(page) > 0 {
-        node::verify_value_leaf(bytes, pages.pool.page_size())
-            && ValueLeaf::new(bytes).generation() <= generation
-    } else {
-        node::verify(bytes)
-            && Node::new(bytes).level() == level
-            && Node::new(bytes).generation() <= generation
-    };
+    let within = node::first_page(page) + node::pages(page) <= pages.space.high_water();
+    let intact = within
+        && if node::span(page) > 0 {
+            node::verify_value_leaf(bytes, pages.pool.page_size())
+                && ValueLeaf::new(bytes).generation() <= generation
+        } else {
+            node::verify(bytes)
+                && Node::new(bytes).level() == level
+                && Node::new(bytes).generation() <= generation
+        };
     if res.is_err() || !intact {
         pages.pool.unref(frame);
         pages.pool.free(frame);
-        let page = node::first_page(page);
-        return Err(res.err().map_or(Error::Corruption { page }, Error::from));
+        return Err(read_error(res, page));
     }
     pages.adopt_leaf(frame, page);
     Ok(frame)
+}
+
+/// The error of a read of the node with page id `page`, which brought in bytes
+/// that failed their checks if `res` is `Ok`. No node lies past the end of the
+/// file, so a tree that lists one there is corrupt too.
+fn read_error(res: io::Result<()>, page: u64) -> Error {
+    match res {
+        Err(e) if e.kind() != io::ErrorKind::UnexpectedEof => e.into(),
+        _ => Error::Corruption {
+            page: node::first_page(page),
+        },
+    }
 }
 
 /// Writes the pending version's dirty nodes, in page order: each run of adjacent
