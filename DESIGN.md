@@ -992,11 +992,14 @@ read it again themselves: a failure goes to the reader that claimed it.
 
 No reader depends on another being polled, not even the one that started the
 read: the read is polled with a waker of its own, which wakes every reader waiting
-for it. That waker keeps the waiting readers in a `Mutex`, because Rust requires
-wakers to be `Send` and `Sync`. It is never contended: a store's reads all run on
-its thread. A read whose last reader lets go of it is cancelled. Its frame is freed
-at once if the read is done with it, and otherwise reclaimed by the clock hand once
-the read finishes: the buffer the runtime holds keeps the frame alive until then.
+for it. A reader starts waiting before it polls the read, which may wake that
+waker while it is polled and still return pending: the wake reaches only the
+readers already waiting. That waker keeps the waiting readers in a `Mutex`,
+because Rust requires wakers to be `Send` and `Sync`. It is never contended: a
+store's reads all run on its thread. A read whose last reader lets go of it is
+cancelled. Its frame is freed at once if the read is done with it, and otherwise
+reclaimed by the clock hand once the read finishes: the buffer the runtime holds
+keeps the frame alive until then.
 
 Slots are reused: once the table has grown to the most reads ever in flight at
 once, a miss allocates nothing but what the disk's read does: compio's operation,
@@ -1421,7 +1424,9 @@ complete without suspending.
   reaches the reader that claims it, and that a cancelled read's frame is only
   reused once the read finishes. They also hold a write's leaf read while a second
   write queues up: when the first then fails its commit, the second gets
-  `Error::Failed`.
+  `Error::Failed`. The simulated disk can also make each read yield once, waking its
+  waker while it is polled: the scan that follows an open, a lookup that misses
+  the cache and an iterator still finish.
 - **Leaf cache:** tests drive the clock hands over a pool directly. Making room
   for a value leaf passes no other frame. While a write holds every frame, the hand
   looks a step ahead for each frame taken, still finds a leaf that a reader lets go

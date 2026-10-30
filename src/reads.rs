@@ -169,8 +169,12 @@ impl<R: Future<Output = (io::Result<()>, ReadBuf)> + Unpin> Reads<R> {
     /// another reader claimed it first.
     pub(crate) fn poll(&mut self, i: usize, cx: &mut Context<'_>) -> Poll<Option<Claim>> {
         let slot = &mut self.slots[i];
+        // The reader starts waiting before it polls the read, which may wake its
+        // waker while it is polled and still return pending: the wake reaches only
+        // the readers already waiting. A read that finishes wakes this one too, for
+        // nothing.
+        slot.waiters.add(cx.waker());
         if !slot.advance(&self.duration) {
-            slot.waiters.add(cx.waker());
             return Poll::Pending;
         }
         match std::mem::replace(&mut slot.state, State::Claimed) {
