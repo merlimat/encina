@@ -90,11 +90,13 @@ impl Options {
 
     /// Sets the memory budget for pages, 64 MiB by default.
     ///
-    /// Internal nodes always stay in memory; leaves are cached within what's left,
-    /// and evicted roughly least recently used first. A write needs the leaves it changes
-    /// and the ones it builds in memory at once, so a large batch can exceed the
-    /// budget until it commits. Entries too large for a leaf take at most a
-    /// quarter of the budget, and one larger than that isn't cached.
+    /// Internal nodes above the bottom level always stay in memory, a fraction of a
+    /// percent of the store; leaves and the internal nodes right above them are
+    /// cached within what's left, and evicted roughly least recently used first. A
+    /// write needs the nodes it changes and the ones it builds in memory at once, so
+    /// a large batch can exceed the budget until it commits. Entries too large for a
+    /// leaf take at most a quarter of the budget, and one larger than that isn't
+    /// cached.
     pub fn cache_size(mut self, bytes: usize) -> Self {
         self.cache_size = bytes;
         self

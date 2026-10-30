@@ -6,7 +6,9 @@
 > read, iterators read ahead (§8), nodes whose entries allow it are dense (§5),
 > and bench/ compares encina with RocksDB (§11). Writing large batches' new
 > leaves early remains. M4 is done: entries too large for a leaf get value
-> leaves, which the cache keeps and iterators read ahead (§5).
+> leaves, which the cache keeps and iterators read ahead (§5). Level-1 internal
+> nodes live in the cache too, so memory stays within its budget however large
+> the store grows (§8).
 
 encina is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. Its first
@@ -28,9 +30,10 @@ user is the job RocksDB does inside BookKeeper's `DbLedgerStorage`: mapping
 
 The B+tree is the right call for this workload.
 
-- **Reads.** Internal nodes are always in memory, so a point read is a few binary
-  searches over in-memory nodes plus at most one leaf access. There are no bloom
-  filters and no probing of several levels. A floor lookup is a single descent.
+- **Reads.** Internal nodes stay in memory, the bottom level as the cache has room
+  for it (§8), so a point read is a few binary searches over in-memory nodes plus
+  at most one leaf access. There are no bloom filters and no probing of several
+  levels. A floor lookup is a single descent.
 - **`delete_range` leaves nothing behind.** Covered subtrees are dropped wholesale
   without reading their leaves; only the two boundary leaves are rewritten. An LSM
   writes a range tombstone instead, and every later read in that range has to check
@@ -59,7 +62,7 @@ The costs to accept:
 |---|---|
 | Durability | Each `write()` is atomic and durable: when it returns, the batch is on disk, and readers see it from that moment on. Writes that queue up behind a commit share the next one (§6). There is no separate flush and no internal WAL: after a crash the store opens at the last completed write, and the caller's journal replays anything newer. |
 | Threading | One `!Send` instance per compio thread, no locks or atomics, except in wakers, which Rust requires to be `Send` and `Sync` (§8). Scale by sharding (for example, by ledger id) above the library. |
-| Memory | Bounded from day one and managed entirely by encina: internal nodes stay resident, and leaves live in encina's own leaf cache with a budget, read on demand (§8). No reliance on the OS page cache or `mmap`: the data file is opened for direct I/O (§9). |
+| Memory | Bounded from day one and managed entirely by encina: internal nodes above level 1 stay resident, and level-1 nodes and leaves live in encina's own cache with a budget, read on demand (§8). No reliance on the OS page cache or `mmap`: the data file is opened for direct I/O (§9). |
 | Allocation | No heap allocation on the data path. Frames in the leaf cache are the only exception (§8), besides the buffer a value leaf too large to cache is read into (§5); write batches, the batches that groups of writes share, cursors and reader bookkeeping reuse their memory. compio itself allocates once per I/O operation, so cache misses and commits are not allocation-free (§9). |
 | Keys and values | Arbitrary byte strings, keys up to a quarter of a page. Two node formats: slotted, which handles any lengths, and dense, for nodes whose keys share one length and whose values share another, chosen per node when it is built. An entry too large for either gets a value leaf of its own (§5). |
 
@@ -86,10 +89,11 @@ write(batch) ─► new version ─► write new pages ─► fsync ─► meta 
   memory is byte-for-byte its on-disk page. A cache miss needs no decoding, and the
   budget is counted in frames. Frames double as I/O buffers, which direct I/O needs
   aligned anyway.
-- **Internal nodes are always resident**: an encoded key block (same format as
-  leaves) plus child references. A reference to an internal child holds its frame
-  and page id; a reference to a leaf holds only its page id, and the leaf is found
-  through the cache, so it can be evicted whenever no one is using it.
+- **Internal nodes above level 1 are always resident**: an encoded key block (same
+  format as leaves) plus child references. A reference to a child above level 1
+  holds its frame and page id; a reference to a level-1 node or a leaf holds only
+  its page id, and the node is found through the cache, so it can be evicted
+  whenever no one is using it (§8).
 - **Versions.** A version is a root reference. A node is never mutated after it is
   published. A write builds new nodes along the paths it touches and shares
   everything else, then swaps the root once its commit is durable. Readers holding
@@ -325,10 +329,13 @@ applied in order and atomically.
    once it ends at or before the key. For a group that appends 1M entries to 1,000
    ledgers and deletes 500 older ones, normalizing takes 6 ms on an Apple M5 Pro,
    where checking each key against every range that starts before it took 0.8 s.
-2. **Plan.** Descend the resident internal nodes to find the leaves the batch
-   changes, and load the ones that aren't cached, keeping them pinned. Subtrees
-   that ranges remove whole aren't read. Then free the pages that readers held
-   back, and have let go of since (§8), so that the merge can take them.
+2. **Plan.** Descend the resident internal nodes to find the level-1 nodes the
+   batch changes, and load the ones that aren't cached, keeping them pinned. Then
+   descend through them to the leaves the batch changes, and load those the same
+   way. Subtrees that ranges remove whole aren't descended into, but their level-1
+   nodes are loaded, since they list the leaves to drop. Then free the pages that
+   readers held back, and have let go of since (§8), so that the merge can take
+   them.
 3. **Apply ranges** (see below).
 4. **Bulk merge.** Descend recursively, partitioning the sorted operations by child
    key range. Each touched leaf is rebuilt once from its old entries plus the
@@ -505,7 +512,9 @@ published.
 ### `delete_range(start..end)`
 
 At each internal node, children that lie entirely inside the range are dropped.
-Their page ids come from the resident internal nodes, so no leaf is read.
+Their page ids come from the internal nodes, so no leaf is read: only the level-1
+nodes of the dropped subtrees, which the cache may not have, a fraction of a
+percent of the pages they drop.
 Partially covered children recurse, and the two boundary leaves are rebuilt. Empty
 nodes are removed, and a root left with a single child collapses. Later reads pay
 nothing.
@@ -672,7 +681,9 @@ offset  size  field
 
 The frame only means something in memory: it is written to disk as it stands, and
 loading the node rewrites it. So an internal node stores its references whole: a
-dense one has no value prefix, and a value suffix of 16 bytes.
+dense one has no value prefix, and a value suffix of 16 bytes. A level-2 node's
+children are level-1 nodes, which are found by page id, through the cache (§8):
+its references hold zeros where the frame would go.
 
 A level-1 node's children are leaves, which are found by page id, through the
 cache. Its references hold the leaf's size where the frame would go, and in the
@@ -690,7 +701,7 @@ and the bytes of their keys and values, so a store knows both without reading it
 leaves. A commit adds the sizes of the leaves it builds, and takes out those of the
 leaves it replaces, drops or moves, as their parents' references record them. A
 range that drops whole subtrees takes their entries out from the level-1 nodes
-above their leaves, which stay in memory, so it still reads no leaf. A root leaf
+above their leaves, which it loads (§6), so it still reads no leaf. A root leaf
 has no parent: it holds every entry. Costs:
 
 - The sizes take 4 bytes per reference: about 15% fewer children per internal node
@@ -812,9 +823,10 @@ to 4,540 averaging 158 KiB, and made it three times as fast.
    one with the highest generation. Its high-water mark must leave the meta pages
    in, and its root no deeper than writes take (`MAX_HEIGHT`).
 2. Load the internal pages level by level, verifying checksums, levels and
-   generations, and point each parent at its children's frames. Leaves are read on
-   demand, so open time scales with the internal pages, a fraction of a percent of
-   the file.
+   generations, and point each parent above level 2 at its children's frames. The
+   level-1 nodes are read into the cache, which keeps those it has room for, a
+   window at a time within the budget. Leaves are read on demand, so open time
+   scales with the internal pages, a fraction of a percent of the file.
 3. Build the free bitmap from the pages the tree reaches.
 
 No page past the end of the file is in use, since a commit writes its tree before
@@ -841,8 +853,10 @@ completed write.
   Internal nodes, cached leaves and dirty leaves all live in frames. A cached value
   leaf takes a large frame, of all its pages, which the cache allocates and frees
   (§5).
-- **Internal nodes** are always resident. With prefixes stripped, an internal page
-  holds several hundred children, so internal nodes are well under 1% of the data.
+- **Internal nodes** above level 1 are always resident. Level-1 nodes live in the
+  cache, as leaves do (below). With prefixes stripped, an internal page holds
+  several hundred children, so internal nodes are well under 1% of the data, and
+  all but a fraction of a percent of them are level-1 nodes.
 - **Leaves** live in the cache, keyed by page id in a table sized at open, with CLOCK
   eviction. Only clean, unpinned leaves can be evicted: a write pins the leaves it
   changes and the ones it builds until it publishes, and a reader pins the leaf it
@@ -904,13 +918,40 @@ the read finishes: the buffer the runtime holds keeps the frame alive until then
 Slots are reused: once the table has grown to the most reads ever in flight at
 once, a miss allocates nothing but compio's operation (§9).
 
+### Level-1 nodes
+
+Each internal level is about a fanout smaller than the one below it, so level 1
+holds nearly all the internal nodes: with 150 children per node, 99.3% of them.
+Kept resident, they would grow with the store, past any budget: a billion entries
+with 32-byte keys and 100-byte values take about 1.8 GiB of internal nodes. So
+level-1 nodes live in the cache, found by page id like leaves, and the nodes above
+them, about a fanout fewer again, stay resident. The memory the store takes then
+stays within the budget, however large the store.
+
+- **Reads.** A lookup that doesn't find a level-1 node cached reads it, then the
+  leaf below it: a fully cold lookup takes two dependent reads instead of one. It
+  pins the nodes it reads until it ends, at most two level-1 nodes and two leaves.
+  CLOCK keeps the level-1 nodes over the leaves in use: every access to any of a
+  node's leaves marks it used.
+- **Iterators** pin the level-1 node their cursor is at, since the cursor refers to
+  it by frame across waits. Reading ahead, an iterator that reaches a level-1 node
+  that isn't cached reads it too, and goes on reading leaves under it once it is
+  cached.
+- **Writes** load the level-1 nodes they change first, then the leaves under them,
+  and keep both pinned until they publish (§6). They build level-1 nodes into the
+  cache, as they do leaves.
+- **Open** still reads every level-1 node, to mark its leaves' pages used (§7), so
+  it takes as long as before. A level-1 node that isn't cached when a write moves
+  or merges its siblings stays where it is, as a leaf does.
+
 ### Reading ahead
 
 Leaves are scattered on disk (§2), and direct I/O leaves no OS read-ahead anyway, so
-iterators read ahead themselves. Internal nodes are resident, so an iterator knows
-the pages of the leaves it will visit. When the leaf it moves to isn't cached, it
-waits for that leaf's read and meanwhile starts reads of the following leaves that
-aren't cached either, so that a cold scan keeps many reads in flight instead of one.
+iterators read ahead themselves. The internal nodes list the leaves' pages, so an
+iterator knows the pages of the leaves it will visit. When the leaf it moves to
+isn't cached, it waits for that leaf's read and meanwhile starts reads of the
+following leaves that aren't cached either, so that a cold scan keeps many reads in
+flight instead of one.
 Each such miss tops the window up again. The window spans `IO_WINDOW` (16) leaves
 past the current one, which take at most a quarter of the cache budget, a value leaf
 all of its pages. A value leaf too large to cache isn't read ahead. The window ends
@@ -1210,7 +1251,7 @@ complete without suspending.
     fuzzed.
   - `node_round_trip`, `value_leaf_round_trip` and `meta_round_trip`: what the
     encoders write decodes back to what they were given. Sorted entries of any
-    lengths are built into nodes a page's worth at a time, at levels 0 to 2, with
+    lengths are built into nodes a page's worth at a time, at levels 0 to 3, with
     child references above 0; a value leaf is copied out a page at a time over
     other bytes, as a commit does; and a meta page has any fields.
 

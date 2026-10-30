@@ -87,7 +87,7 @@ pub fn node(data: &[u8]) {
 pub fn node_round_trip(data: &[u8]) {
     let mut input = Input(data);
     let page_size = input.page_size();
-    let level = input.u8() % 3;
+    let level = input.u8() % 4;
     let generation = input.u64();
     let max = node::max_entry(page_size);
     // Keys of one length, and values of another, make dense nodes.
@@ -111,11 +111,12 @@ pub fn node_round_trip(data: &[u8]) {
                         bytes: input.u32().into(),
                     },
                 ),
-                true,
+                0,
             ),
+            2 => reference(Child::level_1(input.u64()), 1),
             _ => reference(
                 Child::internal(input.u32().min(NO_FRAME - 1), input.u64()),
-                false,
+                2,
             ),
         };
         entries.insert(key, value);
@@ -154,7 +155,7 @@ pub fn node_round_trip(data: &[u8]) {
                 assert_eq!(&page[at..at + len], v);
             }
             if level > 0 {
-                assert_eq!(node.child_at(i), node::decode_child(v, level == 1));
+                assert_eq!(node.child_at(i), node::decode_child(v, level - 1));
             }
             // The key, and probes just after it and before it.
             let mut after = k.clone();
@@ -170,11 +171,10 @@ pub fn node_round_trip(data: &[u8]) {
     }
 }
 
-/// The reference to `child`, held by a level-1 node if `leaf`, which decodes back
-/// to it.
-fn reference(child: Child, leaf: bool) -> Vec<u8> {
+/// The reference to `child`, at `level`, which decodes back to it.
+fn reference(child: Child, level: u8) -> Vec<u8> {
     let r = node::child_ref(child);
-    assert_eq!(node::decode_child(&r, leaf), child);
+    assert_eq!(node::decode_child(&r, level), child);
     r.to_vec()
 }
 
