@@ -243,16 +243,16 @@ impl Inner {
         let window = scan_window(&tree.pages.cache);
         let mut marked = 0;
         loop {
+            self.fill_scan(scan, &mut tree, &mut reads, window);
+            if scan.len() == 0 {
+                break;
+            }
             if *quota == 0 {
                 return Poll::Ready(Ok(()));
             }
             if marked == window {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
-            }
-            self.fill_scan(scan, &mut tree, &mut reads, window);
-            if scan.len() == 0 {
-                break;
             }
             let (page, held) = *scan.at(0);
             let frame = if held.is_some() {
@@ -365,9 +365,9 @@ impl Db {
     ///
     /// Opening reads the internal nodes above the leaves' parents, a fraction of a
     /// percent of the internal nodes, and returns: the store serves reads and
-    /// writes at once. The leaves' parents are then read in a task the store
-    /// spawns on the current compio runtime, which finds the pages free for reuse.
-    /// Until it has, writes take new pages at the end of the file.
+    /// writes at once. A task that the store spawns on the current compio runtime
+    /// then reads the leaves' parents, to find the pages free for reuse. Until it
+    /// has, writes take new pages at the end of the file.
     pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
         opts.validate()?;
         let (storage, len) = Storage::open(path.as_ref()).await?;

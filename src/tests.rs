@@ -1271,9 +1271,11 @@ fn opening_reads_only_the_levels_above_1() {
     assert_eq!(store.db.scan_left(), Some(level_1 as usize));
     check_sampled_reads(&store.db, &model);
     store.db.check();
+    // It ends with the last of them.
     store.reopen();
     let ops = store.disk.ops();
-    store.finish_scan();
+    now(store.db.scan_level_1(level_1 as usize)).unwrap();
+    assert_eq!(store.db.scan_left(), None);
     assert_eq!(store.disk.ops() - ops, level_1);
     within_budget(&store.db);
     check_tree(&store.db, &model);
