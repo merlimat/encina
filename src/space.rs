@@ -15,9 +15,11 @@
 //! Page allocation.
 //!
 //! A bitmap tracks which pages are in use. Nothing about it is stored: opening a
-//! store marks the pages its tree reaches. A page that a write replaces stays in
-//! use until no reader of an older version, which might still read it, is left,
-//! and a write frees it.
+//! store marks the pages of its internal nodes, and a scan that goes on after the
+//! open marks those of its leaves. Until the scan ends, pages are allocated past
+//! where the file ended, which are free whatever the scan finds. A page that a
+//! write replaces stays in use until no reader of an older version, which might
+//! still read it, is left, and a write frees it.
 //!
 //! A write takes its pages in order from runs of free pages, so that its commit
 //! writes each run with one request. Free stretches shorter than
@@ -71,6 +73,9 @@ pub(crate) struct Space {
     high_water: u64,
     /// No page below this one is free.
     lowest_free: u64,
+    /// No page below this one is allocated, and the high-water mark doesn't come
+    /// down below it: the scan hasn't marked every page in use there yet.
+    floor: u64,
     /// The run each [`Life`] allocates from, while a write is in progress.
     runs: [Run; 2],
     /// Pages the write in progress allocated and freed again: holes in its runs,
@@ -99,6 +104,7 @@ impl Space {
             min_run,
             high_water,
             lowest_free: 0,
+            floor: 0,
             runs: [Run::default(); 2],
             holes: Vec::new(),
             #[cfg(test)]
@@ -127,9 +133,24 @@ impl Space {
         self.in_use += 1;
     }
 
+    /// Takes no page below the high-water mark as it is now, and keeps the mark
+    /// from coming down below it, until [`end_scan`](Self::end_scan): the pages
+    /// in use there aren't all marked yet. Those at or above it are free until
+    /// allocated, whatever the scan finds.
+    pub(crate) fn start_scan(&mut self) {
+        self.floor = self.high_water;
+    }
+
+    /// Every page in use is marked: allocation may take any free page again.
+    pub(crate) fn end_scan(&mut self) {
+        self.floor = 0;
+        // Allocation took no note of the free pages below the floor.
+        self.lowest_free = 0;
+    }
+
     /// Makes the next allocation start over from the lowest free page: each write
     /// starts with this, so that it reuses what earlier writes freed. The
-    /// high-water mark comes down to the last page in use.
+    /// high-water mark comes down to the last page in use, or to the floor.
     pub(crate) fn restart(&mut self) {
         self.runs = [Run::default(); 2];
         self.holes.clear();
@@ -138,9 +159,10 @@ impl Space {
             self.freed = 0;
         }
         let last = self.used.iter().rposition(|&w| w != 0);
-        self.high_water = last.map_or(0, |i| {
+        let last = last.map_or(0, |i| {
             (i as u64 + 1) * 64 - u64::from(self.used[i].leading_zeros())
         });
+        self.high_water = last.max(self.floor);
         self.used.truncate(self.high_water.div_ceil(64) as usize);
     }
 
@@ -186,7 +208,7 @@ impl Space {
             self.take(start, n);
             return start;
         }
-        let mut start = self.next_free(self.lowest_free);
+        let mut start = self.next_free(self.lowest_free.max(self.floor));
         loop {
             if let Some(run) = self.runs.iter().find(|r| (r.next..r.end).contains(&start)) {
                 start = self.next_free(run.end);
@@ -221,18 +243,20 @@ impl Space {
 
     /// Whether a node on `page` that the write in progress keeps should move to a
     /// new page, freeing `page` once the write is published: whether `page` sits
-    /// in a window of 64 pages, below the high-water mark, with at most
-    /// [`MOVE_AT`] in use.
+    /// in a window of 64 pages, between the floor and the high-water mark, with at
+    /// most [`MOVE_AT`] in use.
     pub(crate) fn should_move(&self, page: u64) -> bool {
         let word = page / 64;
-        (word + 1) * 64 <= self.high_water && self.used[word as usize].count_ones() <= MOVE_AT
+        word * 64 >= self.floor
+            && (word + 1) * 64 <= self.high_water
+            && self.used[word as usize].count_ones() <= MOVE_AT
     }
 
-    /// The first stretch of free pages at or after `from`, outside the `other`
-    /// run, that is at least `min_run` long or reaches the end of the file,
-    /// where it takes [`CHUNK`] pages.
+    /// The first stretch of free pages at or after `from`, and the floor, outside
+    /// the `other` run, that is at least `min_run` long or reaches the end of the
+    /// file, where it takes [`CHUNK`] pages.
     fn find_run(&mut self, from: u64, other: Run) -> (u64, u64) {
-        let mut start = self.next_free(from.max(self.lowest_free));
+        let mut start = self.next_free(from.max(self.lowest_free).max(self.floor));
         if from <= self.lowest_free {
             self.lowest_free = start;
         }
@@ -287,7 +311,8 @@ impl Space {
         }
     }
 
-    fn unmark(&mut self, page: u64) {
+    /// Marks `page` free.
+    pub(crate) fn unmark(&mut self, page: u64) {
         debug_assert!(self.is_used(page), "page {page} freed twice");
         self.used[(page / 64) as usize] &= !(1 << (page % 64));
         self.lowest_free = self.lowest_free.min(page);
@@ -475,6 +500,29 @@ mod tests {
         assert_eq!(space.high_water(), 70);
         assert_eq!(alloc_n(&mut space, Life::Short, 3), [70, 71, 72]);
         assert_eq!(space.high_water(), 73);
+    }
+
+    #[test]
+    fn until_the_scan_ends_pages_come_from_past_the_floor() {
+        // The pages in use below the mark aren't all marked yet: those that look
+        // free may hold leaves.
+        let mut space = space_with(200, (10..30).chain(64..124).chain(150..200));
+        space.start_scan();
+        assert_eq!(alloc_n(&mut space, Life::Short, 3), [200, 201, 202]);
+        assert_eq!(space.alloc_span(2), 200 + CHUNK);
+        assert!(!space.should_move(70), "a window below the floor moved");
+        // The write frees what it took: the mark stays at the floor.
+        for page in [200, 201, 202, 200 + CHUNK, 201 + CHUNK] {
+            space.free(page);
+        }
+        space.restart();
+        assert_eq!(space.high_water(), 200);
+        // Once the scan has marked them, the free pages below are taken first.
+        space.end_scan();
+        space.restart();
+        assert_eq!(space.high_water(), 150);
+        assert_eq!(space.alloc(Life::Short), 10);
+        assert!(space.should_move(70));
     }
 
     #[test]

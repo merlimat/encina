@@ -16,7 +16,7 @@
 //! into a simulated disk, and a real file.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::Bound;
 use std::pin::{Pin, pin};
@@ -89,10 +89,18 @@ impl Store {
         Store { disk, db, opts }
     }
 
-    /// Restarts the machine, and opens the store again.
+    /// Restarts the machine, and opens the store again. The scan of level 1 is
+    /// left to the test.
     fn reopen(&mut self) {
         self.disk = self.disk.restart();
         self.db = now(Db::open_sim(self.disk.clone(), self.opts.clone())).unwrap();
+    }
+
+    /// Runs the scan of level 1 to its end, which caches the level-1 nodes the
+    /// cache has room for.
+    fn finish_scan(&self) {
+        now(self.db.scan_level_1(usize::MAX)).unwrap();
+        assert_eq!(self.db.scan_left(), None);
     }
 }
 
@@ -209,8 +217,11 @@ enum Step {
     /// with a full scan after each, which mustn't see it. Then it is finished if
     /// marked, and dropped otherwise: if it paused, it applies nothing.
     Paused(Vec<Op>, u8, bool),
-    /// Restarts the machine and reopens the store.
-    Reopen,
+    /// Restarts the machine and reopens the store, which leaves its scan of level 1
+    /// to the next steps. Unless marked, writes never let the scan end first.
+    Reopen(bool),
+    /// Goes on with the scan of level 1 for this many level-1 nodes, if one runs.
+    ScanLevel1(u8),
 }
 
 impl Step {
@@ -229,9 +240,12 @@ impl Step {
                     Op::Put(key, vec![i as u8; *value_len])
                 })
                 .collect(),
-            Step::Get(..) | Step::Scan(..) | Step::Group(_) | Step::Paused(..) | Step::Reopen => {
-                Vec::new()
-            }
+            Step::Get(..)
+            | Step::Scan(..)
+            | Step::Group(_)
+            | Step::Paused(..)
+            | Step::Reopen(_)
+            | Step::ScanLevel1(_) => Vec::new(),
         }
     }
 }
@@ -281,7 +295,8 @@ fn step(value_len: impl Strategy<Value = usize> + Clone) -> impl Strategy<Value 
         .prop_map(Step::Group),
         1 => (prop::collection::vec(op(value_len), 1..40), 1..4u8, any::<bool>())
             .prop_map(|(ops, polls, finish)| Step::Paused(ops, polls, finish)),
-        1 => Just(Step::Reopen),
+        1 => any::<bool>().prop_map(Step::Reopen),
+        1 => (1..8u8).prop_map(Step::ScanLevel1),
     ]
 }
 
@@ -318,7 +333,8 @@ fn dense_step() -> impl Strategy<Value = Step> {
         3 => (key(), prop::sample::select(COMPARISONS.to_vec())).prop_map(|(k, cmp)| Step::Get(k, cmp)),
         1 => (bound(), bound()).prop_map(|(lo, hi)| Step::Scan(lo, hi)),
         1 => prop::collection::vec(dense_op(), 1..40).prop_map(Step::WriteDuringScan),
-        1 => Just(Step::Reopen),
+        1 => any::<bool>().prop_map(Step::Reopen),
+        1 => (1..8u8).prop_map(Step::ScanLevel1),
     ]
 }
 
@@ -414,9 +430,16 @@ fn run_sliced(opts: Options, slice: Option<usize>, steps: &[Step]) {
                 }
                 check_tree(&store.db, &model);
             }
-            Step::Reopen => {
+            Step::Reopen(wait) => {
                 store.reopen();
                 store.db.set_merge_slice(slice);
+                if !wait {
+                    store.db.set_scan_wait(Some(0));
+                }
+                check_tree(&store.db, &model);
+            }
+            Step::ScanLevel1(nodes) => {
+                now(store.db.scan_level_1(usize::from(*nodes))).unwrap();
                 check_tree(&store.db, &model);
             }
         }
@@ -1182,7 +1205,10 @@ fn level_1_nodes_that_outgrow_the_cache_stay_within_its_budget() {
     let budget = store.db.tree().pages.cache.budget();
     assert!(store.db.tree().level_1().len() > 4 * budget);
     assert_eq!(store.db.tree().current().root.unwrap().level, 3);
-    // Opening reads every level-1 node, but keeps those the cache has room for.
+    // The scan of level 1 reads every level-1 node, but keeps those the cache has
+    // room for.
+    within_budget(&store.db);
+    store.finish_scan();
     within_budget(&store.db);
     check_sampled_reads(&store.db, &model);
     within_budget(&store.db);
@@ -1216,18 +1242,179 @@ fn level_1_nodes_that_outgrow_the_cache_stay_within_its_budget() {
     check_tree(&store.db, &model);
 }
 
+/// The pages of the internal nodes above level 1 in `db`'s tree.
+fn upper_nodes(db: &Db) -> u64 {
+    let tree = db.tree();
+    (tree.pages().len() - tree.leaves().len() - tree.level_1().len()) as u64
+}
+
+#[test]
+fn opening_reads_only_the_levels_above_1() {
+    let mut store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
+    let mut model = Model::new();
+    let puts: Vec<_> = (0..20_000).map(|i| scattered_put(i, 0)).collect();
+    write(&store.db, &puts);
+    apply(&mut model, &puts);
+    let level_1 = store.db.tree().level_1().len() as u64;
+    let upper = upper_nodes(&store.db);
+    assert!(level_1 > 4 * upper);
+    // The owner and a view read the meta pages, then the nodes above level 1.
+    store.reopen();
+    assert_eq!(store.disk.ops(), RECOVER_OPS + upper);
+    let ops = store.disk.ops();
+    let view = now(ReadOnlyDb::open_sim(store.disk.clone(), store.opts.clone())).unwrap();
+    assert_eq!(store.disk.ops() - ops, RECOVER_OPS + upper);
+    drop(view);
+    // The scan of level 1 reads each level-1 node once, and the store answers
+    // reads before it does.
+    assert_eq!(store.db.tree().leaf_usage().0, 0);
+    assert_eq!(store.db.scan_left(), Some(level_1 as usize));
+    check_sampled_reads(&store.db, &model);
+    store.db.check();
+    store.reopen();
+    let ops = store.disk.ops();
+    store.finish_scan();
+    assert_eq!(store.disk.ops() - ops, level_1);
+    within_budget(&store.db);
+    check_tree(&store.db, &model);
+}
+
+/// Puts keys `0..n`, each with a value of its own, so that leaves hold a few
+/// dozen entries on 256-byte pages.
+fn distinct_round(n: u32, round: u8) -> Vec<Op> {
+    (0..n)
+        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![i as u8 ^ round; 8]))
+        .collect()
+}
+
+#[test]
+fn reads_and_writes_go_on_during_the_scan() {
+    // A store with free pages among those in use, and dozens of level-1 nodes. A
+    // cache of 16 pages scans 4 at a time, and lets writes go on without waiting
+    // for the scan while more than that are left.
+    let mut store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
+    let mut model = Model::new();
+    for ops in [distinct_round(12_000, 0), distinct_round(6000, 1)] {
+        write(&store.db, &ops);
+        apply(&mut model, &ops);
+    }
+    store.reopen();
+    let end = store.db.tree().pages.space.high_water();
+    let opened: BTreeSet<u64> = store.db.tree().pages().into_iter().collect();
+    assert!(store.db.scan_left().unwrap() > 40);
+    // Until the scan ends, writes take pages past where the file ended, and free
+    // none of the pages they replace.
+    for round in 2..8 {
+        now(store.db.scan_level_1(4)).unwrap();
+        check_sampled_reads(&store.db, &model);
+        let ops: Vec<_> = (0..12_000)
+            .step_by(7)
+            .map(|i| scattered_put(i, round))
+            .collect();
+        write(&store.db, &ops);
+        apply(&mut model, &ops);
+        check_tree(&store.db, &model);
+        let pages = store.db.tree().pages();
+        assert!(
+            pages
+                .iter()
+                .all(|&page| opened.contains(&page) || page >= end),
+            "a write took a page the scan hadn't reached"
+        );
+    }
+    assert!(store.db.scan_left().is_some());
+    store.finish_scan();
+    check_tree(&store.db, &model);
+    // From then on, writes reuse the free pages below.
+    let ops: Vec<_> = (0..12_000)
+        .step_by(3)
+        .map(|i| scattered_put(i, 8))
+        .collect();
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    let pages = store.db.tree().pages();
+    assert!(
+        pages
+            .iter()
+            .any(|&page| !opened.contains(&page) && page < end)
+    );
+    check_tree(&store.db, &model);
+    check_reads(&store.db, &model);
+}
+
+#[test]
+fn the_file_is_cut_only_once_the_scan_has_ended() {
+    node::slotted_only();
+    // A cache of 16 pages, so that writes don't wait for the scan to end.
+    let mut store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
+    let batches = moving_scenario();
+    let mut model = Model::new();
+    for ops in &batches[..4] {
+        write(&store.db, ops);
+        apply(&mut model, ops);
+    }
+    // The last batch freed the second half of the keys, at the end of the file:
+    // the next write would cut it, but the scan hasn't found those pages free.
+    store.reopen();
+    assert!(store.db.scan_left().unwrap() > 4);
+    let len = store.disk.len();
+    let end = store.db.tree().pages.space.high_water();
+    for round in 5..8 {
+        let ops = [Op::Put(0u32.to_be_bytes().to_vec(), vec![round; 8])];
+        write(&store.db, &ops);
+        apply(&mut model, &ops);
+        assert!(store.disk.len() >= len, "the file was cut during the scan");
+        assert!(store.db.tree().pages.space.high_water() >= end);
+        check_tree(&store.db, &model);
+    }
+    // Once it has, the next writes move the pages written meanwhile below, and cut
+    // the file.
+    store.finish_scan();
+    for round in 8..10 {
+        let ops = [Op::Put(0u32.to_be_bytes().to_vec(), vec![round; 8])];
+        write(&store.db, &ops);
+        apply(&mut model, &ops);
+    }
+    assert!(store.disk.len() < len * 7 / 8);
+    check_tree(&store.db, &model);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+}
+
+#[test]
+fn a_write_lets_a_scan_with_little_left_end_first() {
+    let mut store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
+    let mut model = Model::new();
+    let ops = distinct_round(2000, 0);
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    store.reopen();
+    let left = store.db.scan_left().unwrap();
+    assert!(left > 8);
+    // With more than a window of 4 level-1 nodes left, a write goes on without the
+    // scan.
+    let ops = distinct_round(10, 1);
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    assert_eq!(store.db.scan_left(), Some(left));
+    // With no more, it lets the scan end first.
+    now(store.db.scan_level_1(left - 4)).unwrap();
+    assert_eq!(store.db.scan_left(), Some(4));
+    let ops = distinct_round(20, 2);
+    write(&store.db, &ops);
+    apply(&mut model, &ops);
+    assert_eq!(store.db.scan_left(), None);
+    check_tree(&store.db, &model);
+}
+
 #[test]
 fn damaged_pages_are_reported() {
     let mut store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
-    let puts: Vec<_> = (0..300u32)
-        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![7; 8]))
-        .collect();
-    write(&store.db, &puts);
-    let (root, leaf) = {
+    write(&store.db, &round_of(3000, 7));
+    let (root, level_1, leaf) = {
         let tree = store.db.tree();
         let root = tree.current().root.unwrap();
-        assert!(root.level > 0);
-        (root.page, tree.leaves()[0].0)
+        assert!(root.level > 1);
+        (root.page, tree.level_1()[0], tree.leaves()[0].0)
     };
     // A damaged leaf fails the reads that need it.
     store.disk.flip(leaf * 256 + 100);
@@ -1235,7 +1422,19 @@ fn damaged_pages_are_reported() {
     let mut iter = store.db.range(..);
     assert!(matches!(now(iter.next()), Err(Error::Corruption { page }) if page == leaf));
     drop(iter);
-    // A damaged internal node fails the open.
+    // So does a damaged level-1 node, which the open doesn't read. The scan of
+    // level 1 stops there, and writes fail with it.
+    store.disk.flip(level_1 * 256 + 100);
+    store.reopen();
+    let found = now(store
+        .db
+        .get(&0u32.to_be_bytes(), Comparison::Equal, |_, _| ()));
+    assert!(matches!(found, Err(Error::Corruption { page }) if page == level_1));
+    let scanned = now(store.db.scan_level_1(usize::MAX));
+    assert!(matches!(scanned, Err(Error::Corruption { page }) if page == level_1));
+    let written = now(store.db.write(&mut batch_of(&round_of(1, 8))));
+    assert!(matches!(written, Err(Error::Corruption { page }) if page == level_1));
+    // A damaged internal node above level 1 fails the open.
     store.disk.flip(root * 256 + 100);
     let opened = now(Db::open_sim(store.disk.restart(), store.opts.clone()));
     assert!(matches!(opened, Err(Error::Corruption { page }) if page == root));
@@ -1273,20 +1472,34 @@ fn nodes_whose_entries_lie_outside_them_are_reported() {
     let mut iter = store.db.range(..);
     assert!(matches!(now(iter.next()), Err(Error::Corruption { page }) if page == root.page));
     drop(iter);
-    // A root internal node whose first child reference is 3 bytes fails the open.
+    // An internal node whose first child reference is 3 bytes: at the root, above
+    // level 1, it fails the open; at level 1, the reads that need it and the scan
+    // of level 1.
     let store = Store::new(Options::new().page_size(256));
-    write(&store.db, &round_of(300, 0));
+    write(&store.db, &round_of(3000, 0));
     let (root, generation) = current(&store.db);
-    assert!(root.level > 0);
-    let mut buf = node::EntryBuf::default();
-    buf.push(b"a", &[0; 3]);
-    buf.push(b"bb", &[0; node::CHILD_REF]);
-    let mut internal = vec![0; 256];
-    node::build(&mut internal, root.level, &buf, 0, 2);
-    node::seal(&mut internal, generation);
-    store.disk.set_bytes(root.page * 256, &internal);
-    let opened = now(Db::open_sim(store.disk.restart(), store.opts.clone()));
+    assert!(root.level > 1);
+    let short = |level| {
+        let mut buf = node::EntryBuf::default();
+        buf.push(b"a", &[0; 3]);
+        buf.push(b"bb", &[0; node::CHILD_REF]);
+        let mut internal = vec![0; 256];
+        node::build(&mut internal, level, &buf, 0, 2);
+        node::seal(&mut internal, generation);
+        internal
+    };
+    let disk = store.disk.restart();
+    disk.set_bytes(root.page * 256, &short(root.level));
+    let opened = now(Db::open_sim(disk, store.opts.clone()));
     assert!(matches!(opened, Err(Error::Corruption { page }) if page == root.page));
+    let level_1 = store.db.tree().level_1()[0];
+    let disk = store.disk.restart();
+    disk.set_bytes(level_1 * 256, &short(1));
+    let db = now(Db::open_sim(disk, store.opts.clone())).unwrap();
+    let found = now(db.get(&0u32.to_be_bytes(), Comparison::Equal, |_, _| ()));
+    assert!(matches!(found, Err(Error::Corruption { page }) if page == level_1));
+    let scanned = now(db.scan_level_1(usize::MAX));
+    assert!(matches!(scanned, Err(Error::Corruption { page }) if page == level_1));
 }
 
 /// Puts keys `0..n`, each with value `round`.
@@ -1466,17 +1679,18 @@ fn a_read_only_view_of_a_quiet_store_reports_damage() {
     write(&store.db, &round_of(300, 0));
     let (root, leaf) = {
         let tree = store.db.tree();
-        let root = tree.current().root.unwrap();
-        assert!(root.level > 0);
-        (root.page, tree.leaves()[0].0)
+        (tree.current().root.unwrap(), tree.leaves()[0].0)
     };
     // The owner has written nothing since the view opened: the page is corrupt.
     store.disk.flip(leaf * 256 + 100);
     let view = now(ReadOnlyDb::open_sim(store.disk.clone(), opts.clone())).unwrap();
     assert!(matches!(view_scan(&view), Err(Error::Corruption { page }) if page == leaf));
-    store.disk.flip(root * 256 + 100);
-    let opened = now(ReadOnlyDb::open_sim(store.disk.clone(), opts)).map(drop);
-    assert!(matches!(opened, Err(Error::Corruption { page }) if page == root));
+    // The view's open reads no level-1 node: its reads find this one damaged.
+    assert_eq!(root.level, 1);
+    store.disk.flip(root.page * 256 + 100);
+    let view = now(ReadOnlyDb::open_sim(store.disk.clone(), opts)).unwrap();
+    let found = view_get(&view, &7u32.to_be_bytes(), Comparison::Equal);
+    assert!(matches!(found, Err(Error::Corruption { page }) if page == root.page));
 }
 
 #[test]
@@ -1530,41 +1744,52 @@ fn a_read_only_view_overwritten_while_it_opens_is_stale() {
 }
 
 #[test]
-fn a_bad_child_reference_fails_the_open() {
-    let store = Store::new(Options::new().page_size(256));
-    let puts: Vec<_> = (0..300u32)
-        .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![7; 8]))
-        .collect();
-    write(&store.db, &puts);
-    let (root, bytes) = {
-        let tree = store.db.tree();
-        let root = tree.current().root.unwrap();
-        assert!(root.level > 0);
-        (
-            root.page,
-            tree.node_bytes(root.frame, root.page, root.level),
-        )
-    };
-    let first = Node::new(&bytes).child_page(0);
-    // Point the first child past the end of the file, then the second at the
-    // first's page. The root is sealed again, so that it passes its checksum.
-    for (i, bad) in [(0, store.disk.len() / 256), (1, first)] {
-        let mut page = bytes.clone();
-        let (at, _) = Node::new(&page).value_span(i);
-        let child = node::Child {
-            page: bad,
-            ..Node::new(&page).child_at(i)
+fn a_bad_child_reference_fails_the_open_or_the_scan() {
+    // A root above level 1 lists level-1 nodes, which the open checks; a root at
+    // level 1 lists leaves, which the scan of level 1 checks, and writes then fail.
+    for n in [3000, 300] {
+        let store = Store::new(Options::new().page_size(256));
+        write(&store.db, &round_of(n, 7));
+        let (root, bytes) = {
+            let tree = store.db.tree();
+            let root = tree.current().root.unwrap();
+            (root, tree.node_bytes(root.frame, root.page, root.level))
         };
-        page[at..at + node::CHILD_REF].copy_from_slice(&node::child_ref(child));
-        let generation = Node::new(&page).generation();
-        node::seal(&mut page, generation);
-        let disk = store.disk.restart();
-        disk.set_bytes(root * 256, &page);
-        let opened = now(Db::open_sim(disk, store.opts.clone()));
-        assert!(
-            matches!(opened, Err(Error::Corruption { page }) if page == bad),
-            "child {i}"
-        );
+        assert_eq!(root.level > 1, n == 3000);
+        let first = Node::new(&bytes).child_page(0);
+        // Point the first child past the end of the file, then the second at the
+        // first's page. The root is sealed again, so that it passes its checksum.
+        for (i, bad) in [(0, store.disk.len() / 256), (1, first)] {
+            let mut page = bytes.clone();
+            let (at, _) = Node::new(&page).value_span(i);
+            let child = node::Child {
+                page: bad,
+                ..Node::new(&page).child_at(i)
+            };
+            page[at..at + node::CHILD_REF].copy_from_slice(&node::child_ref(child));
+            let generation = Node::new(&page).generation();
+            node::seal(&mut page, generation);
+            let disk = store.disk.restart();
+            disk.set_bytes(root.page * 256, &page);
+            let opened = now(Db::open_sim(disk, store.opts.clone()));
+            let failed = if root.level > 1 {
+                opened.map(drop)
+            } else {
+                let db = opened.unwrap();
+                let scanned = now(db.scan_level_1(usize::MAX));
+                let written = now(db.write(&mut batch_of(&round_of(1, 8))));
+                assert!(
+                    matches!(written, Err(Error::Corruption { page }) if page == bad),
+                    "child {i}: {written:?}"
+                );
+                scanned
+            };
+            assert!(
+                matches!(failed, Err(Error::Corruption { page }) if page == bad),
+                "child {i} of a root at level {}: {failed:?}",
+                root.level
+            );
+        }
     }
 }
 
@@ -1666,7 +1891,9 @@ fn the_file_bounds_the_high_water_mark() {
     store.db.check();
     assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
     // A three-page file whose root lists leaves on pages 3 to 5, within the mark:
-    // no commit wrote them, so the tree is corrupt.
+    // no commit wrote them, so the tree is corrupt. The open reads no level-1 node:
+    // the view's reads find the leaves missing, and the owner's scan of level 1
+    // stops there.
     let mut file = vec![0; 3 * 256];
     let mut buf = node::EntryBuf::default();
     for (i, key) in [b"a", b"b", b"c"].into_iter().enumerate() {
@@ -1687,13 +1914,18 @@ fn the_file_bounds_the_high_water_mark() {
         ..Meta::empty(256)
     };
     meta.encode(&mut file[..256]);
-    let (viewed, opened) = open_both(&file);
+    let disk = SimDisk::new();
+    disk.set_bytes(0, &file);
+    let view = now(ReadOnlyDb::open_sim(disk.clone(), opts.clone())).unwrap();
+    let found = view_get(&view, b"a", Comparison::Equal);
     assert!(
-        matches!(viewed, Err(Error::Corruption { page: 3 })),
-        "{viewed:?}"
+        matches!(found, Err(Error::Corruption { page: 3 })),
+        "{found:?}"
     );
-    assert!(matches!(opened, Err(Error::Corruption { page: 3 })));
-    // So is a root leaf past the end of the file.
+    let db = now(Db::open_sim(disk, opts.clone())).unwrap();
+    let scanned = now(db.scan_level_1(usize::MAX));
+    assert!(matches!(scanned, Err(Error::Corruption { page: 3 })));
+    // A root leaf past the end of the file fails the open.
     Meta {
         root: 5,
         root_level: 0,
@@ -1902,22 +2134,37 @@ fn every_single_failure_while_moving_or_cutting_leaves_a_recoverable_store() {
 /// time, the store is left usable, or failed, and that it reopens in the state
 /// after the last write that succeeded.
 fn check_every_single_failure(opts: &Options, batches: &[Vec<Op>]) {
-    let mut states = vec![Vec::new()];
-    let mut model = Model::new();
+    check_failures(opts, &SimDisk::new(), &Model::new(), batches, try_scenario);
+}
+
+/// Runs batches on a store until an operation fails, like [`try_scenario`].
+type Scenario = fn(&Rc<SimDisk>, &Options, &[Vec<Op>]) -> (Option<Db>, usize);
+
+/// Like [`check_every_single_failure`], on the store that `start` holds, whose
+/// entries are `model`'s, with `run` running the batches.
+fn check_failures(
+    opts: &Options,
+    start: &SimDisk,
+    model: &Model,
+    batches: &[Vec<Op>],
+    run: Scenario,
+) {
+    let mut states = vec![expected_scan(model, ALL)];
+    let mut model = model.clone();
     for ops in batches {
         apply(&mut model, ops);
         states.push(expected_scan(&model, ALL));
     }
-    let clean = SimDisk::new();
-    let (db, done) = try_scenario(&clean, opts, batches);
+    let clean = start.restart();
+    let (db, done) = run(&clean, opts, batches);
     assert_eq!(done, batches.len());
     drop(db);
     let total = clean.ops();
     for fault in [Fault::Error, Fault::Crash] {
         for op in 0..total {
-            let disk = SimDisk::new();
+            let disk = start.restart();
             disk.inject(op, fault);
-            let (db, done) = try_scenario(&disk, opts, batches);
+            let (db, done) = run(&disk, opts, batches);
             let failed = db.as_ref().is_some_and(Db::has_failed);
             if let Some(db) = &db {
                 if failed {
@@ -1948,6 +2195,52 @@ fn check_every_single_failure(opts: &Options, batches: &[Vec<Op>]) {
             );
         }
     }
+}
+
+/// Like [`try_scenario`], on a store that opens with a scan of level 1 to do,
+/// which goes on for a few level-1 nodes before each batch.
+fn try_scan_scenario(
+    disk: &Rc<SimDisk>,
+    opts: &Options,
+    batches: &[Vec<Op>],
+) -> (Option<Db>, usize) {
+    let Ok(db) = now(Db::open_sim(disk.clone(), opts.clone())) else {
+        return (None, 0);
+    };
+    for (done, ops) in batches.iter().enumerate() {
+        // A read that fails stops the scan, and the write fails with its error.
+        let _ = now(db.scan_level_1(3));
+        if now(db.write(&mut batch_of(ops))).is_err() {
+            return (Some(db), done);
+        }
+        if now(db.get(&[0, 0, 0, 0x7f], Comparison::Ceiling, |_, _| ())).is_err()
+            || try_scan(&db).is_err()
+        {
+            return (Some(db), done + 1);
+        }
+    }
+    (Some(db), batches.len())
+}
+
+#[test]
+fn every_single_failure_during_the_scan_leaves_a_recoverable_store() {
+    // A store of dozens of level-1 nodes. A cache of 16 pages scans 4 at a time,
+    // and lets writes go on during the scan.
+    let opts = Options::new().page_size(256).cache_size(16 * 256);
+    let disk = SimDisk::new();
+    let db = now(Db::open_sim(disk.clone(), opts.clone())).unwrap();
+    let mut model = Model::new();
+    let ops = distinct_round(3000, 0);
+    write(&db, &ops);
+    apply(&mut model, &ops);
+    drop(db);
+    let key = |i: u32| i.to_be_bytes().to_vec();
+    let batches = [
+        distinct_round(3000, 1).into_iter().step_by(5).collect(),
+        vec![Op::DeleteRange(key(1000), key(2000))],
+        distinct_round(1600, 2).into_iter().skip(1500).collect(),
+    ];
+    check_failures(&opts, &disk, &model, &batches, try_scan_scenario);
 }
 
 /// Rounds of batches to write as groups: in each, the first write waits for its
@@ -2163,7 +2456,7 @@ fn writes_move_internal_nodes_too() {
     assert!(store.db.tree().current().root.unwrap().level >= 3);
     assert!(store.db.tree().moves().1 > 0);
     store.reopen();
-    store.db.tree().check();
+    store.db.check();
     assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
 }
 
@@ -2185,7 +2478,7 @@ fn freeing_the_end_of_the_file_cuts_it() {
     assert!(end < len * 7 / 8, "{end} of {len} bytes");
     assert_eq!(store.disk.len(), end);
     store.reopen();
-    store.db.tree().check();
+    store.db.check();
     assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
     // And grows again from there.
     let ops: Vec<_> = (5000..7000u32)
@@ -2195,7 +2488,7 @@ fn freeing_the_end_of_the_file_cuts_it() {
     apply(&mut model, &ops);
     assert!(store.disk.len() > end);
     store.reopen();
-    store.db.tree().check();
+    store.db.check();
     assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
 }
 
@@ -2367,7 +2660,7 @@ fn poll_once<F: Future + ?Sized>(f: Pin<&mut F>) -> Poll<F::Output> {
 }
 
 /// A store of `n` entries on 256-byte pages, reopened with a cache of `frames`
-/// pages, so that none of its leaves is cached.
+/// pages, so that none of its leaves is cached. Its scan of level 1 has ended.
 fn cold_store(n: u32, frames: usize) -> (Store, Model) {
     let mut store = Store::new(Options::new().page_size(256).cache_size(frames * 256));
     let puts: Vec<_> = (0..n)
@@ -2377,6 +2670,7 @@ fn cold_store(n: u32, frames: usize) -> (Store, Model) {
     let mut model = Model::new();
     apply(&mut model, &puts);
     store.reopen();
+    store.finish_scan();
     (store, model)
 }
 
@@ -2618,7 +2912,8 @@ fn reading_ahead_stays_within_the_cache_budget() {
 }
 
 /// A store on 256-byte pages of `n` entries too large for a leaf, two pages each,
-/// reopened with a cache of `frames` pages, so that none of them is cached.
+/// reopened with a cache of `frames` pages, so that none of them is cached. Its
+/// scan of level 1 has ended.
 fn cold_value_store(n: u32, frames: usize) -> (Store, Model) {
     let mut store = Store::new(Options::new().page_size(256).cache_size(frames * 256));
     let puts: Vec<_> = (0..n)
@@ -2628,6 +2923,7 @@ fn cold_value_store(n: u32, frames: usize) -> (Store, Model) {
     let mut model = Model::new();
     apply(&mut model, &puts);
     store.reopen();
+    store.finish_scan();
     (store, model)
 }
 
@@ -4099,6 +4395,54 @@ async fn a_store_closes_with_its_last_handle() {
 }
 
 #[compio::test]
+#[cfg_attr(miri, ignore)]
+async fn a_file_store_scans_level_1_in_the_background() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encina.db");
+    let key = |i: u32| i.to_be_bytes();
+    let count = async |db: &Db| {
+        let mut iter = db.range(..);
+        let mut n = 0;
+        while iter.next().await.unwrap().is_some() {
+            n += 1;
+        }
+        n
+    };
+    // The smallest cache, of 8 pages, scans 2 level-1 nodes at a time, and lets
+    // writes go on while the scan has more left.
+    let opts = Options::default().cache_size(0);
+    let db = Db::open(&path, opts.clone()).await.unwrap();
+    let mut batch = WriteBatch::new();
+    for i in 0..50_000u32 {
+        batch.put(&key(i), &[i as u8; 100]);
+    }
+    db.write(&mut batch).await.unwrap();
+    db.close().await.unwrap();
+    // Closing the store lets go of the file whatever its scan is reading.
+    let db = Db::open(&path, opts.clone()).await.unwrap();
+    assert!(db.scan_left().unwrap() > 2);
+    yield_once().await;
+    db.close().await.unwrap();
+    // The scan goes on by itself, while the store serves reads and writes.
+    let db = Db::open(&path, opts.clone()).await.unwrap();
+    batch.clear();
+    batch.delete_range(&key(10_000), &key(40_000));
+    db.write(&mut batch).await.unwrap();
+    assert_eq!(count(&db).await, 20_000);
+    for _ in 0..1_000_000 {
+        if db.scan_left().is_none() {
+            break;
+        }
+        yield_once().await;
+    }
+    assert_eq!(db.scan_left(), None);
+    db.close().await.unwrap();
+    let db = Db::open(&path, opts).await.unwrap();
+    assert_eq!(count(&db).await, 20_000);
+    db.close().await.unwrap();
+}
+
+#[compio::test]
 async fn a_write_dropped_mid_commit_fails_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
@@ -4797,7 +5141,9 @@ fn metrics_count_cache_hits_and_misses() {
         .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![i as u8; 8]))
         .collect();
     write(&store.db, &puts);
+    // The scan of level 1 caches the level-1 nodes, without looking them up.
     store.reopen();
+    store.finish_scan();
     let leaves = store.db.tree().leaves().len() as i64;
 
     // A scan of a cold store misses every leaf, and the next one hits them all.
@@ -4810,6 +5156,7 @@ fn metrics_count_cache_hits_and_misses() {
 
     // A lookup that reads its leaf counts one miss, not a hit when it looks again.
     store.reopen();
+    store.finish_scan();
     let (hits, misses) = lookups(test);
     assert!(get(&store.db, &7u32.to_be_bytes(), Comparison::Equal).is_some());
     assert_eq!(lookups(test), (hits, misses + 1));
@@ -4837,11 +5184,20 @@ fn metrics_report_the_memory_and_the_file() {
     let test = "memory_and_file";
     let opts = metered(test).cache_size(64 * 256);
     let disk = SimDisk::new();
-    let db = now(Db::open_sim(disk.clone(), opts)).unwrap();
+    let db = now(Db::open_sim(disk.clone(), opts.clone())).unwrap();
     let puts: Vec<_> = (0..2000u32)
         .map(|i| Op::Put(i.to_be_bytes().to_vec(), vec![i as u8; 8]))
         .collect();
     write(&db, &puts);
+    // Reopened, a store reports how its pages are used once the scan of level 1
+    // has found them.
+    let used = file_usage(test);
+    drop(db);
+    let disk = disk.restart();
+    let db = now(Db::open_sim(disk.clone(), opts)).unwrap();
+    assert_eq!(file_usage(test), [0; 3]);
+    now(db.scan_level_1(usize::MAX)).unwrap();
+    assert_eq!(file_usage(test), used);
     assert_eq!(sum(test, "encina.cache.limit", &[]), Some(64 * 256));
     let usage = |kind| sum(test, "encina.cache.usage", &[("encina.page.type", kind)]).unwrap();
     let in_use = db.tree().pages.pool.in_use() as i64 * 256;

@@ -164,10 +164,16 @@ impl Reads {
         }
     }
 
-    /// Whether no read is held.
+    /// The reads held: each one's slot, and the frame it fills, unless a reader
+    /// claimed it already.
     #[cfg(test)]
-    pub(crate) fn is_idle(&self) -> bool {
-        self.slots.iter().all(|s| matches!(s.state, State::Free))
+    pub(crate) fn held(&self) -> impl Iterator<Item = (usize, Option<FrameId>)> + '_ {
+        let held = self.slots.iter().enumerate();
+        held.filter_map(|(i, s)| match s.state {
+            State::Free => None,
+            State::Claimed => Some((i, None)),
+            State::Reading(_) | State::Finished(..) => Some((i, Some(s.frame))),
+        })
     }
 }
 
