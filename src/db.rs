@@ -27,7 +27,7 @@ use std::task::{Context, Poll, Waker, ready};
 
 use crate::batch::WriteBatch;
 use crate::cache::Cache;
-use crate::disk::{Disk, FileDisk, ReadBuf, WriteBuf};
+use crate::disk::{Access, Disk, Env, FileDisk, ReadBuf, WriteBuf};
 use crate::error::{Error, Result};
 use crate::meta::{self, FORMAT_VERSION, Meta};
 use crate::metrics::{self, Metrics};
@@ -393,73 +393,55 @@ async fn scan_level_1<D: Disk>(inner: Weak<Inner<D>>) {
     .await;
 }
 
-impl Db<FileDisk> {
-    /// Opens the store at `path`, creating it if needed.
-    ///
-    /// A new store takes its page size from `opts`, 4 KiB if it sets none. An
-    /// existing one keeps the page size it was created with: this fails with
-    /// [`Error::PageSizeMismatch`] if `opts` sets another.
-    ///
-    /// A store has one owner at a time: this fails with [`Error::Locked`] while
-    /// another `Db`, in this process or another, has it open. That `Db` lets go
-    /// once it, its clones and its iterators are closed or dropped, and any I/O it
-    /// started has finished. A [`ReadOnlyDb`] can read the store meanwhile.
-    ///
-    /// Opening reads the internal nodes above the leaves' parents, a fraction of a
-    /// percent of the internal nodes, and returns: the store serves reads and
-    /// writes at once. A task that the store spawns on the current compio runtime
-    /// then reads the leaves' parents, to find the pages free for reuse. Until it
-    /// has, writes take new pages at the end of the file.
-    pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
-        opts.validate()?;
-        let (disk, len) = FileDisk::open(path.as_ref()).await?;
-        Db::open_with(disk, len, opts, false, Some(path.as_ref()), true).await
-    }
-}
-
 /// A store on a simulated disk, whose writes pause after a millisecond, as on a
 /// file, unless a test sets the work they do instead.
 #[cfg(any(test, fuzzing))]
 impl Db<Rc<crate::sim::SimDisk>> {
     pub(crate) async fn open_sim(disk: Rc<crate::sim::SimDisk>, opts: Options) -> Result<Self> {
-        opts.validate()?;
-        let len = crate::sim::SimDisk::len(&disk);
-        #[cfg(test)]
-        let checked = disk.clone();
-        let db = Db::open_with(disk, len, opts, false, None, true).await?;
+        let db = Db::open(&disk, "sim", opts).await?;
         // The checks read level-1 nodes that aren't cached from the disk.
         #[cfg(test)]
         {
-            db.tree().disk = Some(checked);
+            db.tree().disk = Some(disk);
         }
         Ok(db)
     }
 }
 
 impl<D: Disk> Db<D> {
-    /// Opens the store on `disk`, creating it if the disk is empty, as
-    /// [`open`](Db::open) does on a file.
+    /// Opens the store at `path` in `env`, creating it if needed: in a file, with
+    /// [`Files`](crate::Files).
     ///
-    /// The store needs nothing from a runtime but what the disk's futures do. The
-    /// task that reads the leaves' parents after the open runs wherever the disk
-    /// spawns it (see [`Disk::spawn`]). A write that pauses to let other tasks run
-    /// does so after a set amount of work, rather than after a millisecond, so
-    /// that no clock decides what the store does: given the same requests and the
-    /// same outcomes from the disk, it does the same.
+    /// A new store takes its page size from `opts`, 4 KiB if it sets none. An
+    /// existing one keeps the page size it was created with: this fails with
+    /// [`Error::PageSizeMismatch`] if `opts` sets another.
     ///
-    /// Nothing keeps out a second owner of the disk: that is up to the caller. The
-    /// store's metrics have no `encina.store` attribute but the one
-    /// [`Options::metric_attributes`] gives.
-    pub async fn open_on(disk: D, opts: Options) -> Result<Db<D>> {
+    /// A store has one owner at a time, which the env sees to: with `Files`, this
+    /// fails with [`Error::Locked`] while another `Db`, in this process or another,
+    /// has it open. That `Db` lets go once it, its clones and its iterators are
+    /// closed or dropped, and any I/O it started has finished. A [`ReadOnlyDb`] can
+    /// read the store meanwhile.
+    ///
+    /// Opening reads the internal nodes above the leaves' parents, a fraction of a
+    /// percent of the internal nodes, and returns: the store serves reads and
+    /// writes at once. A task that the store spawns through `env` then reads the
+    /// leaves' parents, to find the pages free for reuse. Until it has, writes take
+    /// new pages at the end of the file.
+    pub async fn open<E: Env<Disk = D>>(
+        env: &E,
+        path: impl AsRef<Path>,
+        opts: Options,
+    ) -> Result<Db<D>> {
         opts.validate()?;
-        let len = disk.len().await?;
-        Db::open_with(disk, len, opts, false, None, false).await
+        let path = path.as_ref();
+        let disk = env.open(path, Access::ReadWrite).await?;
+        Db::open_with(env, disk, opts, false, path).await
     }
 
     /// A handle to the same store whose operations' I/O takes `class`: the reads
     /// of its lookups and of its iterators, and the requests of the commits of its
-    /// writes, unless other writes raise them. Handles from
-    /// [`open`](Db::open) and [`open_on`](Self::open_on) take the default class.
+    /// writes, unless other writes raise them. Handles from [`open`](Self::open)
+    /// take the default class.
     pub fn with_class(&self, class: D::Class) -> Db<D> {
         Db {
             inner: self.inner.clone(),
@@ -467,18 +449,16 @@ impl<D: Disk> Db<D> {
         }
     }
 
-    /// Opens the store on `disk`, `len` bytes long, at `path` if it has one. A
-    /// `timed` store's writes pause after a time rather than after a set amount
-    /// of work.
-    async fn open_with(
+    /// Opens the store on `disk`, which `env` opened at `path`.
+    async fn open_with<E: Env<Disk = D>>(
+        env: &E,
         disk: D,
-        len: u64,
         opts: Options,
         read_only: bool,
-        path: Option<&Path>,
-        timed: bool,
+        path: &Path,
     ) -> Result<Db<D>> {
         let class = D::Class::default();
+        let len = disk.len().await?;
         let meta = if len == 0 && !read_only {
             create(&disk, &opts).await?
         } else {
@@ -540,7 +520,7 @@ impl<D: Disk> Db<D> {
                 bytes: meta.entry_bytes,
             },
         );
-        if !timed {
+        if !env.real_time() {
             tree.set_slice(Some(tree::UNTIMED));
         }
         // The scan of level 1 marks the pages of the leaves while the store serves
@@ -571,9 +551,9 @@ impl<D: Disk> Db<D> {
             inner.report_usage();
         }
         let inner = Rc::new(inner);
-        // The scan runs in a task of its own.
+        // The scan runs in a task of its own, which the env runs.
         if inner.scan.borrow().is_some() {
-            inner.disk.spawn(scan_level_1(Rc::downgrade(&inner)));
+            env.spawn(scan_level_1(Rc::downgrade(&inner)));
         }
         Ok(Db { inner, class })
     }
@@ -657,7 +637,7 @@ impl<D: Disk> Db<D> {
     /// entries' locations:
     ///
     /// ```
-    /// # use encina::{Comparison, Db, Options, WriteBatch};
+    /// # use encina::{Comparison, Db, Files, Options, WriteBatch};
     /// fn key(ledger: u64, entry: u64) -> [u8; 16] {
     ///     let mut key = [0; 16];
     ///     key[..8].copy_from_slice(&ledger.to_be_bytes());
@@ -671,7 +651,8 @@ impl<D: Disk> Db<D> {
     /// }
     /// # compio::runtime::Runtime::new().unwrap().block_on(async {
     /// # let dir = tempfile::tempdir().unwrap();
-    /// # let db = Db::open(dir.path().join("data.db"), Options::default()).await?;
+    /// # let path = dir.path().join("data.db");
+    /// # let db = Db::open(&Files, &path, Options::default()).await?;
     /// # let mut batch = WriteBatch::new();
     /// # for entry in 0..3u64 {
     /// #     batch.put(&key(7, entry), &(entry * 1024).to_be_bytes());
@@ -936,38 +917,30 @@ impl<D: Disk> Clone for ReadOnlyDb<D> {
     }
 }
 
-impl ReadOnlyDb<FileDisk> {
-    /// Opens a view of the existing store at `path`, as of its last write. `opts`
-    /// sets the cache size; the page size comes from the file, whatever `opts` sets.
-    ///
-    /// Fails with [`Error::Stale`] if the store's owner overwrote that version
-    /// while it was being opened: opening again finds a newer one.
-    pub async fn open(path: impl AsRef<Path>, opts: Options) -> Result<ReadOnlyDb> {
-        opts.validate()?;
-        let (disk, len) = FileDisk::open_read_only(path.as_ref()).await?;
-        let db = Db::open_with(disk, len, opts, true, Some(path.as_ref()), true).await?;
-        Ok(ReadOnlyDb { db })
-    }
-}
-
 /// A view of a store on a simulated disk.
 #[cfg(any(test, fuzzing))]
 impl ReadOnlyDb<Rc<crate::sim::SimDisk>> {
     pub(crate) async fn open_sim(disk: Rc<crate::sim::SimDisk>, opts: Options) -> Result<Self> {
-        opts.validate()?;
-        let len = crate::sim::SimDisk::len(&disk);
-        let db = Db::open_with(disk, len, opts, true, None, true).await?;
-        Ok(ReadOnlyDb { db })
+        ReadOnlyDb::open(&disk, "sim", opts).await
     }
 }
 
 impl<D: Disk> ReadOnlyDb<D> {
-    /// Opens a view of the existing store on `disk`, as [`open`](ReadOnlyDb::open)
-    /// does of a file. A view writes nothing, and spawns no task.
-    pub async fn open_on(disk: D, opts: Options) -> Result<ReadOnlyDb<D>> {
+    /// Opens a view of the existing store at `path` in `env`, as of its last write.
+    /// `opts` sets the cache size; the page size comes from the file, whatever
+    /// `opts` sets. A view writes nothing, and spawns no task.
+    ///
+    /// Fails with [`Error::Stale`] if the store's owner overwrote that version
+    /// while it was being opened: opening again finds a newer one.
+    pub async fn open<E: Env<Disk = D>>(
+        env: &E,
+        path: impl AsRef<Path>,
+        opts: Options,
+    ) -> Result<ReadOnlyDb<D>> {
         opts.validate()?;
-        let len = disk.len().await?;
-        let db = Db::open_with(disk, len, opts, true, None, false).await?;
+        let path = path.as_ref();
+        let disk = env.open(path, Access::ReadOnly).await?;
+        let db = Db::open_with(env, disk, opts, true, path).await?;
         Ok(ReadOnlyDb { db })
     }
 

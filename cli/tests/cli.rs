@@ -18,7 +18,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use encina::{Db, Options, WriteBatch};
+use encina::{Db, Files, Options, WriteBatch};
 
 fn encina(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_encina"))
@@ -198,7 +198,7 @@ fn errors_leave_no_store() {
 async fn reads_while_another_process_writes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"k", b"v");
     db.write(&mut batch).await.unwrap();
@@ -221,7 +221,7 @@ async fn reads_while_another_process_writes() {
 async fn works_on_any_page_size() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.db");
-    let db = Db::open(&path, Options::default().page_size(16384))
+    let db = Db::open(&Files, &path, Options::default().page_size(16384))
         .await
         .unwrap();
     let mut batch = WriteBatch::new();
@@ -263,7 +263,7 @@ fn levels(stats: &str) -> Vec<[usize; 5]> {
 async fn stats_and_pages() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     for value in [b"v", b"w"] {
         let mut batch = WriteBatch::new();
         batch.put(b"k", value);
@@ -362,7 +362,7 @@ async fn scan_resumes_on_a_new_view() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     write_all(&db, '0').await;
 
     let mut scan = Command::new(env!("CARGO_BIN_EXE_encina"))

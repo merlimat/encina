@@ -39,7 +39,7 @@ use crate::meta::Meta;
 use crate::node::{self, Node};
 use crate::pool::Holds;
 use crate::sim::{Fault, SimDb, SimDisk, SimView};
-use crate::{Comparison, Db, Error, Options, ReadOnlyDb, WriteBatch};
+use crate::{Comparison, Db, Error, Files, Options, ReadOnlyDb, WriteBatch};
 
 /// Runs a future that must finish without waiting, as everything does on the
 /// simulated disk. It may yield, as a write does while it merges.
@@ -4324,7 +4324,7 @@ async fn a_file_store_survives_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
     let key = |i: u32| i.to_be_bytes();
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     let mut batch = WriteBatch::new();
     for i in 0..20_000u32 {
         batch.put(&key(i), &key(i * 2));
@@ -4337,7 +4337,7 @@ async fn a_file_store_survives_reopening() {
 
     // The page size comes from the file. A small cache sends reads to the disk.
     let opts = Options::default().cache_size(16 * 4096);
-    let db = Db::open(&path, opts).await.unwrap();
+    let db = Db::open(&Files, &path, opts).await.unwrap();
     for i in (0..20_000u32).step_by(97) {
         let found = db
             .get(&key(i), Comparison::Equal, |_, v| v.to_vec())
@@ -4361,8 +4361,8 @@ async fn a_file_store_survives_reopening() {
 async fn a_file_store_has_one_owner_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
-    let second = Db::open(&path, Options::default()).await.map(drop);
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
+    let second = Db::open(&Files, &path, Options::default()).await.map(drop);
     assert!(matches!(second, Err(Error::Locked)), "{second:?}");
 
     // The failed open left the store alone.
@@ -4372,11 +4372,11 @@ async fn a_file_store_has_one_owner_at_a_time() {
 
     // Closing the store lets go of it, and so does dropping it.
     db.close().await.unwrap();
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     let found = db.get(b"key", Comparison::Equal, |_, v| v.to_vec());
     assert_eq!(found.await.unwrap(), Some(b"value".to_vec()));
     drop(db);
-    Db::open(&path, Options::default()).await.unwrap();
+    Db::open(&Files, &path, Options::default()).await.unwrap();
 }
 
 #[compio::test]
@@ -4384,14 +4384,16 @@ async fn a_file_store_has_one_owner_at_a_time() {
 async fn a_read_only_view_opens_beside_the_owner() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"key", b"value");
     db.write(&mut batch).await.unwrap();
 
     // The view takes no lock, and leaves the owner's in place.
-    let view = ReadOnlyDb::open(&path, Options::default()).await.unwrap();
-    let second = Db::open(&path, Options::default()).await.map(drop);
+    let view = ReadOnlyDb::open(&Files, &path, Options::default())
+        .await
+        .unwrap();
+    let second = Db::open(&Files, &path, Options::default()).await.map(drop);
     assert!(matches!(second, Err(Error::Locked)), "{second:?}");
 
     // It reads the version it opened, not later writes.
@@ -4404,7 +4406,7 @@ async fn a_read_only_view_opens_beside_the_owner() {
 
     // Nor does it keep another owner out.
     db.close().await.unwrap();
-    Db::open(&path, Options::default()).await.unwrap();
+    Db::open(&Files, &path, Options::default()).await.unwrap();
     view.close().await.unwrap();
 }
 
@@ -4418,26 +4420,32 @@ async fn a_read_only_view_never_writes() {
     let path = dir.path().join("encina.db");
 
     // It doesn't create a store.
-    let opened = ReadOnlyDb::open(&path, Options::default()).await.map(drop);
+    let opened = ReadOnlyDb::open(&Files, &path, Options::default())
+        .await
+        .map(drop);
     assert!(
         matches!(&opened, Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound),
         "{opened:?}"
     );
     assert!(!path.exists());
     fs::write(&path, b"").unwrap();
-    let opened = ReadOnlyDb::open(&path, Options::default()).await.map(drop);
+    let opened = ReadOnlyDb::open(&Files, &path, Options::default())
+        .await
+        .map(drop);
     assert!(matches!(opened, Err(Error::InvalidFile(_))), "{opened:?}");
     assert_eq!(fs::metadata(&path).unwrap().len(), 0);
     fs::remove_file(&path).unwrap();
 
     // It opens a store it may only read.
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"key", b"value");
     db.write(&mut batch).await.unwrap();
     db.close().await.unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-    let view = ReadOnlyDb::open(&path, Options::default()).await.unwrap();
+    let view = ReadOnlyDb::open(&Files, &path, Options::default())
+        .await
+        .unwrap();
     let found = view.get(b"key", Comparison::Equal, |_, v| v.to_vec());
     assert_eq!(found.await.unwrap(), Some(b"value".to_vec()));
     view.close().await.unwrap();
@@ -4447,16 +4455,16 @@ async fn a_read_only_view_never_writes() {
 async fn a_store_closes_with_its_last_handle() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     // Closing a clone, or the store while an iterator is alive, leaves it open.
     db.clone().close().await.unwrap();
     let iter = db.range(..);
     db.close().await.unwrap();
-    let second = Db::open(&path, Options::default()).await.map(drop);
+    let second = Db::open(&Files, &path, Options::default()).await.map(drop);
     assert!(matches!(second, Err(Error::Locked)), "{second:?}");
     // The iterator was the last handle.
     drop(iter);
-    Db::open(&path, Options::default()).await.unwrap();
+    Db::open(&Files, &path, Options::default()).await.unwrap();
 }
 
 #[compio::test]
@@ -4476,7 +4484,7 @@ async fn a_file_store_scans_level_1_in_the_background() {
     // The smallest cache, of 8 pages, scans 2 level-1 nodes at a time, and lets
     // writes go on while the scan has more left.
     let opts = Options::default().cache_size(0);
-    let db = Db::open(&path, opts.clone()).await.unwrap();
+    let db = Db::open(&Files, &path, opts.clone()).await.unwrap();
     let mut batch = WriteBatch::new();
     for i in 0..50_000u32 {
         batch.put(&key(i), &[i as u8; 100]);
@@ -4484,12 +4492,12 @@ async fn a_file_store_scans_level_1_in_the_background() {
     db.write(&mut batch).await.unwrap();
     db.close().await.unwrap();
     // Closing the store lets go of the file whatever its scan is reading.
-    let db = Db::open(&path, opts.clone()).await.unwrap();
+    let db = Db::open(&Files, &path, opts.clone()).await.unwrap();
     assert!(db.scan_left().unwrap() > 2);
     yield_once().await;
     db.close().await.unwrap();
     // The scan goes on by itself, while the store serves reads and writes.
-    let db = Db::open(&path, opts.clone()).await.unwrap();
+    let db = Db::open(&Files, &path, opts.clone()).await.unwrap();
     batch.clear();
     batch.delete_range(&key(10_000), &key(40_000));
     db.write(&mut batch).await.unwrap();
@@ -4502,7 +4510,7 @@ async fn a_file_store_scans_level_1_in_the_background() {
     }
     assert_eq!(db.scan_left(), None);
     db.close().await.unwrap();
-    let db = Db::open(&path, opts).await.unwrap();
+    let db = Db::open(&Files, &path, opts).await.unwrap();
     assert_eq!(count(&db).await, 20_000);
     db.close().await.unwrap();
 }
@@ -4511,7 +4519,7 @@ async fn a_file_store_scans_level_1_in_the_background() {
 async fn a_write_dropped_mid_commit_fails_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"key", b"value");
     // The first poll sends out the new leaf's write, and the write is dropped
@@ -4521,7 +4529,7 @@ async fn a_write_dropped_mid_commit_fails_the_store() {
     // Closing waits for the leaf's write. The store reopens as it was, and takes
     // writes again.
     db.close().await.unwrap();
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     let found = db.get(b"key", Comparison::Equal, |_, v| v.to_vec());
     assert_eq!(found.await.unwrap(), None);
     db.write(&mut batch).await.unwrap();
@@ -4532,7 +4540,7 @@ async fn a_write_dropped_mid_commit_fails_the_store() {
 async fn concurrent_writes_to_a_file_share_commits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encina.db");
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     let key = |i: u32| i.to_be_bytes();
     let mut batches: Vec<_> = (0..8u32)
         .map(|w| {
@@ -4567,7 +4575,7 @@ async fn concurrent_writes_to_a_file_share_commits() {
     assert_eq!(generation(&db), start + 2);
     drop(writes);
     db.close().await.unwrap();
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     for i in (0..8000).step_by(97) {
         let found = db.get(&key(i), Comparison::Equal, |_, v| v.to_vec()).await;
         assert_eq!(found.unwrap(), Some(key(i / 1000).to_vec()));
@@ -4578,13 +4586,15 @@ async fn concurrent_writes_to_a_file_share_commits() {
 async fn bad_options_or_a_missing_directory_fail_the_open() {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options::new().page_size(1000);
-    let opened = Db::open(dir.path().join("encina.db"), opts).await.map(drop);
+    let opened = Db::open(&Files, dir.path().join("encina.db"), opts)
+        .await
+        .map(drop);
     assert!(
         matches!(opened, Err(Error::InvalidOptions(_))),
         "{opened:?}"
     );
     let path = dir.path().join("missing").join("encina.db");
-    let opened = Db::open(path, Options::default()).await.map(drop);
+    let opened = Db::open(&Files, path, Options::default()).await.map(drop);
     assert!(
         matches!(&opened, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound),
         "{opened:?}"
@@ -4608,7 +4618,7 @@ async fn a_new_store_needs_its_directory_synced() {
     // Without read permission, a file can be created in the directory, but the
     // directory can't be opened to sync it.
     mode(0o300);
-    let result = Db::open(&path, Options::default()).await.map(drop);
+    let result = Db::open(&Files, &path, Options::default()).await.map(drop);
     mode(0o700);
     assert!(
         matches!(&result, Err(Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied),
@@ -4617,7 +4627,7 @@ async fn a_new_store_needs_its_directory_synced() {
 
     // The file left behind is empty, so opening it again creates the store.
     assert_eq!(fs::metadata(&path).unwrap().len(), 0);
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"key", b"value");
     db.write(&mut batch).await.unwrap();
@@ -4630,7 +4640,7 @@ async fn a_file_store_shrinks_once_its_end_is_free() {
     let path = dir.path().join("encina.db");
     let len = || std::fs::metadata(&path).unwrap().len();
     let key = |i: u32| i.to_be_bytes();
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     let mut batch = WriteBatch::new();
     for i in 0..20_000u32 {
         batch.put(&key(i), &key(i * 2));
@@ -4647,7 +4657,7 @@ async fn a_file_store_shrinks_once_its_end_is_free() {
     assert!(len() < full / 2, "{} of {full} bytes", len());
     db.close().await.unwrap();
 
-    let db = Db::open(&path, Options::default()).await.unwrap();
+    let db = Db::open(&Files, &path, Options::default()).await.unwrap();
     let mut iter = db.range(..);
     let mut count = 0u32;
     while let Some((k, v)) = iter.next().await.unwrap() {
@@ -5376,7 +5386,7 @@ async fn metrics_name_the_store_by_its_path() {
     // Files take pages of 4 KiB at least.
     let opts = metered(test).page_size(4096);
     let path = dir.path().join("a.db");
-    let db = Db::open(&path, opts.clone()).await.unwrap();
+    let db = Db::open(&Files, &path, opts.clone()).await.unwrap();
     db.write(&mut batch_of(&[Op::Put(vec![1], vec![1])]))
         .await
         .unwrap();
@@ -5384,7 +5394,9 @@ async fn metrics_name_the_store_by_its_path() {
 
     // The options can name it otherwise.
     let opts = opts.metric_attributes(&[KeyValue::new("encina.store", "ledgers")]);
-    let db = Db::open(dir.path().join("b.db"), opts).await.unwrap();
+    let db = Db::open(&Files, dir.path().join("b.db"), opts)
+        .await
+        .unwrap();
     db.write(&mut batch_of(&[Op::Delete(vec![1])]))
         .await
         .unwrap();

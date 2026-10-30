@@ -12,23 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Stores on a disk the test implements, through the public API alone: the disk
-//! keeps the store in memory, runs the task it spawns on the test's own executor,
-//! and notes the class of each request. No compio runtime runs, and no clock
-//! decides what the store does.
+//! Stores in an env the test implements, through the public API alone: its disk
+//! keeps the store in memory and notes the class of each request, and it runs the
+//! task the store spawns on the test's own executor. No compio runtime runs, and
+//! no clock decides what the store does.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::future::{Future, Ready, poll_fn, ready};
 use std::io;
 use std::mem;
+use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
-use encina::{Comparison, Db, Disk, Error, Options, ReadBuf, ReadOnlyDb, WriteBatch, WriteBuf};
+use encina::{
+    Access, Comparison, Db, Disk, Env, Error, Options, ReadBuf, ReadOnlyDb, WriteBatch, WriteBuf,
+};
 
 /// A request the disk took, with its class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +52,11 @@ struct State {
     waiting: RefCell<Vec<Waker>>,
     /// Whether asking for its length fails.
     broken: Cell<bool>,
+    /// The opens asked of the env, with their access.
+    opens: RefCell<Vec<(PathBuf, Access)>>,
+    /// While set, an owner's open fails, as with `Files` while another owner has
+    /// the file.
+    taken: Cell<bool>,
 }
 
 /// A disk in memory, whose requests finish at once.
@@ -63,6 +71,11 @@ impl MemDisk {
     /// The requests taken since the last call.
     fn requests(&self) -> Vec<Request> {
         mem::take(&mut self.0.requests.borrow_mut())
+    }
+
+    /// The opens asked since the last call.
+    fn opens(&self) -> Vec<(PathBuf, Access)> {
+        mem::take(&mut self.0.opens.borrow_mut())
     }
 
     fn land(&self, offset: u64, data: &[u8]) {
@@ -163,6 +176,20 @@ impl Disk for MemDisk {
         .await;
         Ok(())
     }
+}
+
+/// The disk is its own env: it opens itself, whatever the path, and keeps the
+/// tasks the store spawns for the test's executor.
+impl Env for MemDisk {
+    type Disk = MemDisk;
+
+    async fn open(&self, path: &Path, access: Access) -> encina::Result<MemDisk> {
+        self.0.opens.borrow_mut().push((path.to_owned(), access));
+        if access == Access::ReadWrite && self.0.taken.get() {
+            return Err(Error::Locked);
+        }
+        Ok(self.clone())
+    }
 
     fn spawn(&self, task: impl Future<Output = ()> + 'static) {
         self.0.tasks.borrow_mut().push(Box::pin(task));
@@ -179,7 +206,7 @@ impl Wake for Wakes {
     }
 }
 
-/// Runs `f` to its end on this thread, and the tasks the disk spawns meanwhile,
+/// Runs `f` to its end on this thread, and the tasks the env spawns meanwhile,
 /// polling each in turn as long as `f` hasn't ended. Returns its output, and how
 /// many times it paused.
 fn run_counting<F: Future>(disk: &MemDisk, f: F) -> (F::Output, usize) {
@@ -235,7 +262,7 @@ fn puts(
 /// the scan of level 1 to the task it spawns. Returns the disk and the entries.
 fn store(opts: &Options) -> (MemDisk, BTreeMap<Vec<u8>, Vec<u8>>) {
     let disk = MemDisk::default();
-    let db = run(&disk, Db::open_on(disk.clone(), opts.clone())).unwrap();
+    let db = run(&disk, Db::open(&disk, "store", opts.clone())).unwrap();
     // A new store has no level 1 to scan.
     assert_eq!(disk.tasks(), 0);
     let mut model = BTreeMap::new();
@@ -272,7 +299,7 @@ fn opts() -> Options {
 fn a_store_works_on_a_disk_of_its_callers() {
     let opts = opts();
     let (disk, mut model) = store(&opts);
-    let db = run(&disk, Db::open_on(disk.clone(), opts.clone())).unwrap();
+    let db = run(&disk, Db::open(&disk, "store", opts.clone())).unwrap();
     // The store spawned a task for the scan of level 1, which lookups don't wait
     // for.
     assert_eq!(disk.tasks(), 1);
@@ -304,8 +331,19 @@ fn a_store_works_on_a_disk_of_its_callers() {
     assert_eq!(entries(&db, &disk), expected(&model));
 
     // A view reads it as of when it opens, and spawns nothing.
-    let view = run(&disk, ReadOnlyDb::open_on(disk.clone(), opts.clone())).unwrap();
+    let view = run(&disk, ReadOnlyDb::open(&disk, "store", opts.clone())).unwrap();
     assert_eq!(disk.tasks(), 0);
+    // Each open asked the env for the store's path: the new store's and the
+    // reopen's as its owner, and the view's to read only.
+    let path = PathBuf::from("store");
+    assert_eq!(
+        disk.opens(),
+        [
+            (path.clone(), Access::ReadWrite),
+            (path.clone(), Access::ReadWrite),
+            (path, Access::ReadOnly),
+        ]
+    );
     let (mut nodes, mut leaves) = (0, 0);
     run(
         &disk,
@@ -331,7 +369,7 @@ fn the_scan_task_ends_with_its_store() {
     // A cache of 8 pages scans two level-1 nodes at a time, and pauses in between.
     let opts = Options::new().cache_size(8 * 4096);
     let (disk, _) = store(&opts);
-    let db = run(&disk, Db::open_on(disk.clone(), opts)).unwrap();
+    let db = run(&disk, Db::open(&disk, "store", opts)).unwrap();
     let wakes = Arc::new(Wakes::default());
     let waker = Waker::from(wakes.clone());
     assert_eq!(disk.poll_tasks(&waker), 1, "the scan ended at once");
@@ -347,7 +385,7 @@ fn each_request_takes_the_class_of_what_caused_it() {
     let opts = opts();
     let (disk, model) = store(&opts);
     disk.requests();
-    let db = run(&disk, Db::open_on(disk.clone(), opts.clone())).unwrap();
+    let db = run(&disk, Db::open(&disk, "store", opts.clone())).unwrap();
     finish_tasks(&disk);
     // The open's reads, and the scan's, take the default class.
     let opened = disk.requests();
@@ -389,7 +427,7 @@ fn each_request_takes_the_class_of_what_caused_it() {
         "{requests:?}"
     );
 
-    let view = run(&disk, ReadOnlyDb::open_on(disk.clone(), opts)).unwrap();
+    let view = run(&disk, ReadOnlyDb::open(&disk, "store", opts)).unwrap();
     disk.requests();
     let found = run(
         &disk,
@@ -404,7 +442,7 @@ fn each_request_takes_the_class_of_what_caused_it() {
 fn a_commit_takes_the_class_of_the_writes_waiting_for_it() {
     let opts = opts();
     let (disk, _) = store(&opts);
-    let db = run(&disk, Db::open_on(disk.clone(), opts)).unwrap();
+    let db = run(&disk, Db::open(&disk, "store", opts)).unwrap();
     finish_tasks(&disk);
     disk.requests();
     let mut batches: Vec<_> = (0..3u32)
@@ -477,7 +515,7 @@ fn writes_pause_in_the_same_places_each_time() {
             batch.put(&i.to_be_bytes(), &[i as u8; 16]);
         }
         let disk = MemDisk::default();
-        let db = run(&disk, Db::open_on(disk.clone(), Options::new())).unwrap();
+        let db = run(&disk, Db::open(&disk, "store", Options::new())).unwrap();
         let (written, pauses) = run_counting(&disk, db.write(&mut batch));
         written.unwrap();
         (pauses, disk.requests(), disk.0.bytes.borrow().clone())
@@ -490,23 +528,36 @@ fn writes_pause_in_the_same_places_each_time() {
 #[test]
 fn opens_on_a_disk_fail_as_on_a_file() {
     let disk = MemDisk::default();
-    let opened = run(&disk, ReadOnlyDb::open_on(disk.clone(), Options::new()));
+    let opened = run(&disk, ReadOnlyDb::open(&disk, "store", Options::new()));
     assert!(matches!(opened, Err(Error::InvalidFile(_))));
     let opened = run(
         &disk,
-        Db::open_on(disk.clone(), Options::new().page_size(1000)),
+        Db::open(&disk, "store", Options::new().page_size(1000)),
     );
     assert!(matches!(opened, Err(Error::InvalidOptions(_))));
     let opened = run(
         &disk,
-        ReadOnlyDb::open_on(disk.clone(), Options::new().page_size(1000)),
+        ReadOnlyDb::open(&disk, "store", Options::new().page_size(1000)),
     );
     assert!(matches!(opened, Err(Error::InvalidOptions(_))));
+    // Options are checked before the env opens anything.
+    assert_eq!(disk.opens(), [(PathBuf::from("store"), Access::ReadOnly)]);
+    // The env's errors come back from the open: an owner's is refused, a view's
+    // isn't.
+    disk.0.taken.set(true);
+    assert!(matches!(
+        run(&disk, Db::open(&disk, "store", Options::new())),
+        Err(Error::Locked)
+    ));
+    let opened = run(&disk, ReadOnlyDb::open(&disk, "store", Options::new()));
+    assert!(matches!(opened, Err(Error::InvalidFile(_))));
+    disk.0.taken.set(false);
+    // So do the disk's.
     disk.0.broken.set(true);
     assert!(matches!(
-        run(&disk, Db::open_on(disk.clone(), Options::new())),
+        run(&disk, Db::open(&disk, "store", Options::new())),
         Err(Error::Io(_))
     ));
-    let opened = run(&disk, ReadOnlyDb::open_on(disk.clone(), Options::new()));
+    let opened = run(&disk, ReadOnlyDb::open(&disk, "store", Options::new()));
     assert!(matches!(opened, Err(Error::Io(_))));
 }

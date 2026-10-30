@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A simulated disk for tests, which implements [`Disk`] as a caller's disk does.
+//! A simulated disk for tests, which implements [`Env`] and [`Disk`] as callers do.
 //! It can fail any single operation, or crash during one: then only what was synced
 //! survives, plus whichever pages written since happen to have landed, with the
 //! write in progress torn. It can also hold reads in flight, or syncs and cuts,
@@ -24,13 +24,14 @@
 use std::cell::RefCell;
 use std::future::{Future, poll_fn};
 use std::io;
+use std::path::Path;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::slice;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use crate::disk::{Disk, ReadBuf, WriteBuf};
+use crate::disk::{Access, Disk, Env, ReadBuf, WriteBuf};
 use crate::options::MIN_PAGE_SIZE;
 use crate::pool::{Holds, Pool};
 use crate::{Db, ReadOnlyDb};
@@ -430,10 +431,24 @@ impl Disk for Rc<SimDisk> {
         }
         Ok(())
     }
+}
+
+/// The simulated disk is its own env: it opens itself, whatever the path, and lets
+/// writes pause by the clock, as on a file, unless a test sets the work they do.
+impl Env for Rc<SimDisk> {
+    type Disk = Rc<SimDisk>;
+
+    async fn open(&self, _: &Path, _: Access) -> crate::Result<Rc<SimDisk>> {
+        Ok(self.clone())
+    }
 
     /// Drops `task`: the tests drive the scan that follows an open.
     fn spawn(&self, task: impl Future<Output = ()> + 'static) {
         drop(task);
+    }
+
+    fn real_time(&self) -> bool {
+        true
     }
 }
 

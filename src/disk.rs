@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Where a store keeps its pages: a file, or a disk the caller implements.
+//! Where a store runs: the env that opens its disk and runs its task, and the disk
+//! that keeps its pages. [`Files`] keeps stores in files, on compio.
 
-use std::cell::Cell;
 use std::future::Future;
 use std::io;
 use std::mem::MaybeUninit;
@@ -29,7 +29,7 @@ use compio::driver::op::ReadAt;
 use compio::driver::{SharedFd, ToSharedFd};
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncWriteAtExt;
-use compio::runtime::{JoinHandle, Submit};
+use compio::runtime::Submit;
 
 use crate::error::Result;
 use crate::pool::{FrameBuf, ValueBuf};
@@ -38,19 +38,73 @@ use crate::pool::{FrameBuf, ValueBuf};
 /// of the device's block size, at most 4 KiB.
 const BLOCK: u64 = 4096;
 
-/// The disk a store keeps its pages on.
+/// Where a store runs: what opens its file, runs its task, and lets it read the
+/// clock, or not.
 ///
-/// [`Db::open`](crate::Db::open) keeps a store in a file, which it reads and writes
-/// with direct I/O on the current compio runtime. A caller that runs its own I/O,
-/// such as a scheduler that orders the requests of several stores, or a simulated
-/// disk in tests, implements this trait instead, and opens the store with
-/// [`Db::open_on`](crate::Db::open_on) or
-/// [`ReadOnlyDb::open_on`](crate::ReadOnlyDb::open_on).
+/// [`Files`] keeps stores in files, on the current compio runtime. A caller that
+/// runs its own I/O, such as a scheduler that orders the requests of several
+/// stores, or a simulation that replays a run from its seed, implements this trait
+/// and [`Disk`] instead. Either way, [`Db::open`](crate::Db::open) and
+/// [`ReadOnlyDb::open`](crate::ReadOnlyDb::open) take the env, the store's path and
+/// its options.
+///
+/// A store uses its env only while it opens, from the thread it runs on, and needs
+/// nothing else from its runtime: it spawns no task but through
+/// [`spawn`](Self::spawn), and reads no clock unless [`real_time`](Self::real_time)
+/// lets it.
+pub trait Env {
+    /// The disk that [`open`](Self::open) opens.
+    type Disk: Disk;
+
+    /// Opens the store's file at `path`, which the env interprets: [`Files`] opens
+    /// it in the file system.
+    ///
+    /// For [`ReadWrite`](Access::ReadWrite), the store's owner, it creates the file
+    /// if needed, empty, and keeps out other owners until the disk closes: two
+    /// would corrupt the store. [`Files`] fails a second owner's open with
+    /// [`Error::Locked`](crate::Error::Locked). A file it creates must outlast a
+    /// crash once a sync of the disk has finished. For
+    /// [`ReadOnly`](Access::ReadOnly), a view, it opens the file as it is.
+    fn open(&self, path: &Path, access: Access) -> impl Future<Output = Result<Self::Disk>>;
+
+    /// Runs `task` beside the store until it ends. A store that takes writes calls
+    /// this as it opens, unless its tree is a single leaf: the task reads the
+    /// leaves' parents to find the pages free for reuse, and until it has, writes
+    /// take new pages at the end of the disk. It holds the store only while it is
+    /// polled. Once the store is closed or dropped, which wakes it, it ends the next
+    /// time it is polled.
+    fn spawn(&self, task: impl Future<Output = ()> + 'static);
+
+    /// Whether the store may read the real clock, to pace its writes: false by
+    /// default.
+    ///
+    /// A large write pauses now and then to let other tasks run: with the clock,
+    /// about every millisecond; without it, after a set amount of work, about a
+    /// millisecond of a sorted load's merge, and so in the same places each time.
+    /// Without the clock, given the same requests and the same outcomes from its
+    /// disk, a store does the same, as a simulation that replays a run needs.
+    fn real_time(&self) -> bool {
+        false
+    }
+}
+
+/// What a store opens its file for, in [`Env::open`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    /// To read and write it, as the store's owner, a [`Db`](crate::Db).
+    ReadWrite,
+    /// To read it only, as a view, a [`ReadOnlyDb`](crate::ReadOnlyDb).
+    ReadOnly,
+}
+
+/// The disk a store keeps its pages on, which its [`Env`] opens.
+///
+/// [`Files`] opens a [`FileDisk`], which reads and writes a file with direct I/O on
+/// the current compio runtime. A caller that runs its own I/O implements this
+/// trait, and an [`Env`] that opens it.
 ///
 /// The disk holds one store, from offset 0: two meta pages, then the tree's. The
-/// store calls it from the thread it runs on, and needs nothing else from its
-/// runtime: on such a disk it spawns no task but through [`spawn`](Self::spawn),
-/// and no clock decides what it does (see [`Db::open_on`](crate::Db::open_on)).
+/// store calls it from the thread it runs on.
 ///
 /// Requests move owned buffers: [`ReadBuf`]s to read into, and [`WriteBuf`]s to
 /// write from. Each spans whole pages, 4 KiB-aligned as direct I/O asks, and
@@ -121,14 +175,6 @@ pub trait Disk: Sized + 'static {
 
     /// Makes every write that has finished durable, and the disk's length.
     fn sync(&self, class: Self::Class) -> impl Future<Output = io::Result<()>>;
-
-    /// Runs `task` beside the store until it ends, as a task of the runtime the
-    /// store runs on. A store that takes writes calls this as it opens, unless its
-    /// tree is a single leaf: the task reads the leaves' parents to find the pages
-    /// free for reuse, and until it has, writes take new pages at the end of the
-    /// disk. It holds the store only while it is polled. Once the store is closed
-    /// or dropped, which wakes it, it ends the next time it is polled.
-    fn spawn(&self, task: impl Future<Output = ()> + 'static);
 
     /// Closes the disk, once the store's last handle is closed: nothing, by
     /// default. A store dropped rather than closed drops its disk.
@@ -243,47 +289,62 @@ impl IoBuf for WriteBuf {
     }
 }
 
-/// The disk of a store in a file, which [`Db::open`](crate::Db::open) and
-/// [`ReadOnlyDb::open`](crate::ReadOnlyDb::open) open. It reads and writes the file
-/// with direct I/O on the current compio runtime, and runs the scan that follows
-/// an open there.
+/// The env of stores in files. It opens each with direct I/O, as a [`FileDisk`],
+/// runs the store's task on the current compio runtime, and lets writes pause by
+/// the real clock.
+///
+/// An owner's open locks the file until its disk closes, so that a second owner, in
+/// this process or another, fails with [`Error::Locked`](crate::Error::Locked); a
+/// view's takes no lock. A new file's directory is synced, which makes its name
+/// durable.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Files;
+
+impl Env for Files {
+    type Disk = FileDisk;
+
+    async fn open(&self, path: &Path, access: Access) -> Result<FileDisk> {
+        match access {
+            Access::ReadWrite => FileDisk::open(path).await,
+            Access::ReadOnly => FileDisk::open_read_only(path).await,
+        }
+    }
+
+    fn spawn(&self, task: impl Future<Output = ()> + 'static) {
+        compio::runtime::spawn(task).detach();
+    }
+
+    fn real_time(&self) -> bool {
+        true
+    }
+}
+
+/// The disk of a store in a file, which [`Files`] opens. It reads and writes the
+/// file with direct I/O on the current compio runtime.
 pub struct FileDisk {
     file: File,
-    /// The task that runs the scan that follows the open, which dropping the disk
-    /// cancels.
-    task: Cell<Option<JoinHandle<()>>>,
 }
 
 impl FileDisk {
     /// Opens the file at `path`, creating it if needed, and locks it until it
-    /// closes. Returns it with its length.
+    /// closes.
     ///
     /// Fails with [`Error::Locked`](crate::Error::Locked) if another open of the
     /// file holds the lock, in this process or another.
-    pub(crate) async fn open(path: &Path) -> Result<(FileDisk, u64)> {
+    async fn open(path: &Path) -> Result<FileDisk> {
         let file = open_uncached(path, true).await?;
         lock(&file)?;
-        let len = file.metadata().await?.len();
-        if len == 0 {
+        if file.metadata().await?.len() == 0 {
             // A new file's name is durable only once its directory is synced.
             sync_dir(path).await?;
         }
-        Ok((FileDisk::new(file), len))
+        Ok(FileDisk { file })
     }
 
     /// Opens the existing file at `path` for reading only, without locking it.
-    /// Returns it with its length.
-    pub(crate) async fn open_read_only(path: &Path) -> Result<(FileDisk, u64)> {
+    async fn open_read_only(path: &Path) -> Result<FileDisk> {
         let file = open_uncached(path, false).await?;
-        let len = file.metadata().await?.len();
-        Ok((FileDisk::new(file), len))
-    }
-
-    fn new(file: File) -> FileDisk {
-        FileDisk {
-            file,
-            task: Cell::new(None),
-        }
+        Ok(FileDisk { file })
     }
 }
 
@@ -327,10 +388,6 @@ impl Disk for FileDisk {
 
     async fn sync(&self, _: ()) -> io::Result<()> {
         self.file.sync_data().await
-    }
-
-    fn spawn(&self, task: impl Future<Output = ()> + 'static) {
-        self.task.set(Some(compio::runtime::spawn(task)));
     }
 
     async fn close(self) -> io::Result<()> {
@@ -478,7 +535,7 @@ mod tests {
         let path = dir.path().join("file");
         // A block and a half.
         std::fs::write(&path, vec![7; BLOCK as usize * 3 / 2]).unwrap();
-        let (disk, _) = FileDisk::open(&path).await.unwrap();
+        let disk = FileDisk::open(&path).await.unwrap();
         let mut pool = Pool::new(BLOCK as usize);
         let frame = pool.alloc(Holds::Loading, 0);
         let read = |offset| disk.read(ReadBuf::frame(pool.buf(frame)), offset, ());

@@ -57,9 +57,9 @@ with `Error::InvalidFile`.
 ## Example
 
 ```rust
-use encina::{Comparison, Db, Options, WriteBatch};
+use encina::{Comparison, Db, Files, Options, WriteBatch};
 
-let db = Db::open("data.db", Options::default()).await?;
+let db = Db::open(&Files, "data.db", Options::default()).await?;
 
 // Batches apply atomically. Keys sort bytewise, so encode integers big-endian.
 let mut batch = WriteBatch::new();

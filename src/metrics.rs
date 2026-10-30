@@ -126,15 +126,14 @@ pub(crate) struct Meter {
 }
 
 impl Meter {
-    /// The meter of a store opened with `opts`, at `path` if it has one.
-    pub(crate) fn new(opts: &Options, path: Option<&Path>) -> Meter {
+    /// The meter of a store opened at `path` with `opts`.
+    pub(crate) fn new(opts: &Options, path: &Path) -> Meter {
         let Some(meter) = opts.meter.clone() else {
             return Meter::default();
         };
-        let store = path.map(|path| KeyValue::new(STORE, path.to_string_lossy().into_owned()));
+        let store = KeyValue::new(STORE, path.to_string_lossy().into_owned());
         // The options' attributes go last: of a key given twice, the last value wins.
-        let attributes = store
-            .into_iter()
+        let attributes = std::iter::once(store)
             .chain(opts.metric_attributes.iter().cloned())
             .collect();
         Meter {

@@ -8,13 +8,13 @@ never allocates. Without a provider, a store records nothing.
 ## Setup
 
 ```rust
-use encina::{Db, Options};
+use encina::{Db, Files, Options};
 use opentelemetry::KeyValue;
 
 let opts = Options::new()
     .meter_provider(&provider)
     .metric_attributes(&[KeyValue::new("tenant", "a")]);
-let db = Db::open("/data/0/index.db", opts).await?;
+let db = Db::open(&Files, "/data/0/index.db", opts).await?;
 ```
 
 - The metrics come under the instrumentation scope `encina`.
