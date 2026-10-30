@@ -16,8 +16,9 @@
 //! It can fail any single operation, or crash during one: then only what was synced
 //! survives, plus whichever pages written since happen to have landed, with the
 //! write in progress torn. It can also hold reads in flight, or syncs and cuts,
-//! until a test releases them, and delay writes, syncs and reads while the
-//! runtime runs other tasks, as a real disk's take time.
+//! until a test releases them, delay writes, syncs and reads while the runtime
+//! runs other tasks, as a real disk's take time, and make reads yield once, as
+//! any future may.
 //!
 //! It runs no task: the tests drive the scan that follows an open themselves.
 
@@ -91,6 +92,8 @@ struct State {
     finished: u64,
     /// How long each leaf read takes, if the disk delays reads.
     read_time: Option<Duration>,
+    /// Whether each read yields once before it finishes.
+    yielding: bool,
 }
 
 impl SimDisk {
@@ -265,6 +268,13 @@ impl SimDisk {
     /// tasks, as the thread would while a real disk read the page.
     pub(crate) fn delay_reads(&self, time: Duration) {
         self.0.borrow_mut().read_time = Some(time);
+    }
+
+    /// Makes each read from now on yield once before it finishes: the first time
+    /// it is polled, it wakes its waker and returns pending, as a future that lets
+    /// the runtime run other tasks does.
+    pub(crate) fn yield_reads(&self) {
+        self.0.borrow_mut().yielding = true;
     }
 
     /// Waits for the operation's turn, if writes and syncs are delayed: until the
@@ -453,7 +463,7 @@ impl Env for Rc<SimDisk> {
 }
 
 /// A read on the simulated disk. It finishes when first polled, unless the disk
-/// holds or delays it.
+/// holds, delays or yields it.
 pub(crate) struct SimRead {
     disk: Rc<SimDisk>,
     offset: u64,
@@ -463,6 +473,8 @@ pub(crate) struct SimRead {
     started: Option<(u64, io::Result<bool>)>,
     /// When it finishes, if the disk delays it.
     done: Option<Instant>,
+    /// Whether it has yielded, if the disk makes reads yield.
+    yielded: bool,
 }
 
 impl SimRead {
@@ -473,6 +485,7 @@ impl SimRead {
             buf: Some(buf),
             started: None,
             done: None,
+            yielded: false,
         }
     }
 }
@@ -485,6 +498,11 @@ impl Future for SimRead {
         let disk = &this.disk;
         let (op, _) = this.started.get_or_insert_with(|| disk.start_read());
         if disk.holds(*op, cx.waker()) {
+            return Poll::Pending;
+        }
+        if disk.0.borrow().yielding && !this.yielded {
+            this.yielded = true;
+            cx.waker().wake_by_ref();
             return Poll::Pending;
         }
         if let Some(time) = disk.0.borrow().read_time {

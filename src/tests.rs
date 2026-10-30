@@ -2942,6 +2942,43 @@ fn a_failed_shared_read_is_read_again_by_the_others() {
 }
 
 #[test]
+fn reads_that_yield_wake_their_readers() {
+    // A store whose root is a level-1 node, which the open leaves to the scan.
+    let mut store = Store::new(Options::new().page_size(256).cache_size(16 * 256));
+    let puts = distinct_round(100, 0);
+    write(&store.db, &puts);
+    let mut model = Model::new();
+    apply(&mut model, &puts);
+    assert_eq!(store.db.tree().current().root.unwrap().level, 1);
+    // Reopened on a disk whose reads wake their waker while polled and return
+    // pending, once. Nothing else polls a read again, so the readers waiting for
+    // it must be woken then.
+    let reopen = |store: &mut Store| {
+        store.disk = store.disk.restart();
+        store.disk.yield_reads();
+        store.db = now(Db::open_sim(store.disk.clone(), store.opts.clone())).unwrap();
+    };
+    // The open reads the meta pages itself, then the scan reads the root through
+    // the reads in flight.
+    reopen(&mut store);
+    let ops = store.disk.ops();
+    store.finish_scan();
+    assert_eq!(store.disk.ops() - ops, 1);
+    store.db.check();
+    // So does a lookup that misses the cache, for the root and a leaf.
+    reopen(&mut store);
+    let ops = store.disk.ops();
+    let key = 50u32.to_be_bytes();
+    let found = get(&store.db, &key, Comparison::Equal);
+    assert_eq!(found, expected(&model, &key, Comparison::Equal));
+    assert_eq!(store.disk.ops() - ops, 2);
+    // And an iterator, for the root and each leaf.
+    reopen(&mut store);
+    assert_eq!(scan(&store.db, ALL), expected_scan(&model, ALL));
+    store.db.check();
+}
+
+#[test]
 fn a_write_waiting_for_a_failed_commit_fails() {
     // A store of one leaf, which isn't cached.
     let (store, _) = cold_store(1, 64);
