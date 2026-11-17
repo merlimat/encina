@@ -395,12 +395,15 @@ pub(crate) fn slotted_only() {
 }
 
 /// Whether nodes may be dense.
+#[cfg(not(test))]
 fn dense_allowed() -> bool {
-    #[cfg(test)]
-    if SLOTTED_ONLY.get() {
-        return false;
-    }
     true
+}
+
+/// Whether nodes may be dense: not on a thread that asked for [`slotted_only`].
+#[cfg(test)]
+fn dense_allowed() -> bool {
+    !SLOTTED_ONLY.get()
 }
 
 /// The dense layout of entries `a..b` of `src` in a node at `level`, if their keys
