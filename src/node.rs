@@ -64,6 +64,8 @@
 use std::cmp::Ordering;
 use std::ops::{AddAssign, SubAssign};
 
+use crc_fast::CrcAlgorithm::Crc32Iscsi;
+
 use crate::pool::FrameId;
 
 pub(crate) const HEADER: usize = 32;
@@ -120,16 +122,17 @@ pub(crate) fn value_header(
     header[8..10].copy_from_slice(&(key.len() as u16).to_le_bytes());
     header[12..16].copy_from_slice(&(value.len() as u32).to_le_bytes());
     header[20..28].copy_from_slice(&generation.to_le_bytes());
-    let mut crc = crc32c::crc32c(&header[4..]);
-    crc = crc32c::crc32c_append(crc, key);
-    crc = crc32c::crc32c_append(crc, value);
+    let mut crc = crc_fast::Digest::new(Crc32Iscsi);
+    crc.update(&header[4..]);
+    crc.update(key);
+    crc.update(value);
     let mut zeros = span_len - value_leaf_len(key.len(), value.len());
     while zeros > 0 {
         let n = zeros.min(ZEROS.len());
-        crc = crc32c::crc32c_append(crc, &ZEROS[..n]);
+        crc.update(&ZEROS[..n]);
         zeros -= n;
     }
-    header[..4].copy_from_slice(&crc.to_le_bytes());
+    header[..4].copy_from_slice(&(crc.finalize() as u32).to_le_bytes());
     header
 }
 
@@ -163,7 +166,7 @@ pub(crate) fn verify_value_leaf(span: &[u8], page_size: usize) -> bool {
     }
     let crc = u32::from_le_bytes(span[..4].try_into().unwrap());
     ValueLeaf::new(span).used().div_ceil(page_size) * page_size == span.len()
-        && crc32c::crc32c(&span[4..]) == crc
+        && crc_fast::checksum(Crc32Iscsi, &span[4..]) as u32 == crc
 }
 
 /// A value leaf, read from the pages it spans.
@@ -313,7 +316,7 @@ pub(crate) fn child_page(child_ref: &[u8]) -> u64 {
 /// ready to be written.
 pub(crate) fn seal(page: &mut [u8], generation: u64) {
     page[20..28].copy_from_slice(&generation.to_le_bytes());
-    let crc = crc32c::crc32c(&page[4..]);
+    let crc = crc_fast::checksum(Crc32Iscsi, &page[4..]) as u32;
     page[..4].copy_from_slice(&crc.to_le_bytes());
 }
 
@@ -321,7 +324,9 @@ pub(crate) fn seal(page: &mut [u8], generation: u64) {
 /// and its layout stays within the page.
 pub(crate) fn verify(page: &[u8]) -> bool {
     let crc = u32::from_le_bytes(page[..4].try_into().unwrap());
-    if !matches!(page[4], FORMAT_SLOTTED | FORMAT_DENSE) || crc32c::crc32c(&page[4..]) != crc {
+    if !matches!(page[4], FORMAT_SLOTTED | FORMAT_DENSE)
+        || crc_fast::checksum(Crc32Iscsi, &page[4..]) as u32 != crc
+    {
         return false;
     }
     let node = Node::new(page);
@@ -390,12 +395,15 @@ pub(crate) fn slotted_only() {
 }
 
 /// Whether nodes may be dense.
+#[cfg(not(test))]
 fn dense_allowed() -> bool {
-    #[cfg(test)]
-    if SLOTTED_ONLY.get() {
-        return false;
-    }
     true
+}
+
+/// Whether nodes may be dense: not on a thread that asked for [`slotted_only`].
+#[cfg(test)]
+fn dense_allowed() -> bool {
+    !SLOTTED_ONLY.get()
 }
 
 /// The dense layout of entries `a..b` of `src` in a node at `level`, if their keys

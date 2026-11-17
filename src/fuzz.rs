@@ -29,6 +29,8 @@ use std::pin::pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use crc_fast::CrcAlgorithm::Crc32Iscsi;
+
 use crate::meta::{MAGIC, META_PAGES, Meta};
 use crate::node::{
     self, Child, EntryBuf, FORMAT_DENSE, FORMAT_SLOTTED, FORMAT_VALUE, NO_FRAME, Node, Size,
@@ -392,7 +394,7 @@ fn stamp_file(file: &mut [u8]) {
 /// Stamps the checksum of bytes 4 on into the first four, as a write does: of a
 /// meta slot's 64 bytes, a node's page, or a value leaf's span.
 fn stamp(bytes: &mut [u8]) {
-    let crc = crc32c::crc32c(&bytes[4..]);
+    let crc = crc_fast::checksum(Crc32Iscsi, &bytes[4..]) as u32;
     bytes[..4].copy_from_slice(&crc.to_le_bytes());
 }
 

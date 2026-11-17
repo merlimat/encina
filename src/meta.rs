@@ -31,6 +31,8 @@
 //!     56     8  bytes of their keys and values
 //! ```
 
+use crc_fast::CrcAlgorithm::Crc32Iscsi;
+
 /// Pages 0 and 1 hold the meta slots; nodes start at page 2.
 pub(crate) const META_PAGES: u64 = 2;
 
@@ -83,7 +85,7 @@ impl Meta {
         page[40..48].copy_from_slice(&self.high_water.to_le_bytes());
         page[48..56].copy_from_slice(&self.entries.to_le_bytes());
         page[56..64].copy_from_slice(&self.entry_bytes.to_le_bytes());
-        let crc = crc32c::crc32c(&page[4..LEN]);
+        let crc = crc_fast::checksum(Crc32Iscsi, &page[4..LEN]) as u32;
         page[..4].copy_from_slice(&crc.to_le_bytes());
     }
 
@@ -94,7 +96,7 @@ impl Meta {
             return None;
         }
         let crc = u32::from_le_bytes(page[..4].try_into().unwrap());
-        if crc32c::crc32c(&page[4..LEN]) != crc {
+        if crc_fast::checksum(Crc32Iscsi, &page[4..LEN]) as u32 != crc {
             return None;
         }
         let u32_at = |at: usize| u32::from_le_bytes(page[at..at + 4].try_into().unwrap());

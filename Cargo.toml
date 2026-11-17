@@ -13,7 +13,10 @@ categories = ["database-implementations", "asynchronous"]
 
 [dependencies]
 compio = { version = "0.19.2", features = ["fs"] }
-crc32c = "0.6"
+# CRC-32C for page and value leaf checksums. crc-fast folds with carry-less
+# multiply on top of the CRC instructions: 2-4x the crc32c crate at page sizes.
+# Default features add a C FFI and a panic handler.
+crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 nanometer = "0.1"
 # The version nanometer pins.
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"] }
