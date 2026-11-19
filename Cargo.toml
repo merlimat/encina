@@ -17,7 +17,7 @@ compio = { version = "0.19.2", features = ["fs"] }
 # multiply on top of the CRC instructions: 2-4x the crc32c crate at page sizes.
 # Default features add a C FFI and a panic handler.
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
-nanometer = "0.1"
+nanometer = "0.2"
 # The version nanometer pins.
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"] }
 
