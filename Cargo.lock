@@ -819,9 +819,9 @@ checksum = "21909324aa58f5c284d91cac514c6d081210901dc372d7c8ea6a9d7e0406097a"
 
 [[package]]
 name = "nanometer"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "378861974743b6642127bcd7c066bad3d1746f1de35795cf5d97df7d033d0da0"
+checksum = "cec2fb10e70f47425f5fae2fb0ad0e1c8388557443021fe19486cb6f08d8e7cc"
 dependencies = [
  "opentelemetry",
  "quanta",
